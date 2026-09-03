@@ -4,7 +4,7 @@
 
 FarHelm is a remote control plane for personal research and GPU training environments. It brings server health, training jobs, and Codex sessions from multiple machines into one mobile-first web console while keeping training hosts outbound-only and retaining source code and credentials locally.
 
-> Current status: `0.1.0` minimal deployment. The public Hub serves Console behind separate admin authentication, while training-host Agents use a separate token to report real presence outbound. Training control, remote Codex sessions, and Web Push are not implemented yet.
+> Current status: `0.2.0` reliable command foundation. In addition to the `0.1.0` public Console and real Agent presence, Hub and Agent now persist asynchronous commands and handle TTLs and idempotent retries. The only enabled action is the side-effect-free `agent.probe`; training control, remote Codex sessions, and Web Push remain unavailable.
 
 ## Architecture
 
@@ -51,6 +51,7 @@ FARHELM_ADMIN_USER=admin \
 FARHELM_ADMIN_PASSWORD=local-password-1234 \
 FARHELM_AGENT_TOKEN=local-agent-token-with-at-least-32-characters \
 FARHELM_CONSOLE_DIR=farhelm-console/dist \
+FARHELM_HUB_DATABASE=.farhelm/hub.db \
 cargo run -p farhelm-hub
 ```
 
@@ -90,9 +91,9 @@ make test-release
 End users need neither compilation nor a GitHub login and can download the public Release directly:
 
 ```bash
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.1.0/farhelm-hub-0.1.0-linux-x86_64.tar.gz
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.1.0/farhelm-agent-0.1.0-linux-x86_64.tar.gz
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.1.0/SHA256SUMS
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.2.0/farhelm-hub-0.2.0-linux-x86_64.tar.gz
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.2.0/farhelm-agent-0.2.0-linux-x86_64.tar.gz
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.2.0/SHA256SUMS
 sha256sum -c SHA256SUMS
 ```
 
@@ -127,11 +128,11 @@ uv run --project farhelm-worker-codex pytest
 
 ## Roadmap
 
-1. Design an Agent–Hub command channel with a durable outbox, idempotency, and recovery semantics.
+1. Add WSS wakeups and an Agent event outbox on top of the validated durable command foundation.
 2. Stabilize the Agent–Worker protocol and validate the Codex SDK lifecycle.
 3. Complete training-job and Codex session flows for one training host.
 4. Add GPU and training-job metrics, logs, and notifications.
-5. Expand to multiple hosts and validate atomic upgrades and rollback.
+5. Expand to multiple hosts with per-Agent identities and validate atomic upgrades and rollback.
 
 ## License
 

@@ -87,7 +87,7 @@ if [[ "$no_service" == 0 ]] && [[ -e "$unit_file" ]]; then
 fi
 
 install -d -m 0700 "$install_root" "$install_root/bin" "$install_root/config" \
-  "$install_root/worker/src/farhelm_worker_codex"
+  "$install_root/state" "$install_root/worker/src/farhelm_worker_codex"
 install -m 0755 "$bundle_dir/bin/farhelm-agent" "$install_root/bin/farhelm-agent"
 install -m 0755 "$bundle_dir/run.sh" "$install_root/run.sh"
 install -m 0755 "$bundle_dir/uninstall.sh" "$install_root/uninstall.sh"
@@ -105,8 +105,16 @@ if [[ "$generated" == true ]]; then
     printf 'FARHELM_AGENT_ID=%s\n' "$agent_id"
     printf 'FARHELM_AGENT_HOSTNAME=%s\n' "$agent_hostname"
     printf 'FARHELM_HEARTBEAT_INTERVAL=15\n'
+    printf 'FARHELM_COMMAND_POLL_INTERVAL=2\n'
+    printf 'FARHELM_AGENT_DATABASE=%s/state/agent.db\n' "$install_root"
     printf 'RUST_LOG=farhelm_agent=info\n'
   } >"$config_file"
+fi
+if ! grep -q '^FARHELM_COMMAND_POLL_INTERVAL=' "$config_file"; then
+  printf 'FARHELM_COMMAND_POLL_INTERVAL=2\n' >>"$config_file"
+fi
+if ! grep -q '^FARHELM_AGENT_DATABASE=' "$config_file"; then
+  printf 'FARHELM_AGENT_DATABASE=%s/state/agent.db\n' "$install_root" >>"$config_file"
 fi
 chmod 0600 "$config_file"
 

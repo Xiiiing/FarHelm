@@ -49,6 +49,8 @@ export FARHELM_ADMIN_USER=package-admin
 export FARHELM_ADMIN_PASSWORD=package-password-1234
 export FARHELM_AGENT_TOKEN=package-agent-token-with-at-least-32-characters
 export FARHELM_CONSOLE_DIR="$hub_dir/console"
+export FARHELM_HUB_DATABASE="$test_dir/hub.db"
+export FARHELM_AGENT_DATABASE="$test_dir/agent.db"
 
 "$hub_dir/bin/farhelm-hub" >"$test_dir/hub.log" 2>&1 &
 hub_pid=$!
@@ -66,6 +68,18 @@ if [[ "$healthy" != true ]]; then
 fi
 
 "$agent_dir/bin/farhelm-agent" heartbeat --agent-id package-gpu --hostname package-trainer
+probe_response=$(curl --fail --silent --show-error \
+  --user "$FARHELM_ADMIN_USER:$FARHELM_ADMIN_PASSWORD" \
+  --header 'Content-Type: application/json' \
+  --data '{"idempotency_key":"package-probe-request-0001","ttl_secs":60}' \
+  "$FARHELM_HUB_URL/api/v1/agents/package-gpu/probe")
+command_id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["command_id"])' <<<"$probe_response")
+"$agent_dir/bin/farhelm-agent" command-poll \
+  --agent-id package-gpu \
+  --hostname package-trainer
+curl --fail --silent --show-error \
+  --user "$FARHELM_ADMIN_USER:$FARHELM_ADMIN_PASSWORD" \
+  "$FARHELM_HUB_URL/api/v1/commands/$command_id" | grep -q '"state":"completed"'
 curl --fail --silent --show-error \
   --user "$FARHELM_ADMIN_USER:$FARHELM_ADMIN_PASSWORD" \
   "$FARHELM_HUB_URL/api/v1/agents" | grep -q '"agent_id":"package-gpu"'
@@ -93,6 +107,8 @@ curl --fail --silent --show-error \
   test -x "$installed_root/run.sh"
   test -x "$installed_root/uninstall.sh"
   test "$(stat -c '%a' "$installed_root/config/agent.env")" = 600
+  grep -q "^FARHELM_AGENT_DATABASE=$installed_root/state/agent.db$" \
+    "$installed_root/config/agent.env"
   unit_file="$XDG_CONFIG_HOME/systemd/user/farhelm-agent.service"
   test -f "$unit_file"
   test "$(stat -c '%a' "$unit_file")" = 600

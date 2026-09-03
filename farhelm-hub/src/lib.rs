@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Result, ensure};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Request, State},
+    extract::{DefaultBodyLimit, Path, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -18,8 +18,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use constant_time_eq::constant_time_eq;
 use farhelm_core::PRODUCT_VERSION;
 use farhelm_protocol::{
-    AgentHeartbeat, AgentHeartbeatAck, AgentListResponse, AgentSummary, FARHELM_PROTOCOL,
-    HealthResponse,
+    AgentHeartbeat, AgentHeartbeatAck, AgentListResponse, AgentSummary, CommandAccepted,
+    CommandClaimRequest, CommandClaimResponse, CommandReportRequest, CreateProbeCommand,
+    FARHELM_PROTOCOL, HealthResponse,
 };
 use serde::Serialize;
 use tokio::sync::RwLock;
@@ -27,18 +28,24 @@ use tower_http::services::{ServeDir, ServeFile};
 
 pub const ONLINE_WINDOW_SECS: u64 = 45;
 
+mod command_store;
+
+use command_store::{CommandStore, CreateCommandError, ReportCommandError};
+
 #[derive(Clone)]
 pub struct HubConfig {
     pub admin_user: String,
     pub admin_password: String,
     pub agent_token: String,
     pub console_dir: PathBuf,
+    pub database_path: PathBuf,
 }
 
 #[derive(Clone)]
 pub struct AppState {
     config: Arc<HubConfig>,
     agents: Arc<RwLock<BTreeMap<String, StoredAgent>>>,
+    commands: Arc<CommandStore>,
 }
 
 #[derive(Clone)]
@@ -54,12 +61,13 @@ struct ApiError {
 }
 
 impl AppState {
-    #[must_use]
-    pub fn new(config: HubConfig) -> Self {
-        Self {
+    pub fn new(config: HubConfig) -> Result<Self> {
+        let commands = CommandStore::open(&config.database_path)?;
+        Ok(Self {
             config: Arc::new(config),
             agents: Arc::new(RwLock::new(BTreeMap::new())),
-        }
+            commands: Arc::new(commands),
+        })
     }
 }
 
@@ -82,6 +90,10 @@ impl HubConfig {
             self.console_dir.join("index.html").is_file(),
             "FARHELM_CONSOLE_DIR must contain index.html"
         );
+        ensure!(
+            !self.database_path.as_os_str().is_empty(),
+            "FARHELM_HUB_DATABASE is empty"
+        );
         Ok(())
     }
 }
@@ -94,6 +106,10 @@ pub fn app(state: AppState) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/agents", get(list_agents))
         .route("/api/v1/agents/heartbeat", post(agent_heartbeat))
+        .route("/api/v1/agents/{agent_id}/probe", post(create_probe))
+        .route("/api/v1/commands/{command_id}", get(command_status))
+        .route("/api/v1/agent/commands/claim", post(claim_command))
+        .route("/api/v1/agent/commands/report", post(report_command))
         .route("/api/{*path}", any(api_not_found))
         .fallback_service(static_files)
         .layer(DefaultBodyLimit::max(16 * 1024))
@@ -107,7 +123,7 @@ async fn authorize(State(state): State<AppState>, request: Request, next: Next) 
         return next.run(request).await;
     }
 
-    if path == "/api/v1/agents/heartbeat" {
+    if path == "/api/v1/agents/heartbeat" || path.starts_with("/api/v1/agent/commands/") {
         if bearer_matches(request.headers(), &state.config.agent_token) {
             return next.run(request).await;
         }
@@ -249,6 +265,127 @@ async fn list_agents(State(state): State<AppState>) -> Json<AgentListResponse> {
     })
 }
 
+async fn create_probe(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    Json(request): Json<CreateProbeCommand>,
+) -> Response {
+    if !valid_agent_id(&agent_id)
+        || !valid_idempotency_key(&request.idempotency_key)
+        || !(10..=300).contains(&request.ttl_secs)
+    {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_command");
+    }
+    match state.commands.create_probe(
+        &agent_id,
+        &request.idempotency_key,
+        request.ttl_secs,
+        unix_time(),
+    ) {
+        Ok(command) => (
+            StatusCode::ACCEPTED,
+            Json(CommandAccepted {
+                protocol: FARHELM_PROTOCOL.to_owned(),
+                status_url: format!("/api/v1/commands/{}", command.command_id),
+                command_id: command.command_id,
+                state: command.state,
+                expires_at_unix: command.expires_at_unix,
+            }),
+        )
+            .into_response(),
+        Err(CreateCommandError::Conflict) => {
+            api_error(StatusCode::CONFLICT, "idempotency_conflict")
+        }
+        Err(CreateCommandError::Internal(error)) => {
+            tracing::error!(%error, "failed to create command");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "command_store_failed")
+        }
+    }
+}
+
+async fn command_status(State(state): State<AppState>, Path(command_id): Path<String>) -> Response {
+    if !valid_command_id(&command_id) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_command_id");
+    }
+    match state.commands.get(&command_id) {
+        Ok(Some(command)) => Json(command).into_response(),
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "command_not_found"),
+        Err(error) => {
+            tracing::error!(%error, "failed to read command");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "command_store_failed")
+        }
+    }
+}
+
+async fn claim_command(
+    State(state): State<AppState>,
+    Json(request): Json<CommandClaimRequest>,
+) -> Response {
+    if request.protocol != FARHELM_PROTOCOL || !valid_agent_id(&request.agent_id) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_claim");
+    }
+    match state.commands.claim(&request.agent_id, unix_time()) {
+        Ok(command) => Json(CommandClaimResponse {
+            protocol: FARHELM_PROTOCOL.to_owned(),
+            command,
+        })
+        .into_response(),
+        Err(error) => {
+            tracing::error!(%error, agent_id = %request.agent_id, "failed to claim command");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "command_store_failed")
+        }
+    }
+}
+
+async fn report_command(
+    State(state): State<AppState>,
+    Json(report): Json<CommandReportRequest>,
+) -> Response {
+    if report.protocol != FARHELM_PROTOCOL
+        || !valid_agent_id(&report.agent_id)
+        || !valid_command_id(&report.command_id)
+    {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_report");
+    }
+    match state.commands.report(&report, unix_time()) {
+        Ok(command) => Json(command).into_response(),
+        Err(ReportCommandError::NotFound) => api_error(StatusCode::NOT_FOUND, "command_not_found"),
+        Err(ReportCommandError::Conflict) => {
+            api_error(StatusCode::CONFLICT, "invalid_command_transition")
+        }
+        Err(ReportCommandError::Invalid) => api_error(StatusCode::BAD_REQUEST, "invalid_report"),
+        Err(ReportCommandError::Internal(error)) => {
+            tracing::error!(%error, "failed to report command");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "command_store_failed")
+        }
+    }
+}
+
+fn api_error(status: StatusCode, error: &'static str) -> Response {
+    (status, Json(ApiError { error })).into_response()
+}
+
+fn valid_agent_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn valid_idempotency_key(value: &str) -> bool {
+    (16..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn valid_command_id(value: &str) -> bool {
+    value.len() == 20
+        && value.starts_with("cmd_")
+        && value[4..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 const fn is_online(now: u64, last_seen: u64) -> bool {
     now.saturating_sub(last_seen) <= ONLINE_WINDOW_SECS
 }
@@ -265,7 +402,11 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
-    use farhelm_protocol::{AgentHeartbeat, FARHELM_PROTOCOL, HealthResponse, HealthStatus};
+    use farhelm_protocol::{
+        AgentHeartbeat, CommandAccepted, CommandClaimRequest, CommandClaimResponse,
+        CommandReportRequest, CommandState, CommandStatusResponse, CreateProbeCommand,
+        FARHELM_PROTOCOL, HealthResponse, HealthStatus, ProbeResult,
+    };
     use tower::ServiceExt;
 
     use super::*;
@@ -276,7 +417,9 @@ mod tests {
             admin_password: "correct-horse".to_owned(),
             agent_token: "agent-token-with-at-least-32-characters".to_owned(),
             console_dir: PathBuf::from("missing-test-console"),
+            database_path: PathBuf::from(":memory:"),
         })
+        .unwrap()
     }
 
     fn basic_header() -> String {
@@ -388,7 +531,8 @@ mod tests {
         let state = AppState::new(HubConfig {
             console_dir: console_dir.clone(),
             ..test_state().config.as_ref().clone()
-        });
+        })
+        .unwrap();
         let response = app(state)
             .oneshot(
                 Request::builder()
@@ -429,6 +573,7 @@ mod tests {
             admin_password: "short".to_owned(),
             agent_token: "short".to_owned(),
             console_dir: PathBuf::from("missing-test-console"),
+            database_path: PathBuf::from(":memory:"),
         };
         assert!(config.validate().is_err());
     }
@@ -437,5 +582,250 @@ mod tests {
     fn agent_expires_after_online_window() {
         assert!(is_online(100, 55));
         assert!(!is_online(101, 55));
+    }
+
+    #[tokio::test]
+    async fn probe_command_completes_through_agent_endpoints() {
+        let router = app(test_state());
+        let create = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/agents/gpu-a/probe")
+                    .header(header::AUTHORIZATION, basic_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&CreateProbeCommand {
+                            idempotency_key: "probe-request-0001".to_owned(),
+                            ttl_secs: 60,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::ACCEPTED);
+        let body = to_bytes(create.into_body(), 4096).await.unwrap();
+        let accepted: CommandAccepted = serde_json::from_slice(&body).unwrap();
+
+        let claim = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/agent/commands/claim")
+                    .header(
+                        header::AUTHORIZATION,
+                        "Bearer agent-token-with-at-least-32-characters",
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&CommandClaimRequest {
+                            protocol: FARHELM_PROTOCOL.to_owned(),
+                            agent_id: "gpu-a".to_owned(),
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(claim.into_body(), 4096).await.unwrap();
+        let claim: CommandClaimResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(claim.command.unwrap().command_id, accepted.command_id);
+
+        for (state, result) in [
+            (CommandState::Accepted, None),
+            (
+                CommandState::Completed,
+                Some(ProbeResult {
+                    agent_version: "0.1.0".to_owned(),
+                    hostname: "trainer-a".to_owned(),
+                }),
+            ),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/agent/commands/report")
+                        .header(
+                            header::AUTHORIZATION,
+                            "Bearer agent-token-with-at-least-32-characters",
+                        )
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&CommandReportRequest {
+                                protocol: FARHELM_PROTOCOL.to_owned(),
+                                agent_id: "gpu-a".to_owned(),
+                                command_id: accepted.command_id.clone(),
+                                state,
+                                result,
+                                detail: None,
+                            })
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let status = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/commands/{}", accepted.command_id))
+                    .header(header::AUTHORIZATION, basic_header())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(status.into_body(), 4096).await.unwrap();
+        let command: CommandStatusResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(command.state, CommandState::Completed);
+        assert_eq!(command.result.unwrap().hostname, "trainer-a");
+    }
+
+    #[tokio::test]
+    async fn command_endpoints_enforce_auth_and_command_ownership() {
+        let router = app(test_state());
+        let create_body = serde_json::to_vec(&CreateProbeCommand {
+            idempotency_key: "probe-auth-request-0001".to_owned(),
+            ttl_secs: 60,
+        })
+        .unwrap();
+        let unauthorized = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/agents/gpu-a/probe")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(create_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let create = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/agents/gpu-a/probe")
+                    .header(header::AUTHORIZATION, basic_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(create_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(create.into_body(), 4096).await.unwrap();
+        let accepted: CommandAccepted = serde_json::from_slice(&body).unwrap();
+
+        let wrong_token = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/agent/commands/claim")
+                    .header(header::AUTHORIZATION, "Bearer wrong-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&CommandClaimRequest {
+                            protocol: FARHELM_PROTOCOL.to_owned(),
+                            agent_id: "gpu-a".to_owned(),
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_token.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong_owner = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/agent/commands/report")
+                    .header(
+                        header::AUTHORIZATION,
+                        "Bearer agent-token-with-at-least-32-characters",
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&CommandReportRequest {
+                            protocol: FARHELM_PROTOCOL.to_owned(),
+                            agent_id: "gpu-b".to_owned(),
+                            command_id: accepted.command_id,
+                            state: CommandState::Accepted,
+                            result: None,
+                            detail: None,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_owner.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn probe_creation_rejects_invalid_and_conflicting_requests() {
+        let router = app(test_state());
+        let invalid = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/agents/gpu-a/probe")
+                    .header(header::AUTHORIZATION, basic_header())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&CreateProbeCommand {
+                            idempotency_key: "probe-invalid-0001".to_owned(),
+                            ttl_secs: 9,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+        for (agent_id, expected) in [
+            ("gpu-a", StatusCode::ACCEPTED),
+            ("gpu-b", StatusCode::CONFLICT),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/agents/{agent_id}/probe"))
+                        .header(header::AUTHORIZATION, basic_header())
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&CreateProbeCommand {
+                                idempotency_key: "probe-conflict-0001".to_owned(),
+                                ttl_secs: 60,
+                            })
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
     }
 }

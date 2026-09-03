@@ -2,7 +2,7 @@
 
 [简体中文](README.md) · [English](README.en.md)
 
-发布包面向 Ubuntu 24.04 x86_64（或带 systemd、glibc 2.39+ 的兼容发行版）。公网服务器需要 Caddy（或等价 HTTPS 反向代理）。训练服务器只上报在线心跳时不需要 root、sudo 或 Python，也不需要开放入站端口；Codex Worker 能力才需要 Python 3.12。
+发布包面向 Ubuntu 24.04 x86_64（或带 systemd、glibc 2.39+ 的兼容发行版）。公网服务器需要 Caddy（或等价 HTTPS 反向代理）。训练服务器上报在线状态和处理无副作用 probe 命令时不需要 root、sudo 或 Python，也不需要开放入站端口；Codex Worker 能力才需要 Python 3.12。
 
 下载并解压压缩包只会产生一个同名目录，不会自动安装任何文件。只有执行 `install.sh` 后才会创建下文列出的受管路径。
 
@@ -11,9 +11,9 @@
 不需要编译或登录 GitHub。公网服务器下载 Hub 包，训练服务器下载 Agent 包；两端都下载校验文件：
 
 ```bash
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.1.0/farhelm-hub-0.1.0-linux-x86_64.tar.gz
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.1.0/farhelm-agent-0.1.0-linux-x86_64.tar.gz
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.1.0/SHA256SUMS
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.2.0/farhelm-hub-0.2.0-linux-x86_64.tar.gz
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.2.0/farhelm-agent-0.2.0-linux-x86_64.tar.gz
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.2.0/SHA256SUMS
 sha256sum -c SHA256SUMS
 ```
 
@@ -27,11 +27,11 @@ grep 'farhelm-agent-' SHA256SUMS | sha256sum -c -
 
 ## 1. 公网服务器
 
-上传并解压 `farhelm-hub-0.1.0-linux-x86_64.tar.gz`：
+上传并解压 `farhelm-hub-0.2.0-linux-x86_64.tar.gz`：
 
 ```bash
-tar -xzf farhelm-hub-0.1.0-linux-x86_64.tar.gz
-cd farhelm-hub-0.1.0-linux-x86_64
+tar -xzf farhelm-hub-0.2.0-linux-x86_64.tar.gz
+cd farhelm-hub-0.2.0-linux-x86_64
 sudo ./install.sh
 ```
 
@@ -41,6 +41,7 @@ sudo ./install.sh
 - `/etc/farhelm/hub.env` 与 `/etc/farhelm/Caddyfile.example`：配置和代理示例。
 - `/etc/systemd/system/farhelm-hub.service`：系统服务。
 - `/usr/local/bin/farhelmctl`：健康检查 CLI。
+- `/var/lib/farhelm-hub/`：持久命令数据库；卸载时删除。
 - `farhelm-hub` 系统用户；不创建 home 目录。
 
 随后编辑包中的 `Caddyfile.example`，把域名改成自己的域名并合并到 `/etc/caddy/Caddyfile`：
@@ -66,8 +67,8 @@ sudo /opt/farhelm-hub/uninstall.sh
 不要使用 `sudo`。使用 Hub 安装器生成的 Agent token：
 
 ```bash
-tar -xzf farhelm-agent-0.1.0-linux-x86_64.tar.gz
-cd farhelm-agent-0.1.0-linux-x86_64
+tar -xzf farhelm-agent-0.2.0-linux-x86_64.tar.gz
+cd farhelm-agent-0.2.0-linux-x86_64
 
 FARHELM_HUB_URL="https://你的域名" \
 FARHELM_AGENT_TOKEN="Hub输出的Agent-token" \
@@ -77,7 +78,7 @@ FARHELM_AGENT_ID="gpu-a" \
 
 默认只创建两个 FarHelm 专属位置：
 
-- `${XDG_DATA_HOME:-~/.local/share}/farhelm-agent/`：二进制、Worker、配置和卸载器；配置权限为 `0600`。
+- `${XDG_DATA_HOME:-~/.local/share}/farhelm-agent/`：二进制、Worker、配置、命令状态数据库和卸载器；配置权限为 `0600`。
 - `${XDG_CONFIG_HOME:-~/.config}/systemd/user/farhelm-agent.service`：当前用户的 systemd 服务。
 
 它不会创建系统用户/组，不写 `/opt`、`/etc` 或 `/usr/local`。安装成功后可以删除下载的压缩包和解压目录。
@@ -90,6 +91,15 @@ journalctl --user -u farhelm-agent -n 50 --no-pager
 ```
 
 约一个心跳周期内，Console 的“服务器”页面会出现真实主机名、Agent ID、版本、最后心跳和在线状态。
+
+`0.2.0` 的命令通道只开放 `agent.probe`，用于验证持久化、TTL 和幂等恢复；它不读取项目或执行 shell。可用管理员认证创建 probe，再按返回的 `status_url` 查询状态：
+
+```bash
+curl --user admin \
+  --header 'Content-Type: application/json' \
+  --data '{"idempotency_key":"manual-probe-0001","ttl_secs":60}' \
+  https://你的域名/api/v1/agents/gpu-a/probe
+```
 
 用户服务可以立即运行，但退出登录或重启后持续运行需要服务器为该用户启用 systemd linger。安装器会检测并提示；若未启用，需要管理员执行一次：
 
@@ -128,4 +138,4 @@ ${XDG_DATA_HOME:-$HOME/.local/share}/farhelm-agent/uninstall.sh
 
 - 不得让 Hub 直接监听公网地址；应用会拒绝非 loopback bind。
 - 不要在聊天、Git 或公开日志中粘贴任何 `agent.env` 或 `hub.env`。
-- 当前版本只上报在线状态，不能启动/停止训练，也不连接真实 Codex。
+- 当前版本除在线状态外只执行无副作用 probe，不能启动/停止训练，也不连接真实 Codex。

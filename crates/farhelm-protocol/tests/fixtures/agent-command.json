@@ -1,0 +1,8 @@
+{
+  "protocol": "farhelm/1",
+  "command_id": "cmd_0000000000000001",
+  "agent_id": "gpu-a",
+  "action": "agent.probe",
+  "created_at_unix": 1788432000,
+  "expires_at_unix": 1788432060
+}

@@ -98,7 +98,7 @@ jobs:
       - run: ./tests/deployment-package.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: farhelm-0.1.0-linux-x86_64
+          name: farhelm-0.2.0-linux-x86_64
           path: |
             dist/release/*.tar.gz
             dist/release/SHA256SUMS

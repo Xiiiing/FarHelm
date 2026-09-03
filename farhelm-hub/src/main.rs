@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to bind FarHelm Hub to {address}"))?;
 
     info!(%address, "FarHelm Hub is listening");
-    axum::serve(listener, farhelm_hub::app(AppState::new(config)))
+    axum::serve(listener, farhelm_hub::app(AppState::new(config)?))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("FarHelm Hub server failed")?;
@@ -40,12 +40,17 @@ fn config_from_env() -> Result<HubConfig> {
     let admin_password = required_env("FARHELM_ADMIN_PASSWORD")?;
     let agent_token = required_env("FARHELM_AGENT_TOKEN")?;
     let console_dir = PathBuf::from(required_env("FARHELM_CONSOLE_DIR")?);
+    let database_path = PathBuf::from(
+        std::env::var("FARHELM_HUB_DATABASE")
+            .unwrap_or_else(|_| "/var/lib/farhelm-hub/farhelm.db".to_owned()),
+    );
 
     let config = HubConfig {
         admin_user,
         admin_password,
         agent_token,
         console_dir,
+        database_path,
     };
     config.validate()?;
     Ok(config)

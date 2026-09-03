@@ -4,7 +4,7 @@
 
 FarHelm 是一个面向个人科研与 GPU 训练环境的远程控制平面。它把多台训练服务器的状态、训练任务和 Codex 会话汇总到一个移动优先的 Web 控制台中，同时保持训练服务器仅主动出站、源码与凭据留在本机。
 
-> 当前状态：`0.1.0` 最小部署版本。公网 Hub 可通过独立管理员认证托管 Console，训练服务器 Agent 使用独立 token 主动上报真实在线状态；训练控制、远程 Codex 会话和 Web Push 尚未实现。
+> 当前状态：`0.2.0` 可靠命令底座。除 `0.1.0` 的公网 Console 与真实 Agent 在线状态外，Hub 和 Agent 现在会持久化异步命令、处理 TTL 与幂等重试；唯一开放动作是无副作用的 `agent.probe`，训练控制、远程 Codex 会话和 Web Push 仍未实现。
 
 ## 架构
 
@@ -51,6 +51,7 @@ FARHELM_ADMIN_USER=admin \
 FARHELM_ADMIN_PASSWORD=local-password-1234 \
 FARHELM_AGENT_TOKEN=local-agent-token-with-at-least-32-characters \
 FARHELM_CONSOLE_DIR=farhelm-console/dist \
+FARHELM_HUB_DATABASE=.farhelm/hub.db \
 cargo run -p farhelm-hub
 ```
 
@@ -90,9 +91,9 @@ make test-release
 普通用户无需编译或登录 GitHub，可直接下载公开 Release：
 
 ```bash
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.1.0/farhelm-hub-0.1.0-linux-x86_64.tar.gz
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.1.0/farhelm-agent-0.1.0-linux-x86_64.tar.gz
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.1.0/SHA256SUMS
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.2.0/farhelm-hub-0.2.0-linux-x86_64.tar.gz
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.2.0/farhelm-agent-0.2.0-linux-x86_64.tar.gz
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.2.0/SHA256SUMS
 sha256sum -c SHA256SUMS
 ```
 
@@ -127,11 +128,11 @@ uv run --project farhelm-worker-codex pytest
 
 ## 路线图
 
-1. 设计带持久化 outbox、幂等和恢复语义的 Agent–Hub 命令通道。
+1. 在已验证的持久命令底座上加入 WSS 唤醒和 Agent 事件 outbox。
 2. 固化 Agent–Worker 协议并验证 Codex SDK 生命周期。
 3. 完成单台训练服务器的训练任务与 Codex 会话闭环。
 4. 加入 GPU、训练任务、指标、日志和通知。
-5. 扩展到多服务器并验证原子升级与回滚。
+5. 扩展到多服务器、每 Agent 身份，并验证原子升级与回滚。
 
 ## 许可证
 

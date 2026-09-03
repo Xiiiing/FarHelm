@@ -81,6 +81,97 @@ pub struct AgentListResponse {
     pub agents: Vec<AgentSummary>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommandAction {
+    #[serde(rename = "agent.probe")]
+    AgentProbe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CommandState {
+    Queued,
+    Delivered,
+    Accepted,
+    Completed,
+    Failed,
+    Expired,
+    Cancelled,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateProbeCommand {
+    pub idempotency_key: String,
+    pub ttl_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCommand {
+    pub protocol: String,
+    pub command_id: String,
+    pub agent_id: String,
+    pub action: CommandAction,
+    pub created_at_unix: u64,
+    pub expires_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandAccepted {
+    pub protocol: String,
+    pub command_id: String,
+    pub state: CommandState,
+    pub expires_at_unix: u64,
+    pub status_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandClaimRequest {
+    pub protocol: String,
+    pub agent_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandClaimResponse {
+    pub protocol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<AgentCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbeResult {
+    pub agent_version: String,
+    pub hostname: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandReportRequest {
+    pub protocol: String,
+    pub agent_id: String,
+    pub command_id: String,
+    pub state: CommandState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<ProbeResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandStatusResponse {
+    pub protocol: String,
+    pub command_id: String,
+    pub agent_id: String,
+    pub action: CommandAction,
+    pub state: CommandState,
+    pub created_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub updated_at_unix: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<ProbeResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerRequest {
     pub protocol: String,
@@ -207,6 +298,25 @@ mod tests {
                 "agent_id": "gpu-a",
                 "hostname": "trainer-a",
                 "agent_version": "0.1.0"
+            })
+        );
+    }
+
+    #[test]
+    fn command_fixture_is_stable() {
+        let command: AgentCommand =
+            serde_json::from_str(include_str!("../tests/fixtures/agent-command.json")).unwrap();
+        assert_eq!(command.action, CommandAction::AgentProbe);
+        assert_eq!(command.command_id, "cmd_0000000000000001");
+        assert_eq!(
+            serde_json::to_value(command).unwrap(),
+            serde_json::json!({
+                "protocol": "farhelm/1",
+                "command_id": "cmd_0000000000000001",
+                "agent_id": "gpu-a",
+                "action": "agent.probe",
+                "created_at_unix": 1_788_432_000_u64,
+                "expires_at_unix": 1_788_432_060_u64
             })
         );
     }

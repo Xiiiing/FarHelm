@@ -36,6 +36,7 @@ ln -sfn "$release_dir" /opt/farhelm-hub/current
 install -m 0755 "$bundle_dir/bin/farhelmctl" /usr/local/bin/farhelmctl
 install -m 0755 "$bundle_dir/uninstall.sh" /opt/farhelm-hub/uninstall.sh
 install -d -m 0755 "$config_dir"
+install -d -m 0750 -o farhelm-hub -g farhelm-hub /var/lib/farhelm-hub
 
 generated=false
 if [[ ! -e "$config_file" ]]; then
@@ -61,9 +62,13 @@ if [[ ! -e "$config_file" ]]; then
     printf 'FARHELM_ADMIN_PASSWORD=%s\n' "$admin_password"
     printf 'FARHELM_AGENT_TOKEN=%s\n' "$agent_token"
     printf 'FARHELM_CONSOLE_DIR=/opt/farhelm-hub/current/console\n'
+    printf 'FARHELM_HUB_DATABASE=/var/lib/farhelm-hub/farhelm.db\n'
     printf 'RUST_LOG=farhelm_hub=info\n'
   } >"$config_file"
   generated=true
+fi
+if ! grep -q '^FARHELM_HUB_DATABASE=' "$config_file"; then
+  printf 'FARHELM_HUB_DATABASE=/var/lib/farhelm-hub/farhelm.db\n' >>"$config_file"
 fi
 chown root:farhelm-hub "$config_file"
 chmod 0640 "$config_file"

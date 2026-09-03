@@ -23,7 +23,7 @@ def test_worker_hello_advertises_only_implemented_capability() -> None:
     assert response["request_id"] == "req_test"
     assert response["result"] == {
         "worker": "farhelm-worker-codex",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "capabilities": ["worker.hello"],
     }
 
