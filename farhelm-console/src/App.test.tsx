@@ -12,6 +12,19 @@ const healthy = {
   protocol: 'farhelm/1',
 }
 
+const noAgents = { protocol: 'farhelm/1', agents: [] }
+
+function mockApi(agentResponse: unknown = noAgents) {
+  return vi.fn().mockImplementation((input: RequestInfo | URL) => {
+    const url = String(input)
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve(url.endsWith('/api/v1/agents') ? agentResponse : healthy),
+    })
+  })
+}
+
 afterEach(() => {
   vi.unstubAllGlobals()
   localStorage.clear()
@@ -19,7 +32,7 @@ afterEach(() => {
 
 describe('FarHelm Console', () => {
   it('shows only validated Hub health data', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(healthy) }))
+    vi.stubGlobal('fetch', mockApi())
     render(<MemoryRouter><App /></MemoryRouter>)
 
     expect(screen.getByText('正在验证协议与服务状态…')).toBeInTheDocument()
@@ -43,5 +56,34 @@ describe('FarHelm Console', () => {
     await user.click(screen.getByRole('button', { name: '切换到深色主题' }))
     await waitFor(() => expect(localStorage.getItem('farhelm-color-mode')).toBe('dark'))
     expect(document.documentElement.dataset.theme).toBe('dark')
+  })
+
+  it('renders real Agent heartbeat data', async () => {
+    vi.stubGlobal('fetch', mockApi({
+      protocol: 'farhelm/1',
+      agents: [{
+        agent_id: 'gpu-a',
+        hostname: 'trainer-a',
+        agent_version: '0.1.0',
+        last_seen_unix: 1_788_400_000,
+        online: true,
+      }],
+    }))
+    render(<MemoryRouter initialEntries={['/agents']}><App /></MemoryRouter>)
+
+    expect(await screen.findByText('trainer-a')).toBeInTheDocument()
+    expect(screen.getByText('gpu-a')).toBeInTheDocument()
+    expect(screen.getByText('在线')).toBeInTheDocument()
+  })
+
+  it('rejects malformed Agent data without rendering it', async () => {
+    vi.stubGlobal('fetch', mockApi({
+      protocol: 'farhelm/1',
+      agents: [{ agent_id: 'gpu-a', last_seen_unix: 'not-a-number' }],
+    }))
+    render(<MemoryRouter initialEntries={['/agents']}><App /></MemoryRouter>)
+
+    expect(await screen.findByText('无法读取 Agent 列表')).toBeInTheDocument()
+    expect(screen.queryByText('gpu-a')).not.toBeInTheDocument()
   })
 })

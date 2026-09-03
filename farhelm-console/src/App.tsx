@@ -16,7 +16,9 @@ import { useState } from 'react'
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 
 import { EmptyFeature } from './components/EmptyFeature'
+import { AgentListPage } from './components/AgentListPage'
 import { Overview } from './components/Overview'
+import { useAgents } from './hooks/useAgents'
 import { useColorMode } from './hooks/useColorMode'
 import { useHubHealth } from './hooks/useHubHealth'
 import { createTheme } from './theme'
@@ -42,10 +44,15 @@ const mobileItems = [
 
 function FeatureRoutes() {
   const { health, refresh } = useHubHealth()
+  const { agents, refresh: refreshAgents } = useAgents()
+  const refreshOverview = () => {
+    refresh()
+    refreshAgents()
+  }
   return (
     <Routes>
-      <Route path="/" element={<Overview health={health} onRefresh={refresh} />} />
-      <Route path="/agents" element={<EmptyFeature title="Agent" description="训练服务器接入将在后续需求中实现。" icon={<DesktopOutlined className="empty-icon" />} />} />
+      <Route path="/" element={<Overview health={health} agents={agents} onRefresh={refreshOverview} />} />
+      <Route path="/agents" element={<AgentListPage agents={agents} onRefresh={refreshAgents} />} />
       <Route path="/jobs" element={<EmptyFeature title="任务" description="任务编排与监控尚未接入真实数据。" icon={<UnorderedListOutlined className="empty-icon" />} />} />
       <Route path="/codex" element={<EmptyFeature title="Codex" description="真实 Codex 会话不在首轮骨架范围内。" icon={<CodeOutlined className="empty-icon" />} />} />
       <Route path="/notifications" element={<EmptyFeature title="通知" description="通知与 Web Push 将在可靠性设计完成后提供。" icon={<BellOutlined className="empty-icon" />} />} />

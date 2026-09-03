@@ -1,4 +1,4 @@
-.PHONY: check test test-ui run-hub run-console smoke-worker privacy
+.PHONY: check test test-ui run-hub run-console smoke smoke-worker privacy release test-release
 
 check:
 	cargo fmt --all -- --check
@@ -20,9 +20,18 @@ run-hub:
 run-console:
 	corepack pnpm@10.17.1 --dir farhelm-console dev
 
+smoke:
+	./tests/smoke.sh
+
 smoke-worker:
 	cargo run -p farhelm-agent -- worker-smoke
 
 privacy:
 	./scripts/check-private-files.sh
 	./scripts/check-readme-parity.sh
+
+release:
+	./scripts/build-release.sh
+
+test-release: release
+	./tests/deployment-package.sh

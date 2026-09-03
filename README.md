@@ -4,7 +4,7 @@
 
 FarHelm 是一个面向个人科研与 GPU 训练环境的远程控制平面。它把多台训练服务器的状态、训练任务和 Codex 会话汇总到一个移动优先的 Web 控制台中，同时保持训练服务器仅主动出站、源码与凭据留在本机。
 
-> 当前状态：`0.1.0` 项目骨架。仓库目前提供组件边界、健康检查、Agent 与 Worker 握手以及响应式控制台外壳；认证、训练控制、远程 Codex 会话和 Web Push 尚未实现。
+> 当前状态：`0.1.0` 最小部署版本。公网 Hub 可通过独立管理员认证托管 Console，训练服务器 Agent 使用独立 token 主动上报真实在线状态；训练控制、远程 Codex 会话和 Web Push 尚未实现。
 
 ## 架构
 
@@ -16,9 +16,9 @@ flowchart LR
     Worker["farhelm-worker-codex\nPython adapter"]
     CLI["farhelmctl\nRust CLI"]
 
-    Console -->|HTTPS / SSE| Hub
+    Console -->|HTTPS + Basic Auth| Hub
     CLI -->|HTTPS| Hub
-    Agent -->|outbound WSS| Hub
+    Agent -->|outbound HTTPS heartbeat| Hub
     Agent -->|framed JSON over stdio| Worker
 ```
 
@@ -32,7 +32,7 @@ FarHelm 是一个产品和一个 monorepo，但不同运行角色保持最小权
 | `farhelm-worker-codex` | Codex SDK 隔离适配层 | Python 3.12、uv |
 | `farhelmctl` | 安装、诊断与管理入口 | Rust、Clap |
 
-共享 Rust 类型位于 `crates/`。Hub 与 Agent 分离编译，Worker 不监听网络，Console 在开发阶段通过代理访问 Hub。
+共享 Rust 类型位于 `crates/`。Hub 与 Agent 分离编译，Worker 不监听网络；Hub 在部署包内托管 Console，开发阶段仍可通过 Vite 代理访问。
 
 ## 快速开始
 
@@ -43,9 +43,14 @@ corepack pnpm@10.17.1 --dir farhelm-console install
 uv sync --project farhelm-worker-codex --all-groups
 ```
 
-启动 Hub：
+构建 Console，然后使用仅限本机测试的凭据启动 Hub：
 
 ```bash
+corepack pnpm@10.17.1 --dir farhelm-console build
+FARHELM_ADMIN_USER=admin \
+FARHELM_ADMIN_PASSWORD=local-password-1234 \
+FARHELM_AGENT_TOKEN=local-agent-token-with-at-least-32-characters \
+FARHELM_CONSOLE_DIR=farhelm-console/dist \
 cargo run -p farhelm-hub
 ```
 
@@ -63,6 +68,26 @@ corepack pnpm@10.17.1 --dir farhelm-console dev
 cargo run -p farhelmctl -- health
 cargo run -p farhelm-agent -- worker-smoke
 ```
+
+发送一次本机 Agent 心跳：
+
+```bash
+FARHELM_HUB_URL=http://127.0.0.1:8787 \
+FARHELM_AGENT_TOKEN=local-agent-token-with-at-least-32-characters \
+FARHELM_AGENT_ID=gpu-a \
+cargo run -p farhelm-agent -- heartbeat
+```
+
+## 部署包
+
+在 Linux x86_64 构建两个可安装包。当前二进制运行目标为 Ubuntu 24.04 x86_64（或 glibc 2.39+ 的兼容系统）：
+
+```bash
+make release
+make test-release
+```
+
+产物位于 `dist/release/`：公网服务器使用 `farhelm-hub-0.1.0-linux-x86_64.tar.gz`，训练服务器使用 `farhelm-agent-0.1.0-linux-x86_64.tar.gz`。完整 systemd、Caddy 和安装步骤见[部署说明](deploy/README.md)。Hub 必须只监听 loopback 并经 HTTPS 反向代理公开。
 
 ## 开发检查
 
@@ -83,6 +108,8 @@ uv run --project farhelm-worker-codex pytest
 ## 安全边界
 
 - 训练服务器不需要开放新的公网入站端口。
+- Hub 拒绝绑定非 loopback 地址；公网 TLS 由 Caddy 或等价反向代理终止。
+- 管理员凭据与 Agent token 相互独立，并保存在 `/etc/farhelm/*.env` 权限文件中。
 - Hub 不保存 Codex 登录凭据、SSH 私钥或项目源码。
 - Worker 仅通过 stdin/stdout 与 Agent 通信，不提供网络服务。
 - 首版不会提供任意远程 shell；未来写操作必须经过白名单、TTL、幂等与审计。
@@ -90,9 +117,9 @@ uv run --project farhelm-worker-codex pytest
 
 ## 路线图
 
-1. 固化 Agent–Worker 协议并验证 Codex SDK 生命周期。
-2. 完成单台训练服务器、Hub 与 PWA 的端到端会话闭环。
-3. 加入断线补发、幂等、worktree 隔离与可审查 diff。
+1. 设计带持久化 outbox、幂等和恢复语义的 Agent–Hub 命令通道。
+2. 固化 Agent–Worker 协议并验证 Codex SDK 生命周期。
+3. 完成单台训练服务器的训练任务与 Codex 会话闭环。
 4. 加入 GPU、训练任务、指标、日志和通知。
 5. 扩展到多服务器并验证原子升级与回滚。
 

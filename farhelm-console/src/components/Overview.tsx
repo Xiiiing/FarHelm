@@ -2,19 +2,21 @@ import { CheckCircleOutlined, DisconnectOutlined, ReloadOutlined } from '@ant-de
 import { Alert, Button, Card, Col, Row, Space, Spin, Tag, Typography } from 'antd'
 
 import type { HealthResponse } from '../api/health'
+import type { AgentsState } from '../hooks/useAgents'
 
 type HubHealth =
   | { state: 'checking'; data?: undefined; message?: undefined }
   | { state: 'online'; data: HealthResponse; message?: undefined }
   | { state: 'offline'; data?: undefined; message: string }
 
-export function Overview({ health, onRefresh }: { health: HubHealth; onRefresh: () => void }) {
+export function Overview({ health, agents, onRefresh }: { health: HubHealth; agents: AgentsState; onRefresh: () => void }) {
+  const onlineAgents = agents.state === 'ready' ? agents.data.agents.filter((agent) => agent.online).length : undefined
   return (
     <section aria-labelledby="overview-title" className="feature-page">
       <div className="page-heading">
         <div>
           <Typography.Text className="eyebrow">CONTROL PLANE</Typography.Text>
-          <Typography.Title id="overview-title" level={2}>
+          <Typography.Title id="overview-title" level={1}>
             运行总览
           </Typography.Title>
           <Typography.Paragraph type="secondary">
@@ -60,10 +62,12 @@ export function Overview({ health, onRefresh }: { health: HubHealth; onRefresh: 
         <Col xs={24} lg={12}>
           <Card title="系统范围" className="status-card">
             <Typography.Paragraph type="secondary">
-              当前版本只提供连通性骨架。Agent、训练任务与 Codex 会话尚未接入真实数据源。
+              Agent 在线状态来自真实心跳；训练任务与 Codex 会话仍未接入。
             </Typography.Paragraph>
             <Space wrap>
-              <Tag>Agent 未接入</Tag>
+              {onlineAgents === undefined && <Tag>Agent 状态不可用</Tag>}
+              {onlineAgents === 0 && <Tag>尚无 Agent 心跳</Tag>}
+              {onlineAgents !== undefined && onlineAgents > 0 && <Tag color="success">{onlineAgents} 台 Agent 在线</Tag>}
               <Tag>任务未接入</Tag>
               <Tag>Codex 未连接</Tag>
             </Space>

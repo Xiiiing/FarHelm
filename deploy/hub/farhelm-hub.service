@@ -1,0 +1,27 @@
+[Unit]
+Description=FarHelm public control hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=farhelm-hub
+Group=farhelm-hub
+EnvironmentFile=/etc/farhelm/hub.env
+ExecStart=/opt/farhelm-hub/current/bin/farhelm-hub
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+CapabilityBoundingSet=
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

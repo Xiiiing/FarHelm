@@ -9,6 +9,23 @@ test.beforeEach(async ({ page }) => {
       body: JSON.stringify({ status: 'ok', service: 'farhelm-hub', version: '0.1.0', protocol: 'farhelm/1' }),
     }),
   )
+  await page.route('**/api/v1/agents', (route) =>
+    route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        protocol: 'farhelm/1',
+        agents: [
+          {
+            agent_id: 'gpu-a',
+            hostname: 'trainer-a',
+            agent_version: '0.1.0',
+            last_seen_unix: Math.floor(Date.now() / 1000),
+            online: true,
+          },
+        ],
+      }),
+    }),
+  )
   await page.goto('/')
 })
 
@@ -34,4 +51,12 @@ test('keyboard navigation reaches visible controls', async ({ page }) => {
   await page.keyboard.press('Tab')
   const focused = page.locator(':focus-visible')
   await expect(focused).toHaveCount(1)
+})
+
+test('agent page renders validated Hub data', async ({ page }) => {
+  await page.goto('/agents')
+  await expect(page.getByRole('heading', { name: '服务器' })).toBeVisible()
+  await expect(page.getByText('trainer-a')).toBeVisible()
+  await expect(page.getByText('gpu-a')).toBeVisible()
+  await expect(page.getByText('在线', { exact: true })).toBeVisible()
 })

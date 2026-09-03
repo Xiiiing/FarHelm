@@ -1,0 +1,6 @@
+# Replace the hostname, ensure DNS points at this server, then merge this site
+# block into /etc/caddy/Caddyfile and reload Caddy.
+farhelm.example.com {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:8787
+}

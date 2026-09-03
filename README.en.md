@@ -4,7 +4,7 @@
 
 FarHelm is a remote control plane for personal research and GPU training environments. It brings server health, training jobs, and Codex sessions from multiple machines into one mobile-first web console while keeping training hosts outbound-only and retaining source code and credentials locally.
 
-> Current status: `0.1.0` project skeleton. The repository currently provides component boundaries, a health endpoint, an Agent-to-Worker handshake, and a responsive console shell. Authentication, training control, remote Codex sessions, and Web Push are not implemented yet.
+> Current status: `0.1.0` minimal deployment. The public Hub serves Console behind separate admin authentication, while training-host Agents use a separate token to report real presence outbound. Training control, remote Codex sessions, and Web Push are not implemented yet.
 
 ## Architecture
 
@@ -16,9 +16,9 @@ flowchart LR
     Worker["farhelm-worker-codex\nPython adapter"]
     CLI["farhelmctl\nRust CLI"]
 
-    Console -->|HTTPS / SSE| Hub
+    Console -->|HTTPS + Basic Auth| Hub
     CLI -->|HTTPS| Hub
-    Agent -->|outbound WSS| Hub
+    Agent -->|outbound HTTPS heartbeat| Hub
     Agent -->|framed JSON over stdio| Worker
 ```
 
@@ -32,7 +32,7 @@ FarHelm is one product in one monorepo, while each runtime role retains least pr
 | `farhelm-worker-codex` | Isolated Codex SDK adapter | Python 3.12, uv |
 | `farhelmctl` | Installation, diagnostics, and management | Rust, Clap |
 
-Shared Rust types live under `crates/`. Hub and Agent are compiled separately, the Worker does not listen on a network socket, and the Console proxies to Hub during development.
+Shared Rust types live under `crates/`. Hub and Agent are compiled separately and the Worker does not listen on a network socket. A deployment bundle lets Hub serve Console; Vite still proxies to Hub during development.
 
 ## Quick start
 
@@ -43,9 +43,14 @@ corepack pnpm@10.17.1 --dir farhelm-console install
 uv sync --project farhelm-worker-codex --all-groups
 ```
 
-Start Hub:
+Build Console and start Hub with loopback-only test credentials:
 
 ```bash
+corepack pnpm@10.17.1 --dir farhelm-console build
+FARHELM_ADMIN_USER=admin \
+FARHELM_ADMIN_PASSWORD=local-password-1234 \
+FARHELM_AGENT_TOKEN=local-agent-token-with-at-least-32-characters \
+FARHELM_CONSOLE_DIR=farhelm-console/dist \
 cargo run -p farhelm-hub
 ```
 
@@ -63,6 +68,26 @@ Verify the CLI and Worker:
 cargo run -p farhelmctl -- health
 cargo run -p farhelm-agent -- worker-smoke
 ```
+
+Send one local Agent heartbeat:
+
+```bash
+FARHELM_HUB_URL=http://127.0.0.1:8787 \
+FARHELM_AGENT_TOKEN=local-agent-token-with-at-least-32-characters \
+FARHELM_AGENT_ID=gpu-a \
+cargo run -p farhelm-agent -- heartbeat
+```
+
+## Deployment bundles
+
+Build two installable Linux x86_64 bundles. The current binary target is Ubuntu 24.04 x86_64 or a compatible glibc 2.39+ system:
+
+```bash
+make release
+make test-release
+```
+
+Artifacts are written to `dist/release/`: use `farhelm-hub-0.1.0-linux-x86_64.tar.gz` on the public server and `farhelm-agent-0.1.0-linux-x86_64.tar.gz` on the training server. See the complete systemd, Caddy, and installation instructions in the [deployment guide](deploy/README.en.md). Hub must remain on loopback and be exposed only through an HTTPS reverse proxy.
 
 ## Development checks
 
@@ -83,6 +108,8 @@ uv run --project farhelm-worker-codex pytest
 ## Security boundaries
 
 - Training hosts do not need new public inbound ports.
+- Hub rejects non-loopback binds; Caddy or an equivalent reverse proxy terminates public TLS.
+- Admin credentials and the Agent token are independent and stored in permission-restricted `/etc/farhelm/*.env` files.
 - Hub does not store Codex login credentials, SSH private keys, or project source code.
 - Worker communicates with Agent only over stdin/stdout and exposes no network service.
 - The first release does not expose an arbitrary remote shell; future mutations require allowlists, TTLs, idempotency, and auditing.
@@ -90,9 +117,9 @@ uv run --project farhelm-worker-codex pytest
 
 ## Roadmap
 
-1. Stabilize the Agent–Worker protocol and validate the Codex SDK lifecycle.
-2. Complete the single-host Hub and PWA session loop.
-3. Add replay, idempotency, worktree isolation, and reviewable diffs.
+1. Design an Agent–Hub command channel with a durable outbox, idempotency, and recovery semantics.
+2. Stabilize the Agent–Worker protocol and validate the Codex SDK lifecycle.
+3. Complete training-job and Codex session flows for one training host.
 4. Add GPU and training-job metrics, logs, and notifications.
 5. Expand to multiple hosts and validate atomic upgrades and rollback.
 

@@ -96,6 +96,13 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .empty-card { margin-top: 20px; min-height: 360px; display: grid; place-items: center; }
 .empty-card .ant-card-body { width: 100%; }
 .empty-icon { color: #9AA8B6; font-size: 48px; }
+.agent-list-card { margin-top: 20px; min-height: 128px; }
+.agent-row { padding: 20px 24px !important; align-items: center !important; }
+.agent-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.agent-facts { margin: 0; display: flex; gap: 32px; }
+.agent-facts div { display: grid; gap: 4px; }
+.agent-facts dt { color: #9AA8B6; font-size: 12px; }
+.agent-facts dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
 
 .mobile-nav {
   position: fixed;
@@ -138,6 +145,8 @@ button, a { -webkit-tap-highlight-color: transparent; }
   .page-heading > .ant-btn { align-self: stretch; }
   .status-card { min-height: 0; }
   .empty-card { min-height: 300px; }
+  .agent-row { align-items: flex-start !important; flex-direction: column; gap: 16px; padding: 20px !important; }
+  .agent-facts { width: 100%; display: grid; grid-template-columns: 1fr; gap: 12px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

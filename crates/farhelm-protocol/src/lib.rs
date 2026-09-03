@@ -35,6 +35,52 @@ impl HealthResponse {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHeartbeat {
+    pub protocol: String,
+    pub agent_id: String,
+    pub hostname: String,
+    pub agent_version: String,
+}
+
+impl AgentHeartbeat {
+    #[must_use]
+    pub fn new(
+        agent_id: impl Into<String>,
+        hostname: impl Into<String>,
+        agent_version: impl Into<String>,
+    ) -> Self {
+        Self {
+            protocol: FARHELM_PROTOCOL.to_owned(),
+            agent_id: agent_id.into(),
+            hostname: hostname.into(),
+            agent_version: agent_version.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHeartbeatAck {
+    pub accepted: bool,
+    pub protocol: String,
+    pub server_time_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSummary {
+    pub agent_id: String,
+    pub hostname: String,
+    pub agent_version: String,
+    pub last_seen_unix: u64,
+    pub online: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentListResponse {
+    pub protocol: String,
+    pub agents: Vec<AgentSummary>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerRequest {
     pub protocol: String,
@@ -146,6 +192,21 @@ mod tests {
                 "service": "farhelm-hub",
                 "version": "0.1.0",
                 "protocol": "farhelm/1"
+            })
+        );
+    }
+
+    #[test]
+    fn agent_heartbeat_shape_is_stable() {
+        let value =
+            serde_json::to_value(AgentHeartbeat::new("gpu-a", "trainer-a", "0.1.0")).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "protocol": "farhelm/1",
+                "agent_id": "gpu-a",
+                "hostname": "trainer-a",
+                "agent_version": "0.1.0"
             })
         );
     }

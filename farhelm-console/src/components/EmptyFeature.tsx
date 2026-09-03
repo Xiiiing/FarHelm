@@ -10,7 +10,7 @@ type EmptyFeatureProps = {
 export function EmptyFeature({ title, description, icon }: EmptyFeatureProps) {
   return (
     <section aria-labelledby="feature-title" className="feature-page">
-      <Typography.Title id="feature-title" level={2}>
+      <Typography.Title id="feature-title" level={1}>
         {title}
       </Typography.Title>
       <Card className="empty-card">
