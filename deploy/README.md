@@ -6,6 +6,25 @@
 
 下载并解压压缩包只会产生一个同名目录，不会自动安装任何文件。只有执行 `install.sh` 后才会创建下文列出的受管路径。
 
+## 从 GitHub 下载
+
+不需要编译或登录 GitHub。公网服务器下载 Hub 包，训练服务器下载 Agent 包；两端都下载校验文件：
+
+```bash
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.1.0/farhelm-hub-0.1.0-linux-x86_64.tar.gz
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.1.0/farhelm-agent-0.1.0-linux-x86_64.tar.gz
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.1.0/SHA256SUMS
+sha256sum -c SHA256SUMS
+```
+
+如果一台机器只下载了其中一个压缩包，使用 `grep` 校验该文件：
+
+```bash
+grep 'farhelm-hub-' SHA256SUMS | sha256sum -c -
+# 或
+grep 'farhelm-agent-' SHA256SUMS | sha256sum -c -
+```
+
 ## 1. 公网服务器
 
 上传并解压 `farhelm-hub-0.1.0-linux-x86_64.tar.gz`：

@@ -6,6 +6,25 @@ Bundles target Ubuntu 24.04 x86_64, or a compatible systemd distribution with gl
 
 Downloading and extracting a bundle creates only one same-named directory and does not install anything. Managed paths are created only after you run `install.sh`.
 
+## Download from GitHub
+
+No compilation or GitHub login is required. Download the Hub bundle on the public server, the Agent bundle on the training server, and the checksum file on both:
+
+```bash
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.1.0/farhelm-hub-0.1.0-linux-x86_64.tar.gz
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.1.0/farhelm-agent-0.1.0-linux-x86_64.tar.gz
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.1.0/SHA256SUMS
+sha256sum -c SHA256SUMS
+```
+
+If a host downloads only one bundle, verify that file with:
+
+```bash
+grep 'farhelm-hub-' SHA256SUMS | sha256sum -c -
+# or
+grep 'farhelm-agent-' SHA256SUMS | sha256sum -c -
+```
+
 ## 1. Public server
 
 Upload and extract `farhelm-hub-0.1.0-linux-x86_64.tar.gz`:

@@ -87,7 +87,16 @@ make release
 make test-release
 ```
 
-产物位于 `dist/release/`：公网服务器使用 `farhelm-hub-0.1.0-linux-x86_64.tar.gz`，训练服务器使用 `farhelm-agent-0.1.0-linux-x86_64.tar.gz`。训练端为纯用户态安装，不需要 root/sudo；两个包都包含卸载器。完整目录、systemd、Caddy、前台运行和卸载步骤见[部署说明](deploy/README.md)。Hub 必须只监听 loopback 并经 HTTPS 反向代理公开。
+普通用户无需编译或登录 GitHub，可直接下载公开 Release：
+
+```bash
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.1.0/farhelm-hub-0.1.0-linux-x86_64.tar.gz
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.1.0/farhelm-agent-0.1.0-linux-x86_64.tar.gz
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.1.0/SHA256SUMS
+sha256sum -c SHA256SUMS
+```
+
+公网服务器使用 Hub 包，训练服务器使用 Agent 包。训练端为纯用户态安装，不需要 root/sudo；两个包都包含卸载器。完整目录、systemd、Caddy、前台运行和卸载步骤见[部署说明](deploy/README.md)。Hub 必须只监听 loopback 并经 HTTPS 反向代理公开。
 
 ## 开发检查
 

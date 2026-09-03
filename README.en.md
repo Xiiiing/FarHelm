@@ -87,7 +87,16 @@ make release
 make test-release
 ```
 
-Artifacts are written to `dist/release/`: use `farhelm-hub-0.1.0-linux-x86_64.tar.gz` on the public server and `farhelm-agent-0.1.0-linux-x86_64.tar.gz` on the training server. Agent installation is fully unprivileged and both bundles include uninstallers. See the complete path list, systemd, Caddy, foreground-run, and removal instructions in the [deployment guide](deploy/README.en.md). Hub must remain on loopback and be exposed only through an HTTPS reverse proxy.
+End users need neither compilation nor a GitHub login and can download the public Release directly:
+
+```bash
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.1.0/farhelm-hub-0.1.0-linux-x86_64.tar.gz
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.1.0/farhelm-agent-0.1.0-linux-x86_64.tar.gz
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.1.0/SHA256SUMS
+sha256sum -c SHA256SUMS
+```
+
+Use the Hub bundle on the public server and the Agent bundle on the training server. Agent installation is fully unprivileged and both bundles include uninstallers. See the complete path list, systemd, Caddy, foreground-run, and removal instructions in the [deployment guide](deploy/README.en.md). Hub must remain on loopback and be exposed only through an HTTPS reverse proxy.
 
 ## Development checks
 
