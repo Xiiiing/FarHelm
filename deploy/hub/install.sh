@@ -12,7 +12,7 @@ release_dir="/opt/farhelm-hub/releases/$version"
 config_dir=/etc/farhelm
 config_file="$config_dir/hub.env"
 
-for required in bin/farhelm-hub bin/farhelmctl console/index.html farhelm-hub.service Caddyfile.example; do
+for required in bin/farhelm-hub bin/farhelmctl console/index.html farhelm-hub.service Caddyfile.example uninstall.sh; do
   if [[ ! -e "$bundle_dir/$required" ]]; then
     printf 'Bundle is incomplete: %s is missing.\n' "$required" >&2
     exit 1
@@ -23,7 +23,9 @@ command -v systemctl >/dev/null || { printf 'systemd is required.\n' >&2; exit 1
 command -v openssl >/dev/null || { printf 'openssl is required to generate credentials.\n' >&2; exit 1; }
 
 if ! id farhelm-hub >/dev/null 2>&1; then
-  useradd --system --home-dir /var/lib/farhelm-hub --create-home --shell /usr/sbin/nologin farhelm-hub
+  nologin=$(command -v nologin || true)
+  [[ -n "$nologin" ]] || nologin=/usr/sbin/nologin
+  useradd --system --home-dir /nonexistent --no-create-home --shell "$nologin" farhelm-hub
 fi
 
 install -d -m 0755 /opt/farhelm-hub/releases "$release_dir/bin" "$release_dir/console"
@@ -32,6 +34,7 @@ install -m 0755 "$bundle_dir/bin/farhelmctl" "$release_dir/bin/farhelmctl"
 cp -a "$bundle_dir/console/." "$release_dir/console/"
 ln -sfn "$release_dir" /opt/farhelm-hub/current
 install -m 0755 "$bundle_dir/bin/farhelmctl" /usr/local/bin/farhelmctl
+install -m 0755 "$bundle_dir/uninstall.sh" /opt/farhelm-hub/uninstall.sh
 install -d -m 0755 "$config_dir"
 
 generated=false
@@ -81,3 +84,4 @@ if [[ "$generated" == true ]]; then
 else
   printf 'Existing credentials were preserved in %s.\n' "$config_file"
 fi
+printf 'Uninstall completely with: sudo /opt/farhelm-hub/uninstall.sh\n'

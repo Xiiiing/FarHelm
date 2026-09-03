@@ -87,7 +87,7 @@ make release
 make test-release
 ```
 
-产物位于 `dist/release/`：公网服务器使用 `farhelm-hub-0.1.0-linux-x86_64.tar.gz`，训练服务器使用 `farhelm-agent-0.1.0-linux-x86_64.tar.gz`。完整 systemd、Caddy 和安装步骤见[部署说明](deploy/README.md)。Hub 必须只监听 loopback 并经 HTTPS 反向代理公开。
+产物位于 `dist/release/`：公网服务器使用 `farhelm-hub-0.1.0-linux-x86_64.tar.gz`，训练服务器使用 `farhelm-agent-0.1.0-linux-x86_64.tar.gz`。训练端为纯用户态安装，不需要 root/sudo；两个包都包含卸载器。完整目录、systemd、Caddy、前台运行和卸载步骤见[部署说明](deploy/README.md)。Hub 必须只监听 loopback 并经 HTTPS 反向代理公开。
 
 ## 开发检查
 
@@ -108,6 +108,7 @@ uv run --project farhelm-worker-codex pytest
 ## 安全边界
 
 - 训练服务器不需要开放新的公网入站端口。
+- 训练服务器 Agent 不要求 root 或系统目录写权限；仅使用 XDG 用户数据目录和用户级 systemd unit。
 - Hub 拒绝绑定非 loopback 地址；公网 TLS 由 Caddy 或等价反向代理终止。
 - 管理员凭据与 Agent token 相互独立，并保存在 `/etc/farhelm/*.env` 权限文件中。
 - Hub 不保存 Codex 登录凭据、SSH 私钥或项目源码。

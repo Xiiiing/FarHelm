@@ -1,57 +1,69 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-  printf 'Run this installer as root (for example: sudo ./install.sh).\n' >&2
+if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+  printf 'Do not use root or sudo. Run this installer as the training user.\n' >&2
   exit 1
 fi
 
 bundle_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 version=$(<"$bundle_dir/VERSION")
-release_dir="/opt/farhelm-agent/releases/$version"
-config_dir=/etc/farhelm
-config_file="$config_dir/agent.env"
-run_user=${FARHELM_RUN_USER:-${SUDO_USER:-}}
+user_name=$(id -un)
+user_home=$(getent passwd "$user_name" | cut -d: -f6)
+if [[ -z "$user_home" ]] || [[ "$user_home" != /* ]]; then
+  printf 'Unable to resolve an absolute home directory for %s.\n' "$user_name" >&2
+  exit 1
+fi
+data_home=${XDG_DATA_HOME:-"$user_home/.local/share"}
+config_home=${XDG_CONFIG_HOME:-"$user_home/.config"}
+install_root="$data_home/farhelm-agent"
+config_file="$install_root/config/agent.env"
+unit_dir="$config_home/systemd/user"
+unit_file="$unit_dir/farhelm-agent.service"
 hub_url=${FARHELM_HUB_URL:-}
 agent_token=${FARHELM_AGENT_TOKEN:-}
 agent_id=${FARHELM_AGENT_ID:-$(hostname | tr -c 'A-Za-z0-9._-' '-' | sed 's/-$//')}
 agent_hostname=${FARHELM_AGENT_HOSTNAME:-$(hostname)}
+no_service=${FARHELM_NO_SERVICE:-0}
 
-for required in bin/farhelm-agent worker/src/farhelm_worker_codex farhelm-agent.service; do
+for required in bin/farhelm-agent worker/src/farhelm_worker_codex farhelm-agent.service run.sh uninstall.sh; do
   if [[ ! -e "$bundle_dir/$required" ]]; then
     printf 'Bundle is incomplete: %s is missing.\n' "$required" >&2
     exit 1
   fi
 done
 
-command -v systemctl >/dev/null || { printf 'systemd is required.\n' >&2; exit 1; }
-command -v python3 >/dev/null || { printf 'Python 3.12 is required.\n' >&2; exit 1; }
-python3 -c 'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)' || {
-  printf 'Python 3.12 is required; found %s.\n' "$(python3 --version 2>&1)" >&2
-  exit 1
-}
-if [[ -z "$run_user" ]] || ! id "$run_user" >/dev/null 2>&1; then
-  printf 'Set FARHELM_RUN_USER to the existing Unix user that owns training projects.\n' >&2
+for path in "$data_home" "$config_home" "$install_root" "$unit_dir"; do
+  safe_path_pattern='^/[A-Za-z0-9._/-]+$'
+  if [[ ! "$path" =~ $safe_path_pattern ]]; then
+    printf 'User data/config paths must be absolute and use only safe path characters: %s\n' "$path" >&2
+    exit 1
+  fi
+done
+case "$install_root" in
+  */farhelm-agent) ;;
+  *) printf 'Unsafe Agent installation path: %s\n' "$install_root" >&2; exit 1 ;;
+esac
+if [[ "$no_service" != 0 && "$no_service" != 1 ]]; then
+  printf 'FARHELM_NO_SERVICE must be 0 or 1.\n' >&2
   exit 1
 fi
-if [[ ! "$run_user" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then
-  printf 'FARHELM_RUN_USER is not a safe systemd user name.\n' >&2
-  exit 1
+if [[ "$no_service" == 0 ]]; then
+  command -v systemctl >/dev/null || {
+    printf 'systemctl is unavailable; use FARHELM_NO_SERVICE=1 for a foreground-only installation.\n' >&2
+    exit 1
+  }
+  systemctl --user show-environment >/dev/null 2>&1 || {
+    printf 'The systemd user manager is unavailable in this session.\n' >&2
+    printf 'Retry from a normal login session or use FARHELM_NO_SERVICE=1.\n' >&2
+    exit 1
+  }
 fi
-if ! getent group farhelm-agent >/dev/null 2>&1; then
-  groupadd --system farhelm-agent
-fi
-run_group=farhelm-agent
-
-install -d -m 0755 /opt/farhelm-agent/releases "$release_dir/bin" "$release_dir/worker"
-install -m 0755 "$bundle_dir/bin/farhelm-agent" "$release_dir/bin/farhelm-agent"
-cp -a "$bundle_dir/worker/." "$release_dir/worker/"
-ln -sfn "$release_dir" /opt/farhelm-agent/current
-install -d -m 0755 "$config_dir"
 
 generated=false
 if [[ ! -e "$config_file" ]]; then
-  if [[ ! "$hub_url" =~ ^https://[A-Za-z0-9._:/?&=%-]+$ ]]; then
+  https_url_pattern='^https://[A-Za-z0-9._:/?&=%-]+$'
+  if [[ ! "$hub_url" =~ $https_url_pattern ]]; then
     printf 'Set FARHELM_HUB_URL to the public HTTPS Hub URL.\n' >&2
     exit 1
   fi
@@ -67,6 +79,25 @@ if [[ ! -e "$config_file" ]]; then
     printf 'FARHELM_AGENT_HOSTNAME is invalid.\n' >&2
     exit 1
   fi
+  generated=true
+fi
+
+if [[ "$no_service" == 0 ]] && [[ -e "$unit_file" ]]; then
+  systemctl --user stop farhelm-agent.service >/dev/null 2>&1 || true
+fi
+
+install -d -m 0700 "$install_root" "$install_root/bin" "$install_root/config" \
+  "$install_root/worker/src/farhelm_worker_codex"
+install -m 0755 "$bundle_dir/bin/farhelm-agent" "$install_root/bin/farhelm-agent"
+install -m 0755 "$bundle_dir/run.sh" "$install_root/run.sh"
+install -m 0755 "$bundle_dir/uninstall.sh" "$install_root/uninstall.sh"
+install -m 0644 "$bundle_dir/worker/src/farhelm_worker_codex/"*.py \
+  "$install_root/worker/src/farhelm_worker_codex/"
+install -m 0644 "$bundle_dir/worker/pyproject.toml" "$install_root/worker/pyproject.toml"
+install -m 0644 "$bundle_dir/worker/uv.lock" "$install_root/worker/uv.lock"
+install -m 0644 "$bundle_dir/VERSION" "$install_root/VERSION"
+
+if [[ "$generated" == true ]]; then
   umask 077
   {
     printf 'FARHELM_HUB_URL=%s\n' "$hub_url"
@@ -76,26 +107,39 @@ if [[ ! -e "$config_file" ]]; then
     printf 'FARHELM_HEARTBEAT_INTERVAL=15\n'
     printf 'RUST_LOG=farhelm_agent=info\n'
   } >"$config_file"
-  generated=true
 fi
-chown root:"$run_group" "$config_file"
-chmod 0640 "$config_file"
+chmod 0600 "$config_file"
 
-unit_tmp=$(mktemp)
-trap 'rm -f "$unit_tmp"' EXIT
-sed \
-  -e "s/__FARHELM_RUN_USER__/$run_user/g" \
-  -e "s/__FARHELM_RUN_GROUP__/$run_group/g" \
-  "$bundle_dir/farhelm-agent.service" >"$unit_tmp"
-install -m 0644 "$unit_tmp" /etc/systemd/system/farhelm-agent.service
-systemctl daemon-reload
-systemctl enable farhelm-agent.service
-systemctl restart farhelm-agent.service
+if [[ "$no_service" == 0 ]]; then
+  install -d -m 0700 "$unit_dir"
+  escaped_root=$(printf '%s' "$install_root" | sed 's/[&|]/\\&/g')
+  escaped_config=$(printf '%s' "$config_file" | sed 's/[&|]/\\&/g')
+  unit_tmp=$(mktemp)
+  trap 'rm -f "$unit_tmp"' EXIT
+  sed \
+    -e "s|__FARHELM_INSTALL_ROOT__|$escaped_root|g" \
+    -e "s|__FARHELM_CONFIG_FILE__|$escaped_config|g" \
+    "$bundle_dir/farhelm-agent.service" >"$unit_tmp"
+  install -m 0600 "$unit_tmp" "$unit_file"
+  systemctl --user daemon-reload
+  systemctl --user enable --now farhelm-agent.service
+fi
 
-printf 'FarHelm Agent %s installed as %s.\n' "$version" "$run_user"
-if [[ "$generated" == true ]]; then
-  printf 'Configured Hub: %s\n' "$hub_url"
+printf 'FarHelm Agent %s installed without root.\n' "$version"
+printf '  Managed data: %s\n' "$install_root"
+if [[ "$no_service" == 0 ]]; then
+  printf '  User service: %s\n' "$unit_file"
+  printf '  Status: systemctl --user status farhelm-agent\n'
+  linger=$(loginctl show-user "$user_name" --property=Linger --value 2>/dev/null || true)
+  if [[ "$linger" != yes ]]; then
+    printf '\nWarning: systemd linger is not enabled for %s.\n' "$user_name" >&2
+    printf 'The service is running now, but automatic operation after logout/reboot depends on host policy.\n' >&2
+    printf 'Ask the server administrator to run: loginctl enable-linger %s\n' "$user_name" >&2
+  fi
 else
-  printf 'Existing connection settings were preserved in %s.\n' "$config_file"
+  printf '  No service was installed. Run in the foreground with: %s/run.sh\n' "$install_root"
 fi
-printf 'Check status with: systemctl status farhelm-agent\n'
+if [[ "$generated" == false ]]; then
+  printf 'Existing connection settings were preserved.\n'
+fi
+printf 'Uninstall completely with: %s/uninstall.sh\n' "$install_root"

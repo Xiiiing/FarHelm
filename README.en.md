@@ -87,7 +87,7 @@ make release
 make test-release
 ```
 
-Artifacts are written to `dist/release/`: use `farhelm-hub-0.1.0-linux-x86_64.tar.gz` on the public server and `farhelm-agent-0.1.0-linux-x86_64.tar.gz` on the training server. See the complete systemd, Caddy, and installation instructions in the [deployment guide](deploy/README.en.md). Hub must remain on loopback and be exposed only through an HTTPS reverse proxy.
+Artifacts are written to `dist/release/`: use `farhelm-hub-0.1.0-linux-x86_64.tar.gz` on the public server and `farhelm-agent-0.1.0-linux-x86_64.tar.gz` on the training server. Agent installation is fully unprivileged and both bundles include uninstallers. See the complete path list, systemd, Caddy, foreground-run, and removal instructions in the [deployment guide](deploy/README.en.md). Hub must remain on loopback and be exposed only through an HTTPS reverse proxy.
 
 ## Development checks
 
@@ -108,6 +108,7 @@ uv run --project farhelm-worker-codex pytest
 ## Security boundaries
 
 - Training hosts do not need new public inbound ports.
+- Training-host Agents need no root or system-directory writes; they use only XDG user data and a user-level systemd unit.
 - Hub rejects non-loopback binds; Caddy or an equivalent reverse proxy terminates public TLS.
 - Admin credentials and the Agent token are independent and stored in permission-restricted `/etc/farhelm/*.env` files.
 - Hub does not store Codex login credentials, SSH private keys, or project source code.

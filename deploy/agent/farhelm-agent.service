@@ -5,20 +5,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=__FARHELM_RUN_USER__
-Group=__FARHELM_RUN_GROUP__
-EnvironmentFile=/etc/farhelm/agent.env
-ExecStart=/opt/farhelm-agent/current/bin/farhelm-agent run
+EnvironmentFile=__FARHELM_CONFIG_FILE__
+WorkingDirectory=__FARHELM_INSTALL_ROOT__
+ExecStart=__FARHELM_INSTALL_ROOT__/bin/farhelm-agent run
 Restart=always
 RestartSec=5s
 NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-LockPersonality=true
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

@@ -24,12 +24,24 @@ for required in \
   "$hub_dir/bin/farhelmctl" \
   "$hub_dir/console/index.html" \
   "$hub_dir/install.sh" \
+  "$hub_dir/uninstall.sh" \
   "$agent_dir/bin/farhelm-agent" \
   "$agent_dir/worker/src/farhelm_worker_codex" \
-  "$agent_dir/install.sh"; do
+  "$agent_dir/install.sh" \
+  "$agent_dir/run.sh" \
+  "$agent_dir/uninstall.sh"; do
   test -e "$required"
 done
-bash -n "$hub_dir/install.sh" "$agent_dir/install.sh"
+bash -n \
+  "$hub_dir/install.sh" \
+  "$hub_dir/uninstall.sh" \
+  "$agent_dir/install.sh" \
+  "$agent_dir/run.sh" \
+  "$agent_dir/uninstall.sh"
+if grep -Eq '^(User|Group)=' "$agent_dir/farhelm-agent.service"; then
+  printf 'Agent user unit must not declare a system User or Group.\n' >&2
+  exit 1
+fi
 
 export FARHELM_HUB_BIND=127.0.0.1:18787
 export FARHELM_HUB_URL=http://127.0.0.1:18787
@@ -61,5 +73,34 @@ curl --fail --silent --show-error \
   --user "$FARHELM_ADMIN_USER:$FARHELM_ADMIN_PASSWORD" \
   "$FARHELM_HUB_URL/agents" | grep -q '<title>FarHelm Console</title>'
 "$agent_dir/bin/farhelm-agent" worker-smoke --worker-root "$agent_dir/worker"
+
+(
+  mock_bin="$test_dir/mock-bin"
+  install -d -m 0755 "$mock_bin"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$mock_bin/systemctl"
+  printf '#!/usr/bin/env bash\nprintf "no\\n"\n' >"$mock_bin/loginctl"
+  chmod 0755 "$mock_bin/systemctl" "$mock_bin/loginctl"
+  export PATH="$mock_bin:$PATH"
+  export XDG_DATA_HOME="$test_dir/user-data"
+  export XDG_CONFIG_HOME="$test_dir/user-config"
+  export FARHELM_HUB_URL=https://farhelm.example.test
+  export FARHELM_AGENT_TOKEN=package-agent-token-with-at-least-32-characters
+  export FARHELM_AGENT_ID=package-user-install
+  export FARHELM_AGENT_HOSTNAME=package-user-host
+  "$agent_dir/install.sh"
+  installed_root="$XDG_DATA_HOME/farhelm-agent"
+  test -x "$installed_root/bin/farhelm-agent"
+  test -x "$installed_root/run.sh"
+  test -x "$installed_root/uninstall.sh"
+  test "$(stat -c '%a' "$installed_root/config/agent.env")" = 600
+  unit_file="$XDG_CONFIG_HOME/systemd/user/farhelm-agent.service"
+  test -f "$unit_file"
+  test "$(stat -c '%a' "$unit_file")" = 600
+  ! grep -q '__FARHELM_' "$unit_file"
+  grep -q "$installed_root/bin/farhelm-agent run" "$unit_file"
+  "$installed_root/uninstall.sh"
+  test ! -e "$installed_root"
+  test ! -e "$unit_file"
+)
 
 printf 'Release package smoke passed.\n'
