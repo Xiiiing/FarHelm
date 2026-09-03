@@ -1,0 +1,43 @@
+# Private project knowledge and Codex instructions (never publish)
+/Docs/
+AGENTS.md
+AGENTS.override.md
+
+# Rust
+/target/
+**/*.rs.bk
+
+# Node / Vite
+**/node_modules/
+**/dist/
+**/.vite/
+**/coverage/
+**/playwright-report/
+**/test-results/
+
+# Python
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.venv/
+**/*.egg-info/
+**/*.py[cod]
+
+# Local state, secrets, and databases
+.env
+.env.*
+!.env.example
+**/*.db
+**/*.db-*
+**/*.sqlite
+**/*.sqlite-*
+**/*.pem
+**/*.key
+**/config.local.toml
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp

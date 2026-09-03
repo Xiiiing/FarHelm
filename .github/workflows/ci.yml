@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  console:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.17.1
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: farhelm-console/.node-version
+          cache: pnpm
+          cache-dependency-path: farhelm-console/pnpm-lock.yaml
+      - run: pnpm --dir farhelm-console install --frozen-lockfile
+      - run: pnpm --dir farhelm-console lint
+      - run: pnpm --dir farhelm-console typecheck
+      - run: pnpm --dir farhelm-console test
+      - run: pnpm --dir farhelm-console build
+      - run: pnpm --dir farhelm-console exec playwright install --with-deps chromium
+      - run: pnpm --dir farhelm-console test:e2e
+
+  worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.9"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --project farhelm-worker-codex --frozen --all-groups
+      - run: uv run --project farhelm-worker-codex ruff check farhelm-worker-codex
+      - run: uv run --project farhelm-worker-codex mypy farhelm-worker-codex/src
+      - run: uv run --project farhelm-worker-codex pytest farhelm-worker-codex/tests
+
+  privacy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/check-private-files.sh
+      - run: ./scripts/check-readme-parity.sh
+
+  smoke:
+    needs: [rust, worker]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: ./tests/smoke.sh

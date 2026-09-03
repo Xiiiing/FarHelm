@@ -1,0 +1,15 @@
+[package]
+name = "farhelmctl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+farhelm-core.workspace = true
+farhelm-protocol.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
