@@ -1,6 +1,7 @@
-use std::{net::SocketAddr, path::PathBuf, str::FromStr};
+use std::{ffi::OsString, net::SocketAddr, path::PathBuf, str::FromStr};
 
 use anyhow::{Context, Result, ensure};
+use farhelm_core::PRODUCT_VERSION;
 use farhelm_hub::{AppState, HubConfig};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -9,6 +10,11 @@ const DEFAULT_BIND: &str = "127.0.0.1:8787";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if requests_version(std::env::args_os().skip(1)) {
+        println!("farhelm-hub {PRODUCT_VERSION}");
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -33,6 +39,14 @@ async fn main() -> Result<()> {
         .await
         .context("FarHelm Hub server failed")?;
     Ok(())
+}
+
+fn requests_version(mut arguments: impl Iterator<Item = OsString>) -> bool {
+    let argument = arguments.next();
+    arguments.next().is_none()
+        && argument
+            .as_deref()
+            .is_some_and(|value| value == "--version" || value == "-V")
 }
 
 fn config_from_env() -> Result<HubConfig> {
@@ -80,5 +94,20 @@ async fn shutdown_signal() {
     tokio::select! {
         () = ctrl_c => {}
         () = terminate => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_flag_is_handled_without_runtime_configuration() {
+        assert!(requests_version([OsString::from("--version")].into_iter()));
+        assert!(requests_version([OsString::from("-V")].into_iter()));
+        assert!(!requests_version(std::iter::empty()));
+        assert!(!requests_version(
+            [OsString::from("--version"), OsString::from("extra")].into_iter()
+        ));
     }
 }

@@ -44,6 +44,8 @@ bash -n \
   "$agent_dir/uninstall.sh"
 test "$(<"$hub_dir/RELEASE_TAG")" = "V$version"
 test "$(<"$agent_dir/RELEASE_TAG")" = "V$version"
+env -i "$hub_dir/bin/farhelm-hub" --version | grep -Fxq "farhelm-hub $version"
+env -i "$agent_dir/bin/farhelm-agent" --version | grep -Fxq "farhelm-agent $version"
 if grep -Eq '^(User|Group)=' "$agent_dir/farhelm-agent.service"; then
   printf 'Agent user unit must not declare a system User or Group.\n' >&2
   exit 1

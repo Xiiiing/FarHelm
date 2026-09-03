@@ -13,7 +13,7 @@ def hello_request() -> dict[str, object]:
         "kind": "request",
         "request_id": "req_test",
         "method": "worker.hello",
-        "params": {"agent_version": "0.1.0"},
+        "params": {"agent_version": "0.1.1"},
     }
 
 
@@ -23,7 +23,7 @@ def test_worker_hello_advertises_only_implemented_capability() -> None:
     assert response["request_id"] == "req_test"
     assert response["result"] == {
         "worker": "farhelm-worker-codex",
-        "version": "0.1.0",
+        "version": "0.1.1",
         "capabilities": ["worker.hello"],
     }
 
