@@ -7,24 +7,48 @@ cd "$repo_root"
 smoke_dir=$(mktemp -d)
 hub_log="$smoke_dir/hub.log"
 trap 'kill "${hub_pid:-}" 2>/dev/null || true; rm -rf "$smoke_dir"' EXIT
-printf '<!doctype html><title>FarHelm smoke</title>\n' >"$smoke_dir/index.html"
+console_dir="$smoke_dir/console"
+mkdir -p "$console_dir"
+printf '<!doctype html><title>FarHelm smoke</title>\n' >"$console_dir/index.html"
 
+hub_config="$smoke_dir/hub.toml"
+agent_config="$smoke_dir/agent.toml"
+cat >"$hub_config" <<EOF
+[hub]
+bind = "127.0.0.1:8787"
+database = "$smoke_dir/hub.db"
+console_dir = "$console_dir"
+[admin]
+user = "smoke-admin"
+password = "smoke-password-1234"
+[agents]
+token = "smoke-agent-token-with-at-least-32-characters"
+EOF
+cat >"$agent_config" <<EOF
+[agent]
+id = "smoke-gpu"
+hostname = "smoke-trainer"
+hub_url = "http://127.0.0.1:8787"
+token = "smoke-agent-token-with-at-least-32-characters"
+heartbeat_seconds = 15
+command_poll_seconds = 2
+database = "$smoke_dir/agent.db"
+[worker]
+python = "python3"
+EOF
+
+export FARHELM_HUB_URL=http://127.0.0.1:8787
 export FARHELM_ADMIN_USER=smoke-admin
 export FARHELM_ADMIN_PASSWORD=smoke-password-1234
-export FARHELM_AGENT_TOKEN=smoke-agent-token-with-at-least-32-characters
-export FARHELM_CONSOLE_DIR="$smoke_dir"
-export FARHELM_HUB_DATABASE="$smoke_dir/hub.db"
-export FARHELM_HUB_URL=http://127.0.0.1:8787
-export FARHELM_AGENT_DATABASE="$smoke_dir/agent.db"
 
-cargo build -q -p farhelm-hub -p farhelmctl -p farhelm-agent
+cargo build -q -p farhelm-hub -p farhelm-agent
 
-target/debug/farhelm-hub >"$hub_log" 2>&1 &
+target/debug/farhelm-hub serve --config "$hub_config" >"$hub_log" 2>&1 &
 hub_pid=$!
 
 healthy=false
 for _ in $(seq 1 40); do
-  if target/debug/farhelmctl health >/dev/null 2>&1; then
+  if target/debug/farhelm-hub health >/dev/null 2>&1; then
     healthy=true
     break
   fi
@@ -37,10 +61,8 @@ if [[ "$healthy" != true ]]; then
   exit 1
 fi
 
-target/debug/farhelmctl health
-target/debug/farhelm-agent heartbeat \
-  --agent-id smoke-gpu \
-  --hostname smoke-trainer
+target/debug/farhelm-hub health
+target/debug/farhelm-agent heartbeat --config "$agent_config"
 
 probe_response=$(curl --fail --silent --show-error \
   --user "$FARHELM_ADMIN_USER:$FARHELM_ADMIN_PASSWORD" \
@@ -50,8 +72,7 @@ probe_response=$(curl --fail --silent --show-error \
 command_id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["command_id"])' <<<"$probe_response")
 
 target/debug/farhelm-agent command-poll \
-  --agent-id smoke-gpu \
-  --hostname smoke-trainer
+  --config "$agent_config"
 
 command_status=$(curl --fail --silent --show-error \
   --user "$FARHELM_ADMIN_USER:$FARHELM_ADMIN_PASSWORD" \
@@ -91,10 +112,10 @@ curl --fail --silent --show-error \
 
 kill "$hub_pid"
 wait "$hub_pid"
-target/debug/farhelm-hub >>"$hub_log" 2>&1 &
+target/debug/farhelm-hub serve --config "$hub_config" >>"$hub_log" 2>&1 &
 hub_pid=$!
 for _ in $(seq 1 40); do
-  if target/debug/farhelmctl health >/dev/null 2>&1; then
+  if target/debug/farhelm-hub health >/dev/null 2>&1; then
     break
   fi
   sleep 0.25

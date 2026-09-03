@@ -1,0 +1,11 @@
+[agent]
+id = "gpu-a6000"
+hostname = "trainer-a6000"
+hub_url = "https://farhelm.example.com"
+token = "replace-with-a-random-token-of-at-least-32-characters"
+heartbeat_seconds = 15
+command_poll_seconds = 2
+database = "/home/user/.local/share/farhelm/state/agent.db"
+
+[worker]
+python = "python3"

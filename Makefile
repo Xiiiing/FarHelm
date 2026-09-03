@@ -16,7 +16,8 @@ test-ui:
 	corepack pnpm@10.17.1 --dir farhelm-console test:e2e
 
 run-hub:
-	cargo run -p farhelm-hub
+	test -n "$$FARHELM_HUB_CONFIG"
+	cargo run -p farhelm-hub -- serve --config "$$FARHELM_HUB_CONFIG"
 
 run-console:
 	corepack pnpm@10.17.1 --dir farhelm-console dev

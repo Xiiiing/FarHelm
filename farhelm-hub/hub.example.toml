@@ -1,0 +1,10 @@
+[hub]
+bind = "127.0.0.1:8787"
+database = "/var/lib/farhelm/farhelm.db"
+
+[admin]
+user = "admin"
+password = "replace-with-a-long-random-password"
+
+[agents]
+token = "replace-with-a-random-token-of-at-least-32-characters"

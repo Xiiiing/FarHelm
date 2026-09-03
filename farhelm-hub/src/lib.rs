@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    path::PathBuf,
+    path::{Component, Path as FsPath, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -8,8 +8,9 @@ use std::{
 use anyhow::{Result, ensure};
 use axum::{
     Json, Router,
+    body::Body,
     extract::{DefaultBodyLimit, Path, Request, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{any, get, post},
@@ -24,7 +25,8 @@ use farhelm_protocol::{
 };
 use serde::Serialize;
 use tokio::sync::RwLock;
-use tower_http::services::{ServeDir, ServeFile};
+
+include!(concat!(env!("OUT_DIR"), "/embedded_console.rs"));
 
 pub const ONLINE_WINDOW_SECS: u64 = 45;
 
@@ -37,7 +39,7 @@ pub struct HubConfig {
     pub admin_user: String,
     pub admin_password: String,
     pub agent_token: String,
-    pub console_dir: PathBuf,
+    pub console_dir: Option<PathBuf>,
     pub database_path: PathBuf,
 }
 
@@ -73,35 +75,39 @@ impl AppState {
 
 impl HubConfig {
     pub fn validate(&self) -> Result<()> {
-        ensure!(!self.admin_user.is_empty(), "FARHELM_ADMIN_USER is empty");
+        ensure!(!self.admin_user.is_empty(), "admin.user is empty");
         ensure!(
             !self.admin_user.contains(':'),
-            "FARHELM_ADMIN_USER cannot contain ':'"
+            "admin.user cannot contain ':'"
         );
         ensure!(
             self.admin_password.len() >= 12,
-            "FARHELM_ADMIN_PASSWORD must contain at least 12 characters"
+            "admin.password must contain at least 12 characters"
         );
         ensure!(
             self.agent_token.len() >= 32,
-            "FARHELM_AGENT_TOKEN must contain at least 32 characters"
+            "agents.token must contain at least 32 characters"
         );
-        ensure!(
-            self.console_dir.join("index.html").is_file(),
-            "FARHELM_CONSOLE_DIR must contain index.html"
-        );
+        if let Some(console_dir) = &self.console_dir {
+            ensure!(
+                console_dir.join("index.html").is_file(),
+                "hub.console_dir must contain index.html"
+            );
+        } else {
+            ensure!(
+                has_embedded_console(),
+                "this Hub build has no embedded Console"
+            );
+        }
         ensure!(
             !self.database_path.as_os_str().is_empty(),
-            "FARHELM_HUB_DATABASE is empty"
+            "hub.database is empty"
         );
         Ok(())
     }
 }
 
 pub fn app(state: AppState) -> Router {
-    let index = state.config.console_dir.join("index.html");
-    let static_files = ServeDir::new(&state.config.console_dir).fallback(ServeFile::new(index));
-
     Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/agents", get(list_agents))
@@ -111,10 +117,97 @@ pub fn app(state: AppState) -> Router {
         .route("/api/v1/agent/commands/claim", post(claim_command))
         .route("/api/v1/agent/commands/report", post(report_command))
         .route("/api/{*path}", any(api_not_found))
-        .fallback_service(static_files)
+        .fallback(static_content)
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), authorize))
         .with_state(state)
+}
+
+#[must_use]
+pub fn has_embedded_console() -> bool {
+    EMBEDDED_CONSOLE
+        .iter()
+        .any(|(path, _)| *path == "index.html")
+}
+
+async fn static_content(State(state): State<AppState>, uri: Uri) -> Response {
+    let requested = uri.path().trim_start_matches('/');
+    let requested = if requested.is_empty() {
+        "index.html"
+    } else {
+        requested
+    };
+    if !safe_asset_path(requested) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let asset = if let Some(console_dir) = &state.config.console_dir {
+        read_external_asset(console_dir, requested).await
+    } else {
+        read_embedded_asset(requested)
+    };
+    let (path, contents) = match asset {
+        Some(asset) => asset,
+        None if !requested.starts_with("api/") => {
+            if let Some(console_dir) = &state.config.console_dir {
+                match read_external_asset(console_dir, "index.html").await {
+                    Some(asset) => asset,
+                    None => return StatusCode::NOT_FOUND.into_response(),
+                }
+            } else {
+                match read_embedded_asset("index.html") {
+                    Some(asset) => asset,
+                    None => return StatusCode::NOT_FOUND.into_response(),
+                }
+            }
+        }
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let mut response = Response::new(Body::from(contents));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(content_type(&path)),
+    );
+    response
+}
+
+fn safe_asset_path(path: &str) -> bool {
+    !path.is_empty()
+        && FsPath::new(path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+async fn read_external_asset(root: &FsPath, path: &str) -> Option<(String, Vec<u8>)> {
+    tokio::fs::read(root.join(path))
+        .await
+        .ok()
+        .map(|contents| (path.to_owned(), contents))
+}
+
+fn read_embedded_asset(path: &str) -> Option<(String, Vec<u8>)> {
+    EMBEDDED_CONSOLE
+        .iter()
+        .find(|(candidate, _)| *candidate == path)
+        .map(|(_, contents)| (path.to_owned(), contents.to_vec()))
+}
+
+fn content_type(path: &str) -> &'static str {
+    match FsPath::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+    {
+        Some("css") => "text/css; charset=utf-8",
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("json") | Some("webmanifest") => "application/json; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("ico") => "image/x-icon",
+        Some("woff2") => "font/woff2",
+        _ => "application/octet-stream",
+    }
 }
 
 async fn authorize(State(state): State<AppState>, request: Request, next: Next) -> Response {
@@ -416,7 +509,7 @@ mod tests {
             admin_user: "admin".to_owned(),
             admin_password: "correct-horse".to_owned(),
             agent_token: "agent-token-with-at-least-32-characters".to_owned(),
-            console_dir: PathBuf::from("missing-test-console"),
+            console_dir: Some(PathBuf::from("missing-test-console")),
             database_path: PathBuf::from(":memory:"),
         })
         .unwrap()
@@ -529,7 +622,7 @@ mod tests {
         )
         .unwrap();
         let state = AppState::new(HubConfig {
-            console_dir: console_dir.clone(),
+            console_dir: Some(console_dir.clone()),
             ..test_state().config.as_ref().clone()
         })
         .unwrap();
@@ -572,7 +665,7 @@ mod tests {
             admin_user: "admin".to_owned(),
             admin_password: "short".to_owned(),
             agent_token: "short".to_owned(),
-            console_dir: PathBuf::from("missing-test-console"),
+            console_dir: Some(PathBuf::from("missing-test-console")),
             database_path: PathBuf::from(":memory:"),
         };
         assert!(config.validate().is_err());

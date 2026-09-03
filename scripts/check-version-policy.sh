@@ -20,6 +20,10 @@ grep -Fq "V$version" README.en.md
 grep -Fq "V$version" deploy/README.md
 grep -Fq "V$version" deploy/README.en.md
 grep -Fq "name: farhelm-V$version-linux-x86_64" .github/workflows/ci.yml
+if grep -q '"farhelmctl"\|"crates/farhelm-bootstrap"' Cargo.toml; then
+  printf 'V0.3+ must expose only the Hub and Agent role programs.\n' >&2
+  exit 1
+fi
 
 if [[ ${GITHUB_REF_TYPE:-} == tag ]] && [[ ${GITHUB_REF_NAME:-} != "V$version" ]]; then
   printf 'Formal release tag must exactly match V%s.\n' "$version" >&2

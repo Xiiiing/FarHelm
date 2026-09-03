@@ -1,29 +1,19 @@
-//! Verified update discovery, download, and extraction for FarHelm releases.
+//! Verified update discovery and executable download for FarHelm releases.
 
-use std::{
-    fmt,
-    fs::{File, OpenOptions},
-    io::Write,
-    path::{Component, Path, PathBuf},
-    process::Stdio,
-    time::Duration,
-};
+use std::{fmt, os::unix::fs::PermissionsExt, path::PathBuf, process::Command, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
-use flate2::read::GzDecoder;
 use reqwest::{Client, redirect::Policy};
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use tokio::{fs, io::AsyncWriteExt, process::Command};
+use tokio::{fs, io::AsyncWriteExt};
 
 const RELEASES_API: &str = "https://api.github.com/repos/Xiiiing/FarHelm/releases?per_page=100";
 const DOWNLOAD_PREFIX: &str = "https://github.com/Xiiiing/FarHelm/releases/download/";
 const API_VERSION: &str = "2026-03-10";
 const MAX_REDIRECTS: usize = 8;
-const MAX_ARCHIVE_ENTRIES: usize = 2_048;
-const MAX_UNPACKED_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -40,7 +30,20 @@ impl Role {
         }
     }
 
-    const fn max_archive_bytes(self) -> u64 {
+    #[must_use]
+    pub fn versioned_binary_name(self, version: &Version) -> String {
+        format!("{}-{version}-linux-x86_64", self.package_name())
+    }
+
+    #[must_use]
+    pub const fn stable_binary_name(self) -> &'static str {
+        match self {
+            Self::Hub => "farhelm-hub-linux-x86_64",
+            Self::Agent => "farhelm-agent-linux-x86_64",
+        }
+    }
+
+    const fn max_binary_bytes(self) -> u64 {
         match self {
             Self::Hub => 64 * 1024 * 1024,
             Self::Agent => 256 * 1024 * 1024,
@@ -64,50 +67,16 @@ pub struct UpdateCandidate {
 
 impl UpdateCandidate {
     #[must_use]
-    pub fn archive_name(&self) -> &str {
+    pub fn asset_name(&self) -> &str {
         &self.asset.name
     }
 }
 
 #[derive(Debug)]
-pub struct VerifiedBundle {
+pub struct VerifiedExecutable {
     _temporary: TempDir,
-    pub root: PathBuf,
+    pub path: PathBuf,
     pub version: Version,
-}
-
-impl VerifiedBundle {
-    /// Validate and stage a release archive embedded in a role-specific bootstrap executable.
-    pub fn from_embedded(role: Role, version: &str, archive: &[u8]) -> Result<Self> {
-        let version = Version::parse(version).context("embedded FarHelm version is invalid")?;
-        ensure!(
-            version.pre.is_empty() && version.build.is_empty(),
-            "embedded FarHelm version must be a formal release"
-        );
-        ensure!(!archive.is_empty(), "embedded release archive is empty");
-        ensure!(
-            u64::try_from(archive.len())? <= role.max_archive_bytes(),
-            "embedded release archive exceeds the role size limit"
-        );
-
-        let temporary =
-            tempfile::tempdir().context("failed to create bootstrap staging directory")?;
-        let archive_path = temporary.path().join("release.tar.gz");
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&archive_path)
-            .context("failed to create embedded release archive")?;
-        output
-            .write_all(archive)
-            .context("failed to stage embedded release archive")?;
-        output
-            .sync_all()
-            .context("failed to sync embedded release archive")?;
-        drop(output);
-
-        stage_bundle(temporary, &archive_path, role, version)
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -180,9 +149,9 @@ impl Updater {
         &self,
         role: Role,
         candidate: &UpdateCandidate,
-    ) -> Result<VerifiedBundle> {
+    ) -> Result<VerifiedExecutable> {
         let temporary = tempfile::tempdir().context("failed to create update staging directory")?;
-        let archive_path = temporary.path().join("release.tar.gz.part");
+        let binary_path = temporary.path().join(role.package_name());
         let mut response = self
             .client
             .get(&candidate.asset.browser_download_url)
@@ -198,12 +167,12 @@ impl Updater {
             );
         }
 
-        let mut archive = fs::OpenOptions::new()
+        let mut binary = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&archive_path)
+            .open(&binary_path)
             .await
-            .context("failed to create staged release archive")?;
+            .context("failed to create staged release executable")?;
         let mut hasher = Sha256::new();
         let mut downloaded = 0_u64;
         while let Some(chunk) = response
@@ -215,91 +184,52 @@ impl Updater {
                 .checked_add(u64::try_from(chunk.len())?)
                 .context("release download size overflowed")?;
             ensure!(
-                downloaded <= role.max_archive_bytes(),
-                "release archive exceeds the role size limit"
+                downloaded <= role.max_binary_bytes(),
+                "release executable exceeds the role size limit"
             );
             ensure!(
                 downloaded <= candidate.asset.size,
-                "release archive exceeds immutable asset metadata"
+                "release executable exceeds immutable asset metadata"
             );
             hasher.update(&chunk);
-            archive
+            binary
                 .write_all(&chunk)
                 .await
-                .context("failed to write staged release archive")?;
+                .context("failed to write staged release executable")?;
         }
-        archive
+        binary
             .sync_all()
             .await
-            .context("failed to sync staged release archive")?;
-        drop(archive);
+            .context("failed to sync staged release executable")?;
+        drop(binary);
         let actual: [u8; 32] = hasher.finalize().into();
         validate_download(candidate, downloaded, actual)?;
+        std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755))?;
+        verify_executable(role, candidate.version.clone(), &binary_path)?;
 
-        stage_bundle(temporary, &archive_path, role, candidate.version.clone())
-    }
-
-    pub async fn install(
-        &self,
-        bundle: &VerifiedBundle,
-        existing_root: Option<&Path>,
-    ) -> Result<()> {
-        self.install_with_env(bundle, existing_root, &[]).await
-    }
-
-    pub async fn install_with_env(
-        &self,
-        bundle: &VerifiedBundle,
-        existing_root: Option<&Path>,
-        environment: &[(String, String)],
-    ) -> Result<()> {
-        let mut command = Command::new("bash");
-        command
-            .arg(bundle.root.join("install.sh"))
-            .current_dir(&bundle.root)
-            .env("FARHELM_UPGRADE", "1")
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .envs(environment.iter().map(|(name, value)| (name, value)));
-        if let Some(root) = existing_root {
-            command.env("FARHELM_INSTALL_ROOT", root);
-        }
-        let status = command
-            .status()
-            .await
-            .context("failed to start verified FarHelm installer")?;
-        ensure!(status.success(), "verified FarHelm installer failed");
-        Ok(())
+        Ok(VerifiedExecutable {
+            _temporary: temporary,
+            path: binary_path,
+            version: candidate.version.clone(),
+        })
     }
 }
 
-fn stage_bundle(
-    temporary: TempDir,
-    archive_path: &Path,
-    role: Role,
-    version: Version,
-) -> Result<VerifiedBundle> {
-    let expected_root = format!("{}-{version}-linux-x86_64", role.package_name());
-    let unpacked = temporary.path().join("unpacked");
-    std::fs::create_dir(&unpacked).context("failed to create archive extraction directory")?;
-    unpack_archive(archive_path, &unpacked, &expected_root)?;
-    let root = unpacked.join(expected_root);
-    let package_version = std::fs::read_to_string(root.join("VERSION"))
-        .context("release package VERSION is missing")?;
+fn verify_executable(role: Role, version: Version, path: &std::path::Path) -> Result<()> {
+    let output = Command::new(path)
+        .arg("--version")
+        .output()
+        .context("failed to execute staged FarHelm release")?;
     ensure!(
-        package_version.trim() == version.to_string(),
-        "release package VERSION does not match immutable metadata"
+        output.status.success(),
+        "staged FarHelm release rejected --version"
     );
     ensure!(
-        root.join("install.sh").is_file(),
-        "release package installer is missing"
+        String::from_utf8_lossy(&output.stdout).trim()
+            == format!("{} {version}", role.package_name()),
+        "staged FarHelm executable role or version does not match immutable metadata"
     );
-    Ok(VerifiedBundle {
-        _temporary: temporary,
-        root,
-        version,
-    })
+    Ok(())
 }
 
 fn select_candidate(
@@ -326,20 +256,17 @@ fn select_candidate(
         if release.tag_name != format!("V{version}") || !version.pre.is_empty() {
             continue;
         }
-        if requested.as_ref().is_some_and(|value| value != &version) {
+        if requested.as_ref().is_some_and(|value| value != &version) || version <= current {
             continue;
         }
-        if version <= current {
-            continue;
-        }
-        let name = format!("{}-{}-linux-x86_64.tar.gz", role.package_name(), version);
+        let name = role.versioned_binary_name(&version);
         let Some(asset) = release.assets.iter().find(|asset| asset.name == name) else {
             continue;
         };
         let digest = parse_digest(asset.digest.as_deref())?;
         ensure!(asset.size > 0, "release asset is empty");
         ensure!(
-            asset.size <= role.max_archive_bytes(),
+            asset.size <= role.max_binary_bytes(),
             "release asset exceeds the role size limit"
         );
         let expected_url = format!("{DOWNLOAD_PREFIX}{}/{name}", release.tag_name);
@@ -406,68 +333,11 @@ fn validate_download(
 ) -> Result<()> {
     ensure!(
         downloaded == candidate.asset.size,
-        "release archive is truncated"
+        "release executable is truncated"
     );
     ensure!(
         actual_digest == candidate.digest,
-        "release archive SHA-256 does not match immutable asset metadata"
-    );
-    Ok(())
-}
-
-fn unpack_archive(archive_path: &Path, destination: &Path, expected_root: &str) -> Result<()> {
-    let archive_file = File::open(archive_path).context("failed to open staged release archive")?;
-    let decoder = GzDecoder::new(archive_file);
-    let mut archive = tar::Archive::new(decoder);
-    let mut entries = 0_usize;
-    let mut unpacked_bytes = 0_u64;
-    for entry in archive.entries().context("release archive is invalid")? {
-        let mut entry = entry.context("release archive entry is invalid")?;
-        entries += 1;
-        ensure!(
-            entries <= MAX_ARCHIVE_ENTRIES,
-            "release archive has too many entries"
-        );
-        let path = entry.path().context("release archive path is invalid")?;
-        validate_archive_path(&path, expected_root)?;
-        let kind = entry.header().entry_type();
-        ensure!(
-            kind.is_file() || kind.is_dir(),
-            "release archive contains a link or special file"
-        );
-        if kind.is_file() {
-            unpacked_bytes = unpacked_bytes
-                .checked_add(entry.size())
-                .context("release unpacked size overflowed")?;
-            ensure!(
-                unpacked_bytes <= MAX_UNPACKED_BYTES,
-                "release archive exceeds the unpacked size limit"
-            );
-        }
-        ensure!(
-            entry
-                .unpack_in(destination)
-                .context("failed to unpack release archive entry")?,
-            "release archive entry escaped the staging directory"
-        );
-    }
-    ensure!(entries > 0, "release archive is empty");
-    Ok(())
-}
-
-fn validate_archive_path(path: &Path, expected_root: &str) -> Result<()> {
-    ensure!(
-        !path.is_absolute(),
-        "release archive contains an absolute path"
-    );
-    let mut components = path.components();
-    ensure!(
-        components.next() == Some(Component::Normal(expected_root.as_ref())),
-        "release archive has an unexpected top-level directory"
-    );
-    ensure!(
-        components.all(|component| matches!(component, Component::Normal(_))),
-        "release archive contains an unsafe path"
+        "release executable SHA-256 does not match immutable asset metadata"
     );
     Ok(())
 }
@@ -475,30 +345,6 @@ fn validate_archive_path(path: &Path, expected_root: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flate2::{Compression, write::GzEncoder};
-
-    fn embedded_archive(root: &str, version: &str) -> Vec<u8> {
-        let encoder = GzEncoder::new(Vec::new(), Compression::fast());
-        let mut archive = tar::Builder::new(encoder);
-        for (path, contents, mode) in [
-            (format!("{root}/VERSION"), format!("{version}\n"), 0o644),
-            (
-                format!("{root}/install.sh"),
-                "#!/usr/bin/env bash\nexit 0\n".to_owned(),
-                0o755,
-            ),
-        ] {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(contents.len() as u64);
-            header.set_mode(mode);
-            header.set_cksum();
-            archive
-                .append_data(&mut header, path, contents.as_bytes())
-                .unwrap();
-        }
-        let encoder = archive.into_inner().unwrap();
-        encoder.finish().unwrap()
-    }
 
     fn release(tag: &str, immutable: bool) -> GithubRelease {
         let version = tag.trim_start_matches(['V', 'v']);
@@ -508,9 +354,9 @@ mod tests {
             prerelease: false,
             immutable,
             assets: vec![ReleaseAsset {
-                name: format!("farhelm-agent-{version}-linux-x86_64.tar.gz"),
+                name: format!("farhelm-agent-{version}-linux-x86_64"),
                 browser_download_url: format!(
-                    "{DOWNLOAD_PREFIX}{tag}/farhelm-agent-{version}-linux-x86_64.tar.gz"
+                    "{DOWNLOAD_PREFIX}{tag}/farhelm-agent-{version}-linux-x86_64"
                 ),
                 size: 1024,
                 digest: Some(format!("sha256:{}", "11".repeat(32))),
@@ -523,14 +369,15 @@ mod tests {
         let releases = vec![
             release("v9.0.0", true),
             release("V0.2.0", false),
-            release("V0.1.1", true),
-            release("V0.2.0", true),
+            release("V0.2.1", true),
+            release("V0.3.0", true),
         ];
-        let selected = select_candidate(&releases, Role::Agent, "0.1.0", None, false)
+        let selected = select_candidate(&releases, Role::Agent, "0.2.0", None, false)
             .unwrap()
             .unwrap();
-        assert_eq!(selected.version, Version::new(0, 2, 0));
-        assert_eq!(selected.tag, "V0.2.0");
+        assert_eq!(selected.version, Version::new(0, 3, 0));
+        assert_eq!(selected.tag, "V0.3.0");
+        assert_eq!(selected.asset_name(), "farhelm-agent-0.3.0-linux-x86_64");
     }
 
     #[test]
@@ -560,45 +407,22 @@ mod tests {
 
     #[test]
     fn requested_release_must_be_newer_and_formal() {
-        let releases = vec![release("V0.1.1", true)];
-        assert!(select_candidate(&releases, Role::Agent, "0.1.0", Some("v0.1.1"), false).is_err());
-        assert!(select_candidate(&releases, Role::Agent, "0.1.1", Some("V0.1.1"), false).is_err());
+        let releases = vec![release("V0.3.0", true)];
+        assert!(select_candidate(&releases, Role::Agent, "0.2.0", Some("v0.3.0"), false).is_err());
+        assert!(select_candidate(&releases, Role::Agent, "0.3.0", Some("V0.3.0"), false).is_err());
     }
 
     #[test]
-    fn validates_digest_and_archive_paths() {
+    fn validates_digest_and_download() {
         assert_eq!(
             parse_digest(Some(&format!("sha256:{}", "ab".repeat(32)))).unwrap(),
             [0xab; 32]
         );
         assert!(parse_digest(Some("sha256:abcd")).is_err());
-        assert!(
-            validate_archive_path(Path::new("../escape"), "farhelm-agent-0.1.0-linux-x86_64")
-                .is_err()
-        );
-        assert!(
-            validate_archive_path(Path::new("/absolute"), "farhelm-agent-0.1.0-linux-x86_64")
-                .is_err()
-        );
-        assert!(
-            validate_archive_path(Path::new("other/file"), "farhelm-agent-0.1.0-linux-x86_64")
-                .is_err()
-        );
-        assert!(
-            validate_archive_path(
-                Path::new("farhelm-agent-0.1.0-linux-x86_64/bin/agent"),
-                "farhelm-agent-0.1.0-linux-x86_64"
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn rejects_truncated_or_corrupted_downloads() {
         let candidate = select_candidate(
-            &[release("V0.1.1", true)],
+            &[release("V0.3.0", true)],
             Role::Agent,
-            "0.1.0",
+            "0.2.0",
             None,
             false,
         )
@@ -607,15 +431,5 @@ mod tests {
         assert!(validate_download(&candidate, 1023, [0x11; 32]).is_err());
         assert!(validate_download(&candidate, 1024, [0x22; 32]).is_err());
         assert!(validate_download(&candidate, 1024, [0x11; 32]).is_ok());
-    }
-
-    #[test]
-    fn validates_embedded_role_and_version() {
-        let bytes = embedded_archive("farhelm-agent-0.2.0-linux-x86_64", "0.2.0");
-        let bundle = VerifiedBundle::from_embedded(Role::Agent, "0.2.0", &bytes).unwrap();
-        assert_eq!(bundle.version, Version::new(0, 2, 0));
-        assert!(bundle.root.join("install.sh").is_file());
-        assert!(VerifiedBundle::from_embedded(Role::Hub, "0.2.0", &bytes).is_err());
-        assert!(VerifiedBundle::from_embedded(Role::Agent, "0.2.1", &bytes).is_err());
     }
 }

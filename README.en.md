@@ -4,37 +4,34 @@
 
 FarHelm is a remote control plane for personal research and GPU training environments. It brings server health, training jobs, and Codex sessions from multiple machines into one mobile-first web console while keeping training hosts outbound-only and retaining source code and credentials locally.
 
-> Current status: `V0.2.0`, the single-file installation release. Hub and Agent each provide one executable installer that performs safe extraction, service registration, and health checks internally. Installed systems retain immutable-Release self-upgrades, atomic switching, and local rollback. The only enabled action remains the side-effect-free `agent.probe`.
+> Current status: `V0.3.0`, the native role-program release. Each download is the actual Hub or Agent, not a bootstrap that expands the old installer. The corresponding program now owns installation, configuration checks, service start/stop/restart/status, updates, rollback, and removal. The only enabled action remains the side-effect-free `agent.probe`.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     Console["farhelm-console\nReact PWA"]
-    Hub["farhelm-hub\nRust control plane"]
-    Agent["farhelm-agent\nRust host agent"]
-    Worker["farhelm-worker-codex\nPython adapter"]
-    CLI["farhelmctl\nRust CLI"]
+    Hub["farhelm-hub\nRust control plane + management"]
+    Agent["farhelm-agent\nRust host agent + management"]
+    Worker["farhelm-worker-codex\nprivate Python adapter"]
 
     Console -->|HTTPS + Basic Auth| Hub
-    CLI -->|HTTPS| Hub
-    Agent -->|outbound HTTPS heartbeat| Hub
+    Agent -->|outbound HTTPS| Hub
     Agent -->|framed JSON over stdio| Worker
 ```
 
-FarHelm is one product in one monorepo, while each runtime role retains least privilege and an independent deliverable:
+FarHelm is one product in one monorepo, while Hub and Agent retain separate permissions and attack surfaces:
 
 | Component | Responsibility | Stack |
 | --- | --- | --- |
-| `farhelm-hub` | Public API, state, and control plane | Rust, Axum, Tokio |
-| `farhelm-agent` | Host state, jobs, and Worker supervision | Rust, Tokio |
-| `farhelm-console` | Mobile and desktop console | React, TypeScript, Ant Design, Vite PWA |
-| `farhelm-worker-codex` | Isolated Codex SDK adapter | Python 3.12, uv |
-| `farhelmctl` | Installation, diagnostics, and management | Rust, Clap |
+| `farhelm-hub` | Public API, embedded Console, state, service, and update management | Rust, Axum, Tokio |
+| `farhelm-agent` | Host state, jobs, Worker, service, and update management | Rust, Tokio |
+| `farhelm-console` | Mobile and desktop console, embedded into formal Hub builds | React, TypeScript, Ant Design, Vite PWA |
+| `farhelm-worker-codex` | Agent-private isolated Codex SDK adapter | Python 3.12, uv |
 
-Shared Rust types live under `crates/`. Hub and Agent are compiled separately and the Worker does not listen on a network socket. A deployment bundle lets Hub serve Console; Vite still proxies to Hub during development.
+Shared Rust types live under `crates/`. Worker exposes no network socket and never receives the Hub token.
 
-## Quick start
+## Development quick start
 
 You need Rust 1.98, Node.js 24, Corepack, Python 3.12, and [uv](https://docs.astral.sh/uv/).
 
@@ -43,70 +40,68 @@ corepack pnpm@10.17.1 --dir farhelm-console install
 uv sync --project farhelm-worker-codex --all-groups
 ```
 
-Build Console and start Hub with loopback-only test credentials:
+Copy `farhelm-hub/hub.example.toml`, point `hub.console_dir` at `farhelm-console/dist`, then start Hub:
 
 ```bash
 corepack pnpm@10.17.1 --dir farhelm-console build
-FARHELM_ADMIN_USER=admin \
-FARHELM_ADMIN_PASSWORD=local-password-1234 \
-FARHELM_AGENT_TOKEN=local-agent-token-with-at-least-32-characters \
-FARHELM_CONSOLE_DIR=farhelm-console/dist \
-FARHELM_HUB_DATABASE=.farhelm/hub.db \
-cargo run -p farhelm-hub
+cargo run -p farhelm-hub -- serve --config /path/to/hub.toml
 ```
 
-Start Console in another terminal:
+Check Hub and Worker:
 
 ```bash
-corepack pnpm@10.17.1 --dir farhelm-console dev
-```
-
-Open `http://127.0.0.1:5173`. Hub exposes its health endpoint at `http://127.0.0.1:8787/api/v1/health`.
-
-Verify the CLI and Worker:
-
-```bash
-cargo run -p farhelmctl -- health
+cargo run -p farhelm-hub -- health
 cargo run -p farhelm-agent -- worker-smoke
 ```
 
 Send one local Agent heartbeat:
 
 ```bash
-FARHELM_HUB_URL=http://127.0.0.1:8787 \
-FARHELM_AGENT_TOKEN=local-agent-token-with-at-least-32-characters \
-FARHELM_AGENT_ID=gpu-a \
-cargo run -p farhelm-agent -- heartbeat
+cargo run -p farhelm-agent -- heartbeat --config /path/to/agent.toml
 ```
 
-## Deployment bundles
+## Download and install
 
-Build role archives and two single-file Linux x86_64 installers. The current binary target is Ubuntu 24.04 x86_64 or a compatible glibc 2.39+ system:
-
-```bash
-make release
-make test-release
-```
-
-End users need no compilation, manual verification, or archive extraction. Download and run this on the Hub server:
+Formal binaries target Ubuntu 24.04 x86_64, or a compatible system with systemd and glibc 2.39+. Install Hub with:
 
 ```bash
 curl -fL https://github.com/Xiiiing/FarHelm/releases/latest/download/farhelm-hub-linux-x86_64 -o farhelm-hub
 chmod +x farhelm-hub
-sudo ./farhelm-hub
+sudo ./farhelm-hub install
 ```
 
-On a training host, download and run the Agent as the regular user. The installer interactively asks for the Hub URL, Agent ID, and a hidden token:
+Install Agent as the regular training-host user, without sudo:
 
 ```bash
 curl -fL https://github.com/Xiiiing/FarHelm/releases/latest/download/farhelm-agent-linux-x86_64 -o farhelm-agent
 chmod +x farhelm-agent
-./farhelm-agent
+./farhelm-agent install
 ```
 
-The Agent needs no root/sudo. No extracted directory is left in the download location, and the installer file can be deleted after success. See the [deployment guide](deploy/README.en.md) for managed paths, systemd, Caddy, non-interactive setup, archive fallback, and removal. Hub must remain on loopback and be exposed only through an HTTPS reverse proxy.
+The programs prompt for required values when configuration is missing. Automation may still provide `FARHELM_ADMIN_USER`, `FARHELM_ADMIN_PASSWORD`, `FARHELM_AGENT_TOKEN`, `FARHELM_HUB_URL`, and `FARHELM_AGENT_ID` as environment variables; do not put secrets in command-line arguments.
 
-After the initial `V0.2.0` installation, later releases need no manual download: use `farhelmctl upgrade --check` / `sudo farhelmctl upgrade` for Hub and `farhelm-agent upgrade --check` / `farhelm-agent upgrade` for Agent. A failed upgrade restores the previous version, while configuration and databases remain outside version directories.
+All installed operations use the same role program:
+
+```bash
+sudo farhelm-hub status
+sudo farhelm-hub restart
+sudo farhelm-hub update --check
+sudo farhelm-hub update
+sudo farhelm-hub rollback
+
+farhelm-agent status
+farhelm-agent restart
+farhelm-agent update --check
+farhelm-agent update
+farhelm-agent rollback
+```
+
+Configuration lives at:
+
+- Hub: `/etc/farhelm/hub.toml`
+- Agent: `${XDG_CONFIG_HOME:-$HOME/.config}/farhelm/agent.toml`
+
+See the [deployment guide](deploy/README.en.md) for executable, configuration, database, systemd, complete removal, and Caddy paths. Hub must stay on loopback and be exposed through Caddy or an equivalent HTTPS reverse proxy.
 
 ## Development checks
 
@@ -114,35 +109,28 @@ After the initial `V0.2.0` installation, later releases need no manual download:
 make check
 make test
 make privacy
-```
-
-Each ecosystem can also be tested independently:
-
-```bash
-cargo test --workspace
-corepack pnpm@10.17.1 --dir farhelm-console test
-uv run --project farhelm-worker-codex pytest
+make test-ui
+make test-release
 ```
 
 ## Security boundaries
 
-- Training hosts do not need new public inbound ports.
-- Training-host Agents need no root or system-directory writes; they use only XDG user data and a user-level systemd unit.
-- Hub rejects non-loopback binds; Caddy or an equivalent reverse proxy terminates public TLS.
-- Admin credentials and the Agent token are independent and stored in permission-restricted `/etc/farhelm/*.env` files.
-- Hub does not store Codex login credentials, SSH private keys, or project source code.
-- Worker communicates with Agent only over stdin/stdout and exposes no network service.
-- The first release does not expose an arbitrary remote shell; future mutations require allowlists, TTLs, idempotency, and auditing.
-- Example configuration must never include real credentials or private server paths.
-- Self-upgrade accepts only immutable uppercase `V*` Releases from the fixed official repository, never an arbitrary source; crossing the first version number requires explicit user permission.
+- Training hosts expose no new public inbound ports, and Agent needs no root access.
+- Hub rejects non-loopback binds; a reverse proxy terminates public TLS.
+- Admin credentials and Agent tokens are independent and stored in permission-restricted TOML configuration.
+- Hub does not store Codex login credentials, SSH private keys, or project source.
+- Worker communicates with Agent only over stdin/stdout.
+- FarHelm exposes no arbitrary remote shell; mutations require allowlists, TTLs, idempotency, and auditing.
+- Self-update accepts only versioned actual executables from immutable uppercase `V*` Releases in the fixed official repository; crossing the first version number requires explicit user permission.
+- `V0.3.0` retains a one-time compatibility archive so the uppercase formal V0.2.0 release can migrate. New installs and later updates do not expose archive directories.
 
 ## Roadmap
 
-1. Add WSS wakeups and an Agent event outbox on top of the validated durable command foundation.
-2. Stabilize the Agent–Worker protocol and validate the Codex SDK lifecycle.
-3. Complete training-job and Codex session flows for one training host.
-4. Add GPU and training-job metrics, logs, and notifications.
-5. Expand to multiple hosts with per-Agent identities and validate canary upgrades.
+1. Add WSS wakeups and an Agent event outbox.
+2. Validate the production Codex SDK lifecycle and extend the Worker protocol.
+3. Complete training-job and Codex session flows for one host.
+4. Add GPU/training metrics, logs, and Web Push notifications.
+5. Expand to multiple hosts and validate canary updates.
 
 ## License
 

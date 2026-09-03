@@ -12,15 +12,18 @@ use farhelm_protocol::{
     CommandState, CommandStatusResponse, FARHELM_PROTOCOL, ProbeResult, WORKER_PROTOCOL,
     WorkerHelloResult, WorkerRequest, WorkerResponse, read_frame, write_frame,
 };
-use farhelm_updater::{Role, Updater};
 use reqwest::{Client, Url};
 use tokio::{process::Command, time::timeout};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod command_store;
+mod config;
+mod management;
+mod resources;
 
 use command_store::CommandStore;
+use config::{AgentFileConfig, AgentPaths};
 
 #[derive(Parser)]
 #[command(name = "farhelm-agent", version, about = "FarHelm host agent")]
@@ -34,40 +37,44 @@ enum CommandKind {
     /// Send heartbeats until interrupted.
     Run {
         #[command(flatten)]
-        hub: HubArgs,
-        #[arg(long, env = "FARHELM_HEARTBEAT_INTERVAL", default_value_t = 15)]
-        interval: u64,
-        #[arg(long, env = "FARHELM_COMMAND_POLL_INTERVAL", default_value_t = 2)]
-        command_interval: u64,
-        #[arg(
-            long,
-            env = "FARHELM_AGENT_DATABASE",
-            default_value = "farhelm-agent.db"
-        )]
-        database: PathBuf,
+        connection: ConnectionArgs,
+        #[arg(long, env = "FARHELM_HEARTBEAT_INTERVAL")]
+        interval: Option<u64>,
+        #[arg(long, env = "FARHELM_COMMAND_POLL_INTERVAL")]
+        command_interval: Option<u64>,
+        #[arg(long, env = "FARHELM_AGENT_DATABASE")]
+        database: Option<PathBuf>,
     },
     /// Send one heartbeat and exit.
     Heartbeat {
         #[command(flatten)]
-        hub: HubArgs,
+        connection: ConnectionArgs,
     },
     /// Claim and process at most one Hub command, then exit.
     CommandPoll {
         #[command(flatten)]
-        hub: HubArgs,
-        #[arg(
-            long,
-            env = "FARHELM_AGENT_DATABASE",
-            default_value = "farhelm-agent.db"
-        )]
-        database: PathBuf,
+        connection: ConnectionArgs,
+        #[arg(long, env = "FARHELM_AGENT_DATABASE")]
+        database: Option<PathBuf>,
     },
-    /// Check local prerequisites without changing the host.
+    /// Install this executable, configuration, Worker resources, and user service.
+    Install {
+        /// Install files without creating or starting a systemd user service.
+        #[arg(long)]
+        no_service: bool,
+    },
+    /// Start the installed user service.
+    Start,
+    /// Stop the installed user service.
+    Stop,
+    /// Restart the installed user service.
+    Restart,
+    /// Confirm that the installed user service is active.
+    Status,
+    /// Check the installed configuration and local prerequisites.
     Doctor {
-        #[arg(long, default_value = "python3")]
-        python: String,
-        #[arg(long, default_value = "farhelm-worker-codex")]
-        worker_root: PathBuf,
+        #[arg(long, env = "FARHELM_AGENT_CONFIG")]
+        config: Option<PathBuf>,
     },
     /// Start the Python Worker and verify the framed protocol handshake.
     WorkerSmoke {
@@ -77,11 +84,12 @@ enum CommandKind {
         worker_root: PathBuf,
     },
     /// Check for or install an immutable official Agent release.
-    Upgrade {
+    #[command(visible_alias = "upgrade")]
+    Update {
         /// Only report whether an update is available.
         #[arg(long)]
         check: bool,
-        /// Install one exact formal version, such as V0.2.0.
+        /// Install one exact formal version, such as V0.3.0.
         #[arg(long)]
         version: Option<String>,
         /// Permit a user-approved first-number version change.
@@ -90,18 +98,40 @@ enum CommandKind {
     },
     /// Atomically switch the Agent to its locally installed previous version.
     Rollback,
+    /// Remove the Agent program and its managed service files.
+    Uninstall {
+        /// Keep the TOML configuration and SQLite data.
+        #[arg(long)]
+        keep_data: bool,
+    },
 }
 
 #[derive(Args)]
-struct HubArgs {
+struct ConnectionArgs {
+    #[arg(long, env = "FARHELM_AGENT_CONFIG")]
+    config: Option<PathBuf>,
     #[arg(long, env = "FARHELM_HUB_URL")]
-    hub: String,
+    hub: Option<String>,
     #[arg(long, env = "FARHELM_AGENT_TOKEN", hide_env_values = true)]
-    token: String,
+    token: Option<String>,
     #[arg(long, env = "FARHELM_AGENT_ID")]
-    agent_id: String,
+    agent_id: Option<String>,
     #[arg(long, env = "FARHELM_AGENT_HOSTNAME")]
     hostname: Option<String>,
+}
+
+struct HubArgs {
+    hub: String,
+    token: String,
+    agent_id: String,
+    hostname: Option<String>,
+}
+
+struct RuntimeArgs {
+    hub: HubArgs,
+    interval: u64,
+    command_interval: u64,
+    database: PathBuf,
 }
 
 #[tokio::main]
@@ -115,100 +145,109 @@ async fn main() -> Result<()> {
 
     match Cli::parse().command {
         CommandKind::Run {
-            hub,
+            connection,
             interval,
             command_interval,
             database,
-        } => run(hub, interval, command_interval, &database).await,
-        CommandKind::Heartbeat { hub } => heartbeat_once(&hub).await,
-        CommandKind::CommandPoll { hub, database } => command_poll_once(&hub, &database).await,
-        CommandKind::Doctor {
-            python,
-            worker_root,
-        } => doctor(&python, &worker_root),
+        } => {
+            let runtime = resolve_runtime(connection, interval, command_interval, database)?;
+            if let Ok(paths) = AgentPaths::discover() {
+                resources::materialize_worker(&paths.worker)?;
+            }
+            run(
+                runtime.hub,
+                runtime.interval,
+                runtime.command_interval,
+                &runtime.database,
+            )
+            .await
+        }
+        CommandKind::Heartbeat { connection } => {
+            let runtime = resolve_runtime(connection, None, None, None)?;
+            heartbeat_once(&runtime.hub).await
+        }
+        CommandKind::CommandPoll {
+            connection,
+            database,
+        } => {
+            let runtime = resolve_runtime(connection, None, None, database)?;
+            command_poll_once(&runtime.hub, &runtime.database).await
+        }
+        CommandKind::Install { no_service } => management::install(no_service).await,
+        CommandKind::Start => management::service_action("start"),
+        CommandKind::Stop => management::service_action("stop"),
+        CommandKind::Restart => management::restart().await,
+        CommandKind::Status => management::status(),
+        CommandKind::Doctor { config } => management::doctor(config.as_deref()).map(|_| ()),
         CommandKind::WorkerSmoke {
             python,
             worker_root,
         } => worker_smoke(&python, &worker_root).await,
-        CommandKind::Upgrade {
+        CommandKind::Update {
             check,
             version,
             allow_major,
-        } => upgrade(check, version.as_deref(), allow_major).await,
-        CommandKind::Rollback => rollback().await,
+        } => management::update(check, version.as_deref(), allow_major).await,
+        CommandKind::Rollback => management::rollback().await,
+        CommandKind::Uninstall { keep_data } => management::uninstall(keep_data),
     }
 }
 
-async fn upgrade(check_only: bool, requested: Option<&str>, allow_major: bool) -> Result<()> {
-    let updater = Updater::new()?;
-    let Some(candidate) = updater
-        .check(Role::Agent, PRODUCT_VERSION, requested, allow_major)
-        .await?
-    else {
-        println!("FarHelm Agent {PRODUCT_VERSION} is up to date.");
-        return Ok(());
-    };
-    if check_only {
-        println!(
-            "FarHelm Agent {} is available (current {}).",
-            candidate.version, PRODUCT_VERSION
-        );
-        return Ok(());
-    }
-    ensure!(!is_root(), "Agent upgrade must be run without sudo/root");
-    let install_root = installed_agent_root()?;
-    println!(
-        "Downloading verified {} for immutable release {}...",
-        candidate.archive_name(),
-        candidate.tag
-    );
-    let bundle = updater.download(Role::Agent, &candidate).await?;
-    updater.install(&bundle, Some(&install_root)).await?;
-    println!("FarHelm Agent upgraded to {}.", candidate.version);
-    Ok(())
-}
-
-async fn rollback() -> Result<()> {
-    ensure!(!is_root(), "Agent rollback must be run without sudo/root");
-    let script = installed_agent_root()?.join("rollback.sh");
-    let status = Command::new("bash")
-        .arg(&script)
-        .status()
-        .await
-        .with_context(|| format!("failed to start {}", script.display()))?;
-    ensure!(status.success(), "Agent rollback failed");
-    Ok(())
-}
-
-fn installed_agent_root() -> Result<PathBuf> {
-    let executable = std::env::current_exe()
-        .context("failed to locate the running Agent binary")?
-        .canonicalize()
-        .context("failed to resolve the running Agent binary")?;
-    let release_dir = executable
-        .parent()
-        .and_then(Path::parent)
-        .context("Agent is not running from an installed release")?;
-    let releases_dir = release_dir
-        .parent()
-        .context("Agent release directory is invalid")?;
-    ensure!(
-        releases_dir
-            .file_name()
-            .is_some_and(|name| name == "releases"),
-        "Agent is not running from the versioned installation layout"
-    );
-    releases_dir
-        .parent()
-        .map(Path::to_path_buf)
-        .context("Agent installation root is invalid")
-}
-
-fn is_root() -> bool {
-    std::process::Command::new("id")
-        .arg("-u")
-        .output()
-        .is_ok_and(|output| output.status.success() && output.stdout == b"0\n")
+fn resolve_runtime(
+    options: ConnectionArgs,
+    interval: Option<u64>,
+    command_interval: Option<u64>,
+    database: Option<PathBuf>,
+) -> Result<RuntimeArgs> {
+    let paths = AgentPaths::discover().ok();
+    let config_path = options.config.or_else(|| {
+        paths
+            .as_ref()
+            .map(|value| value.config.clone())
+            .filter(|path| path.is_file())
+    });
+    let config = config_path
+        .as_deref()
+        .map(AgentFileConfig::load)
+        .transpose()?;
+    let hub = options
+        .hub
+        .or_else(|| config.as_ref().map(|value| value.agent.hub_url.clone()))
+        .context("Hub URL is missing; provide --config or FARHELM_HUB_URL")?;
+    let token = options
+        .token
+        .or_else(|| config.as_ref().map(|value| value.agent.token.clone()))
+        .context("Agent token is missing; provide --config or FARHELM_AGENT_TOKEN")?;
+    let agent_id = options
+        .agent_id
+        .or_else(|| config.as_ref().map(|value| value.agent.id.clone()))
+        .context("Agent ID is missing; provide --config or FARHELM_AGENT_ID")?;
+    let hostname = options.hostname.or_else(|| {
+        config
+            .as_ref()
+            .and_then(|value| value.agent.hostname.clone())
+    });
+    Ok(RuntimeArgs {
+        hub: HubArgs {
+            hub,
+            token,
+            agent_id,
+            hostname,
+        },
+        interval: interval
+            .or_else(|| config.as_ref().map(|value| value.agent.heartbeat_seconds))
+            .unwrap_or(15),
+        command_interval: command_interval
+            .or_else(|| {
+                config
+                    .as_ref()
+                    .map(|value| value.agent.command_poll_seconds)
+            })
+            .unwrap_or(2),
+        database: database
+            .or_else(|| config.as_ref().map(|value| value.agent.database.clone()))
+            .unwrap_or_else(|| PathBuf::from("farhelm-agent.db")),
+    })
 }
 
 async fn run(
@@ -497,43 +536,6 @@ async fn send_heartbeat(
         ack.protocol
     );
     Ok(())
-}
-
-fn doctor(python: &str, worker_root: &Path) -> Result<()> {
-    let python_ok = std::process::Command::new(python)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    let worker_src = worker_root.join("src/farhelm_worker_codex");
-    let nvidia_available = std::process::Command::new("nvidia-smi")
-        .arg("--query-gpu=name")
-        .arg("--format=csv,noheader")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-
-    println!("FarHelm Agent doctor");
-    println!("  Python ({python}): {}", state(python_ok));
-    println!("  Worker source: {}", state(worker_src.is_dir()));
-    println!(
-        "  NVIDIA tools: {} (optional for skeleton)",
-        state(nvidia_available)
-    );
-
-    ensure!(python_ok, "Python command `{python}` is unavailable");
-    ensure!(
-        worker_src.is_dir(),
-        "Worker source not found at {}",
-        worker_src.display()
-    );
-    Ok(())
-}
-
-const fn state(value: bool) -> &'static str {
-    if value { "ok" } else { "missing" }
 }
 
 async fn worker_smoke(python: &str, worker_root: &Path) -> Result<()> {

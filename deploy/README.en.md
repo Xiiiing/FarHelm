@@ -1,179 +1,139 @@
-# FarHelm installation, upgrade, and rollback
+# FarHelm V0.3.0 deployment and lifecycle
 
 [简体中文](README.md) · [English](README.en.md)
 
-Bundles target Ubuntu 24.04 x86_64, or a compatible systemd distribution with glibc 2.39+. The public host needs Caddy or an equivalent HTTPS reverse proxy. A training host needs no root, sudo, Python, or inbound port for presence reporting and side-effect-free probe commands; Python 3.12 is required only for Codex Worker capabilities.
+Formal programs target Ubuntu 24.04 x86_64, or a compatible system with systemd and glibc 2.39+. Hub needs Caddy or an equivalent HTTPS reverse proxy. Agent is outbound-only, opens no port, and needs no sudo.
 
-The default entry point is one executable per role. It validates and expands its embedded payload only in an operating-system temporary directory and leaves no extracted directory beside the download. Managed paths are created only when you explicitly run the installer.
-
-## Single-file installation (recommended)
-
-No compilation or GitHub login is required. Download the Hub installer on the public server:
+## Hub
 
 ```bash
 curl -fL https://github.com/Xiiiing/FarHelm/releases/latest/download/farhelm-hub-linux-x86_64 -o farhelm-hub
 chmod +x farhelm-hub
-sudo ./farhelm-hub
+sudo ./farhelm-hub install
 ```
 
-On a training host, download the Agent installer as the regular user and do not use sudo:
+When configuration is missing, the program prompts for the admin username, admin password, and Agent token. Password and token input is hidden. For non-interactive installation:
+
+```bash
+sudo env \
+  FARHELM_ADMIN_USER="admin" \
+  FARHELM_ADMIN_PASSWORD="a-random-password-of-at-least-12-characters" \
+  FARHELM_AGENT_TOKEN="a-random-token-of-at-least-32-characters" \
+  ./farhelm-hub install
+```
+
+Hub creates and manages:
+
+- `/usr/local/bin/farhelm-hub`: the actual program.
+- `/usr/local/bin/farhelm-hub.previous`: the single previous program after an update.
+- `/etc/farhelm/hub.toml`: the only configuration, normally `0640 root:farhelm-hub`.
+- `/var/lib/farhelm/farhelm.db`: persistent database.
+- `/etc/systemd/system/farhelm-hub.service`: system service.
+- The least-privileged `farhelm-hub` system identity.
+
+Console is embedded in Hub, so there is no external `console/` directory and no installed `farhelmctl`. After editing configuration:
+
+```bash
+sudoedit /etc/farhelm/hub.toml
+sudo farhelm-hub doctor
+sudo farhelm-hub restart
+sudo farhelm-hub status
+```
+
+Hub still listens only on `127.0.0.1:8787`. Use `deploy/hub/Caddyfile.example` to configure Caddy and expose only ports 80/443 publicly.
+
+Update and rollback:
+
+```bash
+sudo farhelm-hub update --check
+sudo farhelm-hub update
+sudo farhelm-hub rollback
+```
+
+`upgrade` is a compatibility alias for `update`. Crossing the first version number is denied by default; use `--allow-major` only after explicitly deciding to change it.
+
+Complete removal:
+
+```bash
+sudo farhelm-hub uninstall
+```
+
+Use `sudo farhelm-hub uninstall --keep-data` to retain TOML and database data. The least-privileged service identity is also retained so saved data keeps a stable UID/GID. The program does not edit the shared Caddy configuration; remove the FarHelm site block and reload Caddy separately.
+
+## Agent
+
+Run as the target regular user on the training host:
 
 ```bash
 curl -fL https://github.com/Xiiiing/FarHelm/releases/latest/download/farhelm-agent-linux-x86_64 -o farhelm-agent
 chmod +x farhelm-agent
-./farhelm-agent
+./farhelm-agent install
 ```
 
-Agent prompts for the Hub HTTPS URL, Agent ID, and token; token input is hidden. Delete the downloaded installer after success. Advanced users can run `./farhelm-agent --verify` first to validate the embedded bundle without installing.
-
-## 1. Public server
-
-Run the single-file Hub installer:
+The program prompts for the Hub HTTPS URL, Agent token, and Agent ID; token input is hidden. For non-interactive installation:
 
 ```bash
-sudo ./farhelm-hub
-```
-
-The installer generates an admin password and an Agent token, displays them once, and stores them in `/etc/farhelm/hub.env`. The Hub installer manages only:
-
-- `/opt/farhelm-hub/` for `releases/<version>`, atomic `current/previous` links, Console, and management scripts.
-- `/etc/farhelm/hub.env` and `/etc/farhelm/Caddyfile.example` for configuration and the proxy example.
-- `/etc/systemd/system/farhelm-hub.service` for the system service.
-- `/usr/local/bin/farhelmctl` for the health-check CLI.
-- `/var/lib/farhelm-hub/` for the durable command database, removed by uninstall.
-- The `farhelm-hub` system user, without a home directory.
-
-Replace the hostname in `Caddyfile.example`, merge the site block into `/etc/caddy/Caddyfile`, then run:
-
-```bash
-sudo caddy validate --config /etc/caddy/Caddyfile
-sudo systemctl reload caddy
-curl https://your-domain.example/api/v1/health
-```
-
-Expose only ports 80/443, never 8787. Open the HTTPS URL and sign in with the generated admin credentials. The downloaded single-file installer can be deleted after installation.
-
-Later releases need neither uninstall nor manual download. Check first, then upgrade; a failed health check restores previous automatically:
-
-```bash
-farhelmctl upgrade --check
-sudo farhelmctl upgrade
-sudo farhelmctl rollback
-```
-
-Crossing the first version number is denied by default. Use `sudo farhelmctl upgrade --allow-major` only after you explicitly decide to change it.
-
-Completely uninstall Hub with:
-
-```bash
-sudo /opt/farhelm-hub/uninstall.sh
-```
-
-The uninstaller stops the service and removes every FarHelm-specific managed path and system user above. It does not guess how to edit the shared `/etc/caddy/Caddyfile`; remove the FarHelm site block and reload Caddy yourself.
-
-## 2. Training server: unprivileged install
-
-Do not use `sudo`. Run the single file and enter the Agent token printed by the Hub installer when prompted:
-
-```bash
-./farhelm-agent
-```
-
-Non-interactive automation can still use environment variables. Do not put the token in a command-line argument:
-
-```bash
-FARHELM_HUB_URL="https://your-domain.example" \
-FARHELM_AGENT_TOKEN="agent-token-from-hub" \
+FARHELM_HUB_URL="https://your-domain" \
+FARHELM_AGENT_TOKEN="the-Agent-token-from-Hub-config" \
 FARHELM_AGENT_ID="gpu-a" \
-./farhelm-agent
+./farhelm-agent install
 ```
 
-By default, only two FarHelm-specific locations are created:
+Agent creates and manages:
 
-- `${XDG_DATA_HOME:-~/.local/share}/farhelm-agent/` for persistent configuration/state, `releases/<version>`, atomic `current/previous` links, and the uninstaller; configuration mode is `0600`.
-- `${XDG_CONFIG_HOME:-~/.config}/systemd/user/farhelm-agent.service` for the current user's systemd unit.
+- `${XDG_BIN_HOME:-$HOME/.local/bin}/farhelm-agent`: the actual program.
+- `farhelm-agent.previous` in the same directory: the single rollback backup.
+- `${XDG_CONFIG_HOME:-$HOME/.config}/farhelm/agent.toml`: the only configuration, mode `0600`.
+- `${XDG_DATA_HOME:-$HOME/.local/share}/farhelm/`: SQLite state and private Worker runtime.
+- `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/farhelm-agent.service`: user service.
 
-No system user/group is created, and nothing is written under `/opt`, `/etc`, or `/usr/local`. You may delete the downloaded single-file installer after installation.
+If `~/.local/bin` is not yet in the current shell's `PATH`, installation prints the complete command path. Ubuntu normally adds it after the next login; until then, use `~/.local/bin/farhelm-agent` directly.
 
-Check connectivity:
+Common commands:
 
 ```bash
-systemctl --user status farhelm-agent
+farhelm-agent doctor
+farhelm-agent status
+farhelm-agent restart
 journalctl --user -u farhelm-agent -n 50 --no-pager
+
+farhelm-agent update --check
+farhelm-agent update
+farhelm-agent rollback
 ```
 
-Within one heartbeat interval, Console's Agents page shows the real hostname, Agent ID, version, last heartbeat, and presence.
+After editing the token or Hub URL, run `farhelm-agent doctor && farhelm-agent restart`. Hub and Agent tokens must match. Rotate any token that has appeared in chat or logs.
 
-The `V0.1.0` command channel exposes only `agent.probe` to verify persistence, TTL, and idempotent recovery. It neither reads projects nor runs shell commands. Create a probe with admin authentication, then query the returned `status_url`:
-
-```bash
-curl --user admin \
-  --header 'Content-Type: application/json' \
-  --data '{"idempotency_key":"manual-probe-0001","ttl_secs":60}' \
-  https://your-domain.example/api/v1/agents/gpu-a/probe
-```
-
-The user service starts immediately, but continued operation after logout or reboot requires systemd linger to be enabled for the account. The installer detects and reports this. If disabled, an administrator must run once:
+Continued operation after logout or reboot requires systemd linger for that user. Installation detects and reports this; an administrator only needs to run once:
 
 ```bash
 loginctl enable-linger your-user
 ```
 
-If the systemd user manager is unavailable, install without a service and run in the foreground:
+Without a systemd user manager, install only the files and run in the foreground:
 
 ```bash
-FARHELM_NO_SERVICE=1 \
-FARHELM_HUB_URL="https://your-domain.example" \
-FARHELM_AGENT_TOKEN="agent-token-from-hub" \
-FARHELM_AGENT_ID="gpu-a" \
-./farhelm-agent --no-service
-
-~/.local/share/farhelm-agent/current/run.sh
+./farhelm-agent install --no-service
+~/.local/bin/farhelm-agent run --config ~/.config/farhelm/agent.toml
 ```
 
-For a temporary foreground run with no installation, use the archive fallback below:
+Remove everything or keep data:
 
 ```bash
-FARHELM_HUB_URL="https://your-domain.example" \
-FARHELM_AGENT_TOKEN="agent-token-from-hub" \
-FARHELM_AGENT_ID="gpu-a" \
-./bin/farhelm-agent run
+farhelm-agent uninstall
+farhelm-agent uninstall --keep-data
 ```
 
-Deleting the extracted directory then leaves no FarHelm files. To completely remove a user installation, run:
+## Migrating from V0.2.0
 
-```bash
-${XDG_DATA_HOME:-$HOME/.local/share}/farhelm-agent/uninstall.sh
-```
+The uppercase formal `V0.2.0` release can run its existing `farhelmctl upgrade` or `farhelm-agent upgrade`. The V0.3.0 Release retains one compatibility tar.gz; the old updater verifies it, then invokes the new role program to migrate `.env`, database state, the unit, and the stable executable. The old `releases/current/run.sh` tree is removed after success.
 
-Use the installed Agent for later upgrades and rollback, never `sudo`:
-
-```bash
-~/.local/share/farhelm-agent/current/bin/farhelm-agent upgrade --check
-~/.local/share/farhelm-agent/current/bin/farhelm-agent upgrade
-~/.local/share/farhelm-agent/current/bin/farhelm-agent rollback
-```
-
-Replace the root path if you used a custom `XDG_DATA_HOME`. Upgrade accepts only immutable uppercase `V*` Releases from the fixed official repository and verifies the GitHub asset length and SHA-256; configuration and databases remain outside release directories.
-
-## Versioned archive fallback
-
-The single-file installer and its embedded archive belong to the same immutable Release. For troubleshooting or package inspection, download the versioned tar.gz files and `SHA256SUMS`, verify them, and run the included `install.sh`:
-
-```bash
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.2.0/farhelm-hub-0.2.0-linux-x86_64.tar.gz
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.2.0/farhelm-agent-0.2.0-linux-x86_64.tar.gz
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.2.0/SHA256SUMS
-grep '\.tar\.gz$' SHA256SUMS | sha256sum -c -
-```
-
-## Establishing the new baseline from legacy lowercase releases
-
-Legacy `v0.1.0/v0.2.0` installs use a different layout and remain outside the formal update series. Uppercase `V0.1.x` installations can upgrade directly to current `V0.2.0`; only legacy lowercase installations require cleanup with their old uninstaller first.
+Lowercase legacy `v0.1.0/v0.2.0` releases are outside the formal update sequence. Remove them with their matching old uninstaller before installing V0.3.0.
 
 ## Security notes
 
-- Never expose Hub directly on a public bind address; the application rejects non-loopback binds.
-- Never paste `agent.env` or `hub.env` into chat, Git, or public logs.
-- Beyond presence, this version executes only a side-effect-free probe. It cannot control training and does not connect to real Codex.
-- Formal versions use uppercase `VMAJOR.MINOR.PATCH` tags only. The user alone decides the first number; features and bug fixes increment the second and third numbers respectively.
+- The downloaded file is the program; initial installation executes no dynamic remote script.
+- V0.3+ updater downloads only versioned actual executables and verifies the fixed official repository, immutable Release, length, SHA-256, role, and version.
+- A new program is fully written on the same filesystem before atomic replacement; failed service health restores previous.
+- Configuration, database, and Worker runtime are not overwritten with the executable; logs go to journald.
+- The current release executes only the side-effect-free probe beyond presence reporting; it cannot start/stop training and does not connect to real Codex yet.

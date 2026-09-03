@@ -1,80 +1,120 @@
-use std::{ffi::OsString, net::SocketAddr, path::PathBuf, str::FromStr};
+use std::{net::SocketAddr, path::PathBuf};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
 use farhelm_core::PRODUCT_VERSION;
-use farhelm_hub::{AppState, HubConfig};
+use farhelm_hub::AppState;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_BIND: &str = "127.0.0.1:8787";
+mod config;
+mod management;
+
+use config::{DEFAULT_CONFIG_PATH, HubFileConfig};
+
+#[derive(Debug, Parser)]
+#[command(name = "farhelm-hub", version, about = "FarHelm Control Hub")]
+struct Cli {
+    #[command(subcommand)]
+    command: CommandKind,
+}
+
+#[derive(Debug, Subcommand)]
+enum CommandKind {
+    /// Run the Hub in the foreground.
+    Serve {
+        #[arg(long, env = "FARHELM_HUB_CONFIG", default_value = DEFAULT_CONFIG_PATH)]
+        config: PathBuf,
+    },
+    /// Install this executable, configuration, and the system service.
+    Install {
+        /// Install files without enabling or starting the service.
+        #[arg(long)]
+        no_start: bool,
+    },
+    /// Start the installed system service.
+    Start,
+    /// Stop the installed system service.
+    Stop,
+    /// Restart the installed system service.
+    Restart,
+    /// Confirm that the installed system service is active.
+    Status,
+    /// Validate configuration and local runtime prerequisites.
+    Doctor {
+        #[arg(long, env = "FARHELM_HUB_CONFIG", default_value = DEFAULT_CONFIG_PATH)]
+        config: PathBuf,
+    },
+    /// Check for or install an immutable official Hub update.
+    #[command(visible_alias = "upgrade")]
+    Update {
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long)]
+        allow_major: bool,
+    },
+    /// Atomically switch to the locally preserved previous binary.
+    Rollback,
+    /// Remove the Hub program and its managed service files.
+    Uninstall {
+        /// Keep the TOML configuration and SQLite data.
+        #[arg(long)]
+        keep_data: bool,
+    },
+    /// Check a running Hub health endpoint.
+    Health {
+        #[arg(long, default_value = "http://127.0.0.1:8787")]
+        hub: String,
+    },
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if requests_version(std::env::args_os().skip(1)) {
-        println!("farhelm-hub {PRODUCT_VERSION}");
-        return Ok(());
+    match Cli::parse().command {
+        CommandKind::Serve { config } => serve(config).await,
+        CommandKind::Install { no_start } => management::install(no_start).await,
+        CommandKind::Start => management::service_action("start"),
+        CommandKind::Stop => management::service_action("stop"),
+        CommandKind::Restart => management::restart().await,
+        CommandKind::Status => management::status(),
+        CommandKind::Doctor { config } => management::doctor(&config),
+        CommandKind::Update {
+            check,
+            version,
+            allow_major,
+        } => management::update(check, version.as_deref(), allow_major).await,
+        CommandKind::Rollback => management::rollback().await,
+        CommandKind::Uninstall { keep_data } => management::uninstall(keep_data),
+        CommandKind::Health { hub } => management::health(&hub).await,
     }
+}
 
+async fn serve(path: PathBuf) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
-
-    let bind = std::env::var("FARHELM_HUB_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_owned());
-    let address = SocketAddr::from_str(&bind)
-        .with_context(|| format!("invalid FARHELM_HUB_BIND value: {bind}"))?;
-    ensure!(
-        address.ip().is_loopback(),
-        "FARHELM_HUB_BIND must use a loopback address; terminate public TLS with a reverse proxy"
-    );
-    let config = config_from_env()?;
+    let file = HubFileConfig::load(&path)?;
+    let address: SocketAddr = file
+        .hub
+        .bind
+        .parse()
+        .with_context(|| format!("invalid hub.bind value: {}", file.hub.bind))?;
+    let config = file.runtime();
+    config.validate()?;
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .with_context(|| format!("failed to bind FarHelm Hub to {address}"))?;
 
-    info!(%address, "FarHelm Hub is listening");
+    info!(version = PRODUCT_VERSION, %address, "FarHelm Hub is listening");
     axum::serve(listener, farhelm_hub::app(AppState::new(config)?))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("FarHelm Hub server failed")?;
     Ok(())
-}
-
-fn requests_version(mut arguments: impl Iterator<Item = OsString>) -> bool {
-    let argument = arguments.next();
-    arguments.next().is_none()
-        && argument
-            .as_deref()
-            .is_some_and(|value| value == "--version" || value == "-V")
-}
-
-fn config_from_env() -> Result<HubConfig> {
-    let admin_user = required_env("FARHELM_ADMIN_USER")?;
-    let admin_password = required_env("FARHELM_ADMIN_PASSWORD")?;
-    let agent_token = required_env("FARHELM_AGENT_TOKEN")?;
-    let console_dir = PathBuf::from(required_env("FARHELM_CONSOLE_DIR")?);
-    let database_path = PathBuf::from(
-        std::env::var("FARHELM_HUB_DATABASE")
-            .unwrap_or_else(|_| "/var/lib/farhelm-hub/farhelm.db".to_owned()),
-    );
-
-    let config = HubConfig {
-        admin_user,
-        admin_password,
-        agent_token,
-        console_dir,
-        database_path,
-    };
-    config.validate()?;
-    Ok(config)
-}
-
-fn required_env(name: &str) -> Result<String> {
-    let value =
-        std::env::var(name).with_context(|| format!("required setting {name} is missing"))?;
-    ensure!(!value.is_empty(), "required setting {name} is empty");
-    Ok(value)
 }
 
 async fn shutdown_signal() {
@@ -94,20 +134,5 @@ async fn shutdown_signal() {
     tokio::select! {
         () = ctrl_c => {}
         () = terminate => {}
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn version_flag_is_handled_without_runtime_configuration() {
-        assert!(requests_version([OsString::from("--version")].into_iter()));
-        assert!(requests_version([OsString::from("-V")].into_iter()));
-        assert!(!requests_version(std::iter::empty()));
-        assert!(!requests_version(
-            [OsString::from("--version"), OsString::from("extra")].into_iter()
-        ));
     }
 }

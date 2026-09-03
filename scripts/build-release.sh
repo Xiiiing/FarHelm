@@ -29,72 +29,49 @@ install -d -m 0755 "$output_dir"
 
 corepack pnpm@10.17.1 --dir farhelm-console install --frozen-lockfile
 corepack pnpm@10.17.1 --dir farhelm-console build
-cargo build --release --locked -p farhelm-hub -p farhelm-agent -p farhelmctl
+FARHELM_CONSOLE_EMBED_DIR="$repo_root/farhelm-console/dist" \
+  cargo build --release --locked -p farhelm-hub
+cargo build --release --locked -p farhelm-agent
 
+hub_versioned="farhelm-hub-$version-$platform"
+agent_versioned="farhelm-agent-$version-$platform"
+hub_stable="farhelm-hub-$platform"
+agent_stable="farhelm-agent-$platform"
+install -m 0755 target/release/farhelm-hub "$output_dir/$hub_versioned"
+install -m 0755 target/release/farhelm-agent "$output_dir/$agent_versioned"
+install -m 0755 target/release/farhelm-hub "$output_dir/$hub_stable"
+install -m 0755 target/release/farhelm-agent "$output_dir/$agent_stable"
+
+# V0.3.0 keeps one compatibility archive so the V0.2.0 updater can cross to the
+# native-program layout. V0.3+ clients download the versioned executables above.
 stage_dir=$(mktemp -d)
 trap 'rm -rf "$stage_dir"' EXIT
-hub_name="farhelm-hub-$version-$platform"
-agent_name="farhelm-agent-$version-$platform"
-hub_stage="$stage_dir/$hub_name"
-agent_stage="$stage_dir/$agent_name"
-
-install -d -m 0755 "$hub_stage/bin" "$hub_stage/console"
-install -m 0755 target/release/farhelm-hub "$hub_stage/bin/farhelm-hub"
-install -m 0755 target/release/farhelmctl "$hub_stage/bin/farhelmctl"
-cp -a farhelm-console/dist/. "$hub_stage/console/"
-install -m 0755 deploy/hub/install.sh "$hub_stage/install.sh"
-install -m 0755 deploy/hub/rollback.sh "$hub_stage/rollback.sh"
-install -m 0755 deploy/hub/uninstall.sh "$hub_stage/uninstall.sh"
-install -m 0644 deploy/hub/farhelm-hub.service "$hub_stage/farhelm-hub.service"
-install -m 0644 deploy/hub/Caddyfile.example "$hub_stage/Caddyfile.example"
-install -m 0644 deploy/README.md "$hub_stage/README.md"
-install -m 0644 deploy/README.en.md "$hub_stage/README.en.md"
-printf '%s\n' "$version" >"$hub_stage/VERSION"
-printf 'V%s\n' "$version" >"$hub_stage/RELEASE_TAG"
-
-install -d -m 0755 "$agent_stage/bin" "$agent_stage/worker/src"
-install -m 0755 target/release/farhelm-agent "$agent_stage/bin/farhelm-agent"
-install -d -m 0755 "$agent_stage/worker/src/farhelm_worker_codex"
-install -m 0644 farhelm-worker-codex/src/farhelm_worker_codex/*.py \
-  "$agent_stage/worker/src/farhelm_worker_codex/"
-install -m 0644 farhelm-worker-codex/pyproject.toml "$agent_stage/worker/pyproject.toml"
-install -m 0644 farhelm-worker-codex/uv.lock "$agent_stage/worker/uv.lock"
-install -m 0755 deploy/agent/install.sh "$agent_stage/install.sh"
-install -m 0755 deploy/agent/run.sh "$agent_stage/run.sh"
-install -m 0755 deploy/agent/rollback.sh "$agent_stage/rollback.sh"
-install -m 0755 deploy/agent/uninstall.sh "$agent_stage/uninstall.sh"
-install -m 0644 deploy/agent/farhelm-agent.service "$agent_stage/farhelm-agent.service"
-install -m 0644 deploy/README.md "$agent_stage/README.md"
-install -m 0644 deploy/README.en.md "$agent_stage/README.en.md"
-printf '%s\n' "$version" >"$agent_stage/VERSION"
-printf 'V%s\n' "$version" >"$agent_stage/RELEASE_TAG"
-
-tar -C "$stage_dir" -czf "$output_dir/$hub_name.tar.gz" "$hub_name"
-tar -C "$stage_dir" -czf "$output_dir/$agent_name.tar.gz" "$agent_name"
-
-FARHELM_BOOTSTRAP_ROLE=hub \
-FARHELM_BOOTSTRAP_BUNDLE="$output_dir/$hub_name.tar.gz" \
-  cargo build --release --locked -p farhelm-bootstrap
-install -m 0755 target/release/farhelm-bootstrap \
-  "$output_dir/farhelm-hub-$platform"
-
-FARHELM_BOOTSTRAP_ROLE=agent \
-FARHELM_BOOTSTRAP_BUNDLE="$output_dir/$agent_name.tar.gz" \
-  cargo build --release --locked -p farhelm-bootstrap
-install -m 0755 target/release/farhelm-bootstrap \
-  "$output_dir/farhelm-agent-$platform"
+hub_compat="$stage_dir/$hub_versioned"
+agent_compat="$stage_dir/$agent_versioned"
+install -d -m 0755 "$hub_compat/bin" "$agent_compat/bin"
+install -m 0755 target/release/farhelm-hub "$hub_compat/bin/farhelm-hub"
+install -m 0755 target/release/farhelm-agent "$agent_compat/bin/farhelm-agent"
+install -m 0755 deploy/compat/hub-install.sh "$hub_compat/install.sh"
+install -m 0755 deploy/compat/agent-install.sh "$agent_compat/install.sh"
+printf '%s\n' "$version" >"$hub_compat/VERSION"
+printf '%s\n' "$version" >"$agent_compat/VERSION"
+printf 'V%s\n' "$version" >"$hub_compat/RELEASE_TAG"
+printf 'V%s\n' "$version" >"$agent_compat/RELEASE_TAG"
+tar -C "$stage_dir" -czf "$output_dir/$hub_versioned.tar.gz" "$hub_versioned"
+tar -C "$stage_dir" -czf "$output_dir/$agent_versioned.tar.gz" "$agent_versioned"
 
 (
   cd "$output_dir"
   sha256sum \
-    "$hub_name.tar.gz" \
-    "$agent_name.tar.gz" \
-    "farhelm-hub-$platform" \
-    "farhelm-agent-$platform" >SHA256SUMS
+    "$hub_versioned" \
+    "$agent_versioned" \
+    "$hub_stable" \
+    "$agent_stable" \
+    "$hub_versioned.tar.gz" \
+    "$agent_versioned.tar.gz" >SHA256SUMS
 )
 
-printf 'Release bundles built in %s\n' "$output_dir"
-printf '  %s.tar.gz\n' "$hub_name"
-printf '  %s.tar.gz\n' "$agent_name"
-printf '  farhelm-hub-%s\n' "$platform"
-printf '  farhelm-agent-%s\n' "$platform"
+printf 'FarHelm V%s native role programs built in %s\n' "$version" "$output_dir"
+printf '  %s (stable alias: %s)\n' "$hub_versioned" "$hub_stable"
+printf '  %s (stable alias: %s)\n' "$agent_versioned" "$agent_stable"
+printf '  V0.2.0 migration archives retained for this transition\n'

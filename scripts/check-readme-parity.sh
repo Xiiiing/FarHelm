@@ -3,7 +3,7 @@ set -euo pipefail
 
 for file in README.md README.en.md; do
   test -s "$file"
-  for component in farhelm-hub farhelm-agent farhelm-console farhelm-worker-codex farhelmctl; do
+  for component in farhelm-hub farhelm-agent farhelm-console farhelm-worker-codex; do
     grep -q "$component" "$file"
   done
 done
