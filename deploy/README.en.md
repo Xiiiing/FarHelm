@@ -11,9 +11,9 @@ Downloading and extracting a bundle creates only one same-named directory and do
 No compilation or GitHub login is required. Download the Hub bundle on the public server, the Agent bundle on the training server, and the checksum file on both:
 
 ```bash
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.1/farhelm-hub-0.1.1-linux-x86_64.tar.gz
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.1/farhelm-agent-0.1.1-linux-x86_64.tar.gz
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.1/SHA256SUMS
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.2/farhelm-hub-0.1.2-linux-x86_64.tar.gz
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.2/farhelm-agent-0.1.2-linux-x86_64.tar.gz
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.2/SHA256SUMS
 sha256sum -c SHA256SUMS
 ```
 
@@ -27,11 +27,11 @@ grep 'farhelm-agent-' SHA256SUMS | sha256sum -c -
 
 ## 1. Public server
 
-Upload and extract `farhelm-hub-0.1.1-linux-x86_64.tar.gz`:
+Upload and extract `farhelm-hub-0.1.2-linux-x86_64.tar.gz`:
 
 ```bash
-tar -xzf farhelm-hub-0.1.1-linux-x86_64.tar.gz
-cd farhelm-hub-0.1.1-linux-x86_64
+tar -xzf farhelm-hub-0.1.2-linux-x86_64.tar.gz
+cd farhelm-hub-0.1.2-linux-x86_64
 sudo ./install.sh
 ```
 
@@ -77,8 +77,8 @@ The uninstaller stops the service and removes every FarHelm-specific managed pat
 Do not use `sudo`. Use the Agent token printed by the Hub installer:
 
 ```bash
-tar -xzf farhelm-agent-0.1.1-linux-x86_64.tar.gz
-cd farhelm-agent-0.1.1-linux-x86_64
+tar -xzf farhelm-agent-0.1.2-linux-x86_64.tar.gz
+cd farhelm-agent-0.1.2-linux-x86_64
 
 FARHELM_HUB_URL="https://your-domain.example" \
 FARHELM_AGENT_TOKEN="agent-token-from-hub" \
@@ -156,7 +156,7 @@ Replace the root path if you used a custom `XDG_DATA_HOME`. Upgrade accepts only
 
 ## Establishing the new baseline from legacy lowercase releases
 
-Legacy `v0.1.0/v0.2.0` installs use a different layout and are outside the new update series. As planned, remove Hub and Agent with their legacy uninstallers, then install the current uppercase `V0.1.1`. This is the final uninstall required; use upgrade/rollback afterward.
+Legacy `v0.1.0/v0.2.0` installs use a different layout and are outside the new update series. As planned, remove Hub and Agent with their legacy uninstallers, then install the current uppercase `V0.1.2`. This is the final uninstall required; use upgrade/rollback afterward.
 
 ## Security notes
 

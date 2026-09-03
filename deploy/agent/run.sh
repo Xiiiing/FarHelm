@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-release_root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-install_root=$(cd "$release_root/../.." && pwd)
+release_root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+install_root=$(cd "$release_root/../.." && pwd -P)
 config_file="$install_root/config/agent.env"
 if [[ ! -r "$config_file" ]]; then
   printf 'Agent configuration is missing or unreadable: %s\n' "$config_file" >&2

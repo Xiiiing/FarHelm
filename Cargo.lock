@@ -328,7 +328,7 @@ checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
 name = "farhelm-agent"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -346,14 +346,14 @@ dependencies = [
 
 [[package]]
 name = "farhelm-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "farhelm-hub"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -374,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "farhelm-protocol"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "farhelm-test-support"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "farhelm-protocol",
  "serde_json",
@@ -392,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "farhelm-updater"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "flate2",
@@ -408,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "farhelmctl"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",

@@ -29,6 +29,6 @@ mod tests {
     fn build_info_uses_workspace_identity() {
         let info = BuildInfo::current();
         assert_eq!(info.product, "FarHelm");
-        assert_eq!(info.version, "0.1.1");
+        assert_eq!(info.version, "0.1.2");
     }
 }

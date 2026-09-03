@@ -4,7 +4,7 @@
 
 FarHelm is a remote control plane for personal research and GPU training environments. It brings server health, training jobs, and Codex sessions from multiple machines into one mobile-first web console while keeping training hosts outbound-only and retaining source code and credentials locally.
 
-> Current status: `V0.1.1`, the bug-fix release of the upgradeable baseline. Hub and Agent support self-upgrades verified against immutable Releases and SHA-256 asset digests, atomic version switching, and local rollback while retaining durable asynchronous commands, TTLs, and idempotent retries. The only enabled action remains the side-effect-free `agent.probe`.
+> Current status: `V0.1.2`, the bug-fix release of the upgradeable baseline. Hub and Agent support self-upgrades verified against immutable Releases and SHA-256 asset digests, atomic version switching, and local rollback while retaining durable asynchronous commands, TTLs, and idempotent retries. The only enabled action remains the side-effect-free `agent.probe`.
 
 ## Architecture
 
@@ -91,15 +91,15 @@ make test-release
 End users need neither compilation nor a GitHub login and can download the public Release directly:
 
 ```bash
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.1/farhelm-hub-0.1.1-linux-x86_64.tar.gz
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.1/farhelm-agent-0.1.1-linux-x86_64.tar.gz
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.1/SHA256SUMS
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.2/farhelm-hub-0.1.2-linux-x86_64.tar.gz
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.2/farhelm-agent-0.1.2-linux-x86_64.tar.gz
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.2/SHA256SUMS
 sha256sum -c SHA256SUMS
 ```
 
 Use the Hub bundle on the public server and the Agent bundle on the training server. Agent installation is fully unprivileged and both bundles include uninstallers. See the complete path list, systemd, Caddy, foreground-run, and removal instructions in the [deployment guide](deploy/README.en.md). Hub must remain on loopback and be exposed only through an HTTPS reverse proxy.
 
-After the initial `V0.1.1` installation, later releases need no manual download: use `farhelmctl upgrade --check` / `sudo farhelmctl upgrade` for Hub and `farhelm-agent upgrade --check` / `farhelm-agent upgrade` for Agent. A failed upgrade restores the previous version, while configuration and databases remain outside version directories.
+After the initial `V0.1.2` installation, later releases need no manual download: use `farhelmctl upgrade --check` / `sudo farhelmctl upgrade` for Hub and `farhelm-agent upgrade --check` / `farhelm-agent upgrade` for Agent. A failed upgrade restores the previous version, while configuration and databases remain outside version directories.
 
 ## Development checks
 

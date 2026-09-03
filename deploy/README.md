@@ -11,9 +11,9 @@
 不需要编译或登录 GitHub。公网服务器下载 Hub 包，训练服务器下载 Agent 包；两端都下载校验文件：
 
 ```bash
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.1/farhelm-hub-0.1.1-linux-x86_64.tar.gz
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.1/farhelm-agent-0.1.1-linux-x86_64.tar.gz
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.1/SHA256SUMS
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.2/farhelm-hub-0.1.2-linux-x86_64.tar.gz
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.2/farhelm-agent-0.1.2-linux-x86_64.tar.gz
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.2/SHA256SUMS
 sha256sum -c SHA256SUMS
 ```
 
@@ -27,11 +27,11 @@ grep 'farhelm-agent-' SHA256SUMS | sha256sum -c -
 
 ## 1. 公网服务器
 
-上传并解压 `farhelm-hub-0.1.1-linux-x86_64.tar.gz`：
+上传并解压 `farhelm-hub-0.1.2-linux-x86_64.tar.gz`：
 
 ```bash
-tar -xzf farhelm-hub-0.1.1-linux-x86_64.tar.gz
-cd farhelm-hub-0.1.1-linux-x86_64
+tar -xzf farhelm-hub-0.1.2-linux-x86_64.tar.gz
+cd farhelm-hub-0.1.2-linux-x86_64
 sudo ./install.sh
 ```
 
@@ -77,8 +77,8 @@ sudo /opt/farhelm-hub/uninstall.sh
 不要使用 `sudo`。使用 Hub 安装器生成的 Agent token：
 
 ```bash
-tar -xzf farhelm-agent-0.1.1-linux-x86_64.tar.gz
-cd farhelm-agent-0.1.1-linux-x86_64
+tar -xzf farhelm-agent-0.1.2-linux-x86_64.tar.gz
+cd farhelm-agent-0.1.2-linux-x86_64
 
 FARHELM_HUB_URL="https://你的域名" \
 FARHELM_AGENT_TOKEN="Hub输出的Agent-token" \
@@ -156,7 +156,7 @@ ${XDG_DATA_HOME:-$HOME/.local/share}/farhelm-agent/uninstall.sh
 
 ## 从旧小写版本建立新基线
 
-旧 `v0.1.0/v0.2.0` 使用不同安装布局，不进入新升级序列。按你的计划先用旧版卸载器删除 Hub 和 Agent，再安装当前大写 `V0.1.1`。这是最后一次需要卸载；后续使用上述 upgrade/rollback。
+旧 `v0.1.0/v0.2.0` 使用不同安装布局，不进入新升级序列。按你的计划先用旧版卸载器删除 Hub 和 Agent，再安装当前大写 `V0.1.2`。这是最后一次需要卸载；后续使用上述 upgrade/rollback。
 
 ## 安全说明
 

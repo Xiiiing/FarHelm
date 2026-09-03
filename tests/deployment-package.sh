@@ -132,6 +132,16 @@ EOF
   ! grep -q '__FARHELM_' "$unit_file"
   grep -q "$installed_root/current/run.sh" "$unit_file"
 
+  set +e
+  timeout 1 "$installed_root/current/run.sh" >"$test_dir/installed-agent.log" 2>&1
+  installed_agent_status=$?
+  set -e
+  if [[ "$installed_agent_status" -ne 124 ]]; then
+    sed -n '1,80p' "$test_dir/installed-agent.log" >&2
+    printf 'Installed Agent did not remain running through current/run.sh.\n' >&2
+    exit 1
+  fi
+
   config_hash=$(sha256sum "$installed_root/config/agent.env" | cut -d' ' -f1)
   printf 'persistent-state\n' >"$installed_root/state/preserved.txt"
   for next_version in 0.2.0 0.2.1; do
