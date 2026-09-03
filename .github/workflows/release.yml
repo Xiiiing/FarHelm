@@ -37,7 +37,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
-            dist/release/*.tar.gz \
+            dist/release/farhelm-* \
             dist/release/SHA256SUMS \
             --verify-tag \
             --title "FarHelm $GITHUB_REF_NAME" \

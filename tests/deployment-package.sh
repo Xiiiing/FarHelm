@@ -6,6 +6,8 @@ release_dir=${1:-"$repo_root/dist/release"}
 version=$(cargo pkgid -p farhelm-core | sed 's/.*#//')
 hub_name="farhelm-hub-$version-linux-x86_64"
 agent_name="farhelm-agent-$version-linux-x86_64"
+hub_installer="$release_dir/farhelm-hub-linux-x86_64"
+agent_installer="$release_dir/farhelm-agent-linux-x86_64"
 test_dir=$(mktemp -d)
 hub_pid=
 trap 'kill "${hub_pid:-}" 2>/dev/null || true; rm -rf "$test_dir"' EXIT
@@ -34,6 +36,8 @@ for required in \
   "$agent_dir/uninstall.sh"; do
   test -e "$required"
 done
+test -x "$hub_installer"
+test -x "$agent_installer"
 bash -n \
   "$hub_dir/install.sh" \
   "$hub_dir/rollback.sh" \
@@ -46,6 +50,16 @@ test "$(<"$hub_dir/RELEASE_TAG")" = "V$version"
 test "$(<"$agent_dir/RELEASE_TAG")" = "V$version"
 env -i "$hub_dir/bin/farhelm-hub" --version | grep -Fxq "farhelm-hub $version"
 env -i "$agent_dir/bin/farhelm-agent" --version | grep -Fxq "farhelm-agent $version"
+env -i "$hub_installer" --version | grep -Fxq "farhelm-hub-installer $version"
+env -i "$agent_installer" --version | grep -Fxq "farhelm-agent-installer $version"
+verify_dir="$test_dir/verify-cwd"
+install -d -m 0755 "$verify_dir"
+(
+  cd "$verify_dir"
+  env -i "$hub_installer" --verify | grep -Fxq "Verified embedded farhelm-hub release $version."
+  env -i "$agent_installer" --verify | grep -Fxq "Verified embedded farhelm-agent release $version."
+  test -z "$(find . -mindepth 1 -print -quit)"
+)
 if grep -Eq '^(User|Group)=' "$agent_dir/farhelm-agent.service"; then
   printf 'Agent user unit must not declare a system User or Group.\n' >&2
   exit 1
@@ -115,7 +129,7 @@ EOF
   export FARHELM_AGENT_TOKEN=package-agent-token-with-at-least-32-characters
   export FARHELM_AGENT_ID=package-user-install
   export FARHELM_AGENT_HOSTNAME=package-user-host
-  "$agent_dir/install.sh"
+  "$agent_installer"
   installed_root="$XDG_DATA_HOME/farhelm-agent"
   test -L "$installed_root/current"
   test "$(basename "$(readlink -f "$installed_root/current")")" = "$version"
@@ -144,7 +158,7 @@ EOF
 
   config_hash=$(sha256sum "$installed_root/config/agent.env" | cut -d' ' -f1)
   printf 'persistent-state\n' >"$installed_root/state/preserved.txt"
-  for next_version in 0.2.0 0.2.1; do
+  for next_version in 0.3.0 0.3.1; do
     upgrade_dir="$test_dir/farhelm-agent-$next_version-linux-x86_64"
     cp -a "$agent_dir" "$upgrade_dir"
     printf '%s\n' "$next_version" >"$upgrade_dir/VERSION"
@@ -156,24 +170,24 @@ EOF
     test "$(sha256sum "$installed_root/config/agent.env" | cut -d' ' -f1)" = "$config_hash"
     test "$(<"$installed_root/state/preserved.txt")" = persistent-state
   done
-  test "$(basename "$(readlink -f "$installed_root/previous")")" = 0.2.0
+  test "$(basename "$(readlink -f "$installed_root/previous")")" = 0.3.0
   "$installed_root/rollback.sh"
-  test "$(basename "$(readlink -f "$installed_root/current")")" = 0.2.0
-  test "$(basename "$(readlink -f "$installed_root/previous")")" = 0.2.1
+  test "$(basename "$(readlink -f "$installed_root/current")")" = 0.3.0
+  test "$(basename "$(readlink -f "$installed_root/previous")")" = 0.3.1
   test "$(sha256sum "$installed_root/config/agent.env" | cut -d' ' -f1)" = "$config_hash"
   test "$(<"$installed_root/state/preserved.txt")" = persistent-state
 
-  failed_upgrade_dir="$test_dir/farhelm-agent-0.3.0-linux-x86_64"
+  failed_upgrade_dir="$test_dir/farhelm-agent-0.4.0-linux-x86_64"
   cp -a "$agent_dir" "$failed_upgrade_dir"
-  printf '0.3.0\n' >"$failed_upgrade_dir/VERSION"
-  printf 'V0.3.0\n' >"$failed_upgrade_dir/RELEASE_TAG"
+  printf '0.4.0\n' >"$failed_upgrade_dir/VERSION"
+  printf 'V0.4.0\n' >"$failed_upgrade_dir/RELEASE_TAG"
   if FARHELM_UPGRADE=1 FARHELM_INSTALL_ROOT="$installed_root" "$failed_upgrade_dir/install.sh"; then
     printf 'Installer accepted a package whose binary version did not match VERSION.\n' >&2
     exit 1
   fi
-  test "$(basename "$(readlink -f "$installed_root/current")")" = 0.2.0
+  test "$(basename "$(readlink -f "$installed_root/current")")" = 0.3.0
 
-  printf '#!/usr/bin/env bash\nif [[ ${1:-} == --version ]]; then printf "farhelm-agent 0.3.0\\n"; fi\n' \
+  printf '#!/usr/bin/env bash\nif [[ ${1:-} == --version ]]; then printf "farhelm-agent 0.4.0\\n"; fi\n' \
     >"$failed_upgrade_dir/bin/farhelm-agent"
   chmod 0755 "$failed_upgrade_dir/bin/farhelm-agent"
   export MOCK_SYSTEMCTL_FAIL_FILE="$test_dir/systemctl-health-failure"
@@ -183,8 +197,8 @@ EOF
     exit 1
   fi
   rm -f "$MOCK_SYSTEMCTL_FAIL_FILE"
-  test "$(basename "$(readlink -f "$installed_root/current")")" = 0.2.0
-  test "$(basename "$(readlink -f "$installed_root/previous")")" = 0.3.0
+  test "$(basename "$(readlink -f "$installed_root/current")")" = 0.3.0
+  test "$(basename "$(readlink -f "$installed_root/previous")")" = 0.4.0
   test "$(sha256sum "$installed_root/config/agent.env" | cut -d' ' -f1)" = "$config_hash"
   test "$(<"$installed_root/state/preserved.txt")" = persistent-state
 

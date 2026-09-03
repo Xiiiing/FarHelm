@@ -4,7 +4,7 @@
 
 FarHelm 是一个面向个人科研与 GPU 训练环境的远程控制平面。它把多台训练服务器的状态、训练任务和 Codex 会话汇总到一个移动优先的 Web 控制台中，同时保持训练服务器仅主动出站、源码与凭据留在本机。
 
-> 当前状态：`V0.1.2` 可升级基线修复版。Hub/Agent 支持经过不可变 Release 和 SHA-256 验证的自升级、版本目录原子切换与本地回滚，同时保留异步命令持久化、TTL 和幂等重试；唯一开放动作仍是无副作用的 `agent.probe`。
+> 当前状态：`V0.2.0` 单文件安装版。Hub/Agent 各自提供一个可执行安装文件，内部完成安全解包、服务注册和健康检查；安装后继续支持不可变 Release 自升级、原子切换与本地回滚。唯一开放动作仍是无副作用的 `agent.probe`。
 
 ## 架构
 
@@ -81,25 +81,32 @@ cargo run -p farhelm-agent -- heartbeat
 
 ## 部署包
 
-在 Linux x86_64 构建两个可安装包。当前二进制运行目标为 Ubuntu 24.04 x86_64（或 glibc 2.39+ 的兼容系统）：
+在 Linux x86_64 构建角色归档和两个单文件安装器。当前二进制运行目标为 Ubuntu 24.04 x86_64（或 glibc 2.39+ 的兼容系统）：
 
 ```bash
 make release
 make test-release
 ```
 
-普通用户无需编译或登录 GitHub，可直接下载公开 Release：
+普通用户无需编译、校验或手动解压。Hub 服务器下载并运行：
 
 ```bash
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.2/farhelm-hub-0.1.2-linux-x86_64.tar.gz
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.2/farhelm-agent-0.1.2-linux-x86_64.tar.gz
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.2/SHA256SUMS
-sha256sum -c SHA256SUMS
+curl -fL https://github.com/Xiiiing/FarHelm/releases/latest/download/farhelm-hub-linux-x86_64 -o farhelm-hub
+chmod +x farhelm-hub
+sudo ./farhelm-hub
 ```
 
-公网服务器使用 Hub 包，训练服务器使用 Agent 包。训练端为纯用户态安装，不需要 root/sudo；两个包都包含卸载器。完整目录、systemd、Caddy、前台运行和卸载步骤见[部署说明](deploy/README.md)。Hub 必须只监听 loopback 并经 HTTPS 反向代理公开。
+训练服务器以普通用户下载并运行，安装器会交互询问 Hub URL、Agent ID 和隐藏的 token：
 
-首次安装 `V0.1.2` 后无需再手工下载后续版本：Hub 使用 `farhelmctl upgrade --check` / `sudo farhelmctl upgrade`，Agent 使用 `farhelm-agent upgrade --check` / `farhelm-agent upgrade`。升级失败会恢复上一版本，配置和数据库不在版本目录内。
+```bash
+curl -fL https://github.com/Xiiiing/FarHelm/releases/latest/download/farhelm-agent-linux-x86_64 -o farhelm-agent
+chmod +x farhelm-agent
+./farhelm-agent
+```
+
+训练端不需要 root/sudo。下载目录中不会产生解压目录，成功后可以删除安装文件。完整受管目录、systemd、Caddy、非交互安装、归档备用入口和卸载步骤见[部署说明](deploy/README.md)。Hub 必须只监听 loopback 并经 HTTPS 反向代理公开。
+
+首次安装 `V0.2.0` 后无需再手工下载后续版本：Hub 使用 `farhelmctl upgrade --check` / `sudo farhelmctl upgrade`，Agent 使用 `farhelm-agent upgrade --check` / `farhelm-agent upgrade`。升级失败会恢复上一版本，配置和数据库不在版本目录内。
 
 ## 开发检查
 

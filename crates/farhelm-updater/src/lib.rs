@@ -2,7 +2,8 @@
 
 use std::{
     fmt,
-    fs::File,
+    fs::{File, OpenOptions},
+    io::Write,
     path::{Component, Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -31,7 +32,8 @@ pub enum Role {
 }
 
 impl Role {
-    const fn package_name(self) -> &'static str {
+    #[must_use]
+    pub const fn package_name(self) -> &'static str {
         match self {
             Self::Hub => "farhelm-hub",
             Self::Agent => "farhelm-agent",
@@ -72,6 +74,40 @@ pub struct VerifiedBundle {
     _temporary: TempDir,
     pub root: PathBuf,
     pub version: Version,
+}
+
+impl VerifiedBundle {
+    /// Validate and stage a release archive embedded in a role-specific bootstrap executable.
+    pub fn from_embedded(role: Role, version: &str, archive: &[u8]) -> Result<Self> {
+        let version = Version::parse(version).context("embedded FarHelm version is invalid")?;
+        ensure!(
+            version.pre.is_empty() && version.build.is_empty(),
+            "embedded FarHelm version must be a formal release"
+        );
+        ensure!(!archive.is_empty(), "embedded release archive is empty");
+        ensure!(
+            u64::try_from(archive.len())? <= role.max_archive_bytes(),
+            "embedded release archive exceeds the role size limit"
+        );
+
+        let temporary =
+            tempfile::tempdir().context("failed to create bootstrap staging directory")?;
+        let archive_path = temporary.path().join("release.tar.gz");
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&archive_path)
+            .context("failed to create embedded release archive")?;
+        output
+            .write_all(archive)
+            .context("failed to stage embedded release archive")?;
+        output
+            .sync_all()
+            .context("failed to sync embedded release archive")?;
+        drop(output);
+
+        stage_bundle(temporary, &archive_path, role, version)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -200,32 +236,22 @@ impl Updater {
         let actual: [u8; 32] = hasher.finalize().into();
         validate_download(candidate, downloaded, actual)?;
 
-        let expected_root = format!("{}-{}-linux-x86_64", role.package_name(), candidate.version);
-        let unpacked = temporary.path().join("unpacked");
-        std::fs::create_dir(&unpacked).context("failed to create archive extraction directory")?;
-        unpack_archive(&archive_path, &unpacked, &expected_root)?;
-        let root = unpacked.join(expected_root);
-        let package_version = std::fs::read_to_string(root.join("VERSION"))
-            .context("release package VERSION is missing")?;
-        ensure!(
-            package_version.trim() == candidate.version.to_string(),
-            "release package VERSION does not match immutable metadata"
-        );
-        ensure!(
-            root.join("install.sh").is_file(),
-            "release package installer is missing"
-        );
-        Ok(VerifiedBundle {
-            _temporary: temporary,
-            root,
-            version: candidate.version.clone(),
-        })
+        stage_bundle(temporary, &archive_path, role, candidate.version.clone())
     }
 
     pub async fn install(
         &self,
         bundle: &VerifiedBundle,
         existing_root: Option<&Path>,
+    ) -> Result<()> {
+        self.install_with_env(bundle, existing_root, &[]).await
+    }
+
+    pub async fn install_with_env(
+        &self,
+        bundle: &VerifiedBundle,
+        existing_root: Option<&Path>,
+        environment: &[(String, String)],
     ) -> Result<()> {
         let mut command = Command::new("bash");
         command
@@ -234,7 +260,8 @@ impl Updater {
             .env("FARHELM_UPGRADE", "1")
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::inherit())
+            .envs(environment.iter().map(|(name, value)| (name, value)));
         if let Some(root) = existing_root {
             command.env("FARHELM_INSTALL_ROOT", root);
         }
@@ -245,6 +272,34 @@ impl Updater {
         ensure!(status.success(), "verified FarHelm installer failed");
         Ok(())
     }
+}
+
+fn stage_bundle(
+    temporary: TempDir,
+    archive_path: &Path,
+    role: Role,
+    version: Version,
+) -> Result<VerifiedBundle> {
+    let expected_root = format!("{}-{version}-linux-x86_64", role.package_name());
+    let unpacked = temporary.path().join("unpacked");
+    std::fs::create_dir(&unpacked).context("failed to create archive extraction directory")?;
+    unpack_archive(archive_path, &unpacked, &expected_root)?;
+    let root = unpacked.join(expected_root);
+    let package_version = std::fs::read_to_string(root.join("VERSION"))
+        .context("release package VERSION is missing")?;
+    ensure!(
+        package_version.trim() == version.to_string(),
+        "release package VERSION does not match immutable metadata"
+    );
+    ensure!(
+        root.join("install.sh").is_file(),
+        "release package installer is missing"
+    );
+    Ok(VerifiedBundle {
+        _temporary: temporary,
+        root,
+        version,
+    })
 }
 
 fn select_candidate(
@@ -420,6 +475,30 @@ fn validate_archive_path(path: &Path, expected_root: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::{Compression, write::GzEncoder};
+
+    fn embedded_archive(root: &str, version: &str) -> Vec<u8> {
+        let encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        let mut archive = tar::Builder::new(encoder);
+        for (path, contents, mode) in [
+            (format!("{root}/VERSION"), format!("{version}\n"), 0o644),
+            (
+                format!("{root}/install.sh"),
+                "#!/usr/bin/env bash\nexit 0\n".to_owned(),
+                0o755,
+            ),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(mode);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, path, contents.as_bytes())
+                .unwrap();
+        }
+        let encoder = archive.into_inner().unwrap();
+        encoder.finish().unwrap()
+    }
 
     fn release(tag: &str, immutable: bool) -> GithubRelease {
         let version = tag.trim_start_matches(['V', 'v']);
@@ -528,5 +607,15 @@ mod tests {
         assert!(validate_download(&candidate, 1023, [0x11; 32]).is_err());
         assert!(validate_download(&candidate, 1024, [0x22; 32]).is_err());
         assert!(validate_download(&candidate, 1024, [0x11; 32]).is_ok());
+    }
+
+    #[test]
+    fn validates_embedded_role_and_version() {
+        let bytes = embedded_archive("farhelm-agent-0.2.0-linux-x86_64", "0.2.0");
+        let bundle = VerifiedBundle::from_embedded(Role::Agent, "0.2.0", &bytes).unwrap();
+        assert_eq!(bundle.version, Version::new(0, 2, 0));
+        assert!(bundle.root.join("install.sh").is_file());
+        assert!(VerifiedBundle::from_embedded(Role::Hub, "0.2.0", &bytes).is_err());
+        assert!(VerifiedBundle::from_embedded(Role::Agent, "0.2.1", &bytes).is_err());
     }
 }

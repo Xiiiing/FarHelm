@@ -93,7 +93,7 @@ export default function App() {
               <div><strong>FarHelm</strong><span>远程训练控制台</span></div>
             </div>
             <Menu mode="inline" selectedKeys={[location.pathname]} items={desktopItems} onClick={({ key }) => go(key)} />
-            <div className="sider-footer"><Typography.Text type="secondary">V0.1.2 · Upgradeable baseline</Typography.Text></div>
+            <div className="sider-footer"><Typography.Text type="secondary">V0.2.0 · Single-file install</Typography.Text></div>
           </Sider>
         )}
 

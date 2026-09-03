@@ -19,6 +19,7 @@ grep -Fq "V$version" README.md
 grep -Fq "V$version" README.en.md
 grep -Fq "V$version" deploy/README.md
 grep -Fq "V$version" deploy/README.en.md
+grep -Fq "name: farhelm-V$version-linux-x86_64" .github/workflows/ci.yml
 
 if [[ ${GITHUB_REF_TYPE:-} == tag ]] && [[ ${GITHUB_REF_NAME:-} != "V$version" ]]; then
   printf 'Formal release tag must exactly match V%s.\n' "$version" >&2

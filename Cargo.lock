@@ -328,7 +328,7 @@ checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
 name = "farhelm-agent"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -345,15 +345,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "farhelm-bootstrap"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "farhelm-core",
+ "farhelm-updater",
+ "rpassword",
+ "tokio",
+]
+
+[[package]]
 name = "farhelm-core"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "farhelm-hub"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -374,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "farhelm-protocol"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -384,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "farhelm-test-support"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "farhelm-protocol",
  "serde_json",
@@ -392,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "farhelm-updater"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "flate2",
@@ -408,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "farhelmctl"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1111,6 +1122,27 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rpassword"
+version = "7.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2da316a15f47e3d053de9cb2c439650bd8fa4aaeb9365f2e5f27f492ff73c196"
+dependencies = [
+ "libc",
+ "rtoolbox",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rtoolbox"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a1efe12a1469752d0e6ff5ebec0b6ef4924cc5c4c71046b0ec730040535819d"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

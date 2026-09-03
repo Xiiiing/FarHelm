@@ -71,11 +71,30 @@ printf 'V%s\n' "$version" >"$agent_stage/RELEASE_TAG"
 
 tar -C "$stage_dir" -czf "$output_dir/$hub_name.tar.gz" "$hub_name"
 tar -C "$stage_dir" -czf "$output_dir/$agent_name.tar.gz" "$agent_name"
+
+FARHELM_BOOTSTRAP_ROLE=hub \
+FARHELM_BOOTSTRAP_BUNDLE="$output_dir/$hub_name.tar.gz" \
+  cargo build --release --locked -p farhelm-bootstrap
+install -m 0755 target/release/farhelm-bootstrap \
+  "$output_dir/farhelm-hub-$platform"
+
+FARHELM_BOOTSTRAP_ROLE=agent \
+FARHELM_BOOTSTRAP_BUNDLE="$output_dir/$agent_name.tar.gz" \
+  cargo build --release --locked -p farhelm-bootstrap
+install -m 0755 target/release/farhelm-bootstrap \
+  "$output_dir/farhelm-agent-$platform"
+
 (
   cd "$output_dir"
-  sha256sum "$hub_name.tar.gz" "$agent_name.tar.gz" >SHA256SUMS
+  sha256sum \
+    "$hub_name.tar.gz" \
+    "$agent_name.tar.gz" \
+    "farhelm-hub-$platform" \
+    "farhelm-agent-$platform" >SHA256SUMS
 )
 
 printf 'Release bundles built in %s\n' "$output_dir"
 printf '  %s.tar.gz\n' "$hub_name"
 printf '  %s.tar.gz\n' "$agent_name"
+printf '  farhelm-hub-%s\n' "$platform"
+printf '  farhelm-agent-%s\n' "$platform"
