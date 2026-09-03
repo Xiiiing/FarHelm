@@ -15,12 +15,14 @@ export FARHELM_AGENT_TOKEN=smoke-agent-token-with-at-least-32-characters
 export FARHELM_CONSOLE_DIR="$smoke_dir"
 export FARHELM_HUB_URL=http://127.0.0.1:8787
 
-cargo run -q -p farhelm-hub >"$hub_log" 2>&1 &
+cargo build -q -p farhelm-hub -p farhelmctl -p farhelm-agent
+
+target/debug/farhelm-hub >"$hub_log" 2>&1 &
 hub_pid=$!
 
 healthy=false
 for _ in $(seq 1 40); do
-  if cargo run -q -p farhelmctl -- health >/dev/null 2>&1; then
+  if target/debug/farhelmctl health >/dev/null 2>&1; then
     healthy=true
     break
   fi
@@ -33,8 +35,8 @@ if [[ "$healthy" != true ]]; then
   exit 1
 fi
 
-cargo run -q -p farhelmctl -- health
-cargo run -q -p farhelm-agent -- heartbeat \
+target/debug/farhelmctl health
+target/debug/farhelm-agent heartbeat \
   --agent-id smoke-gpu \
   --hostname smoke-trainer
 
@@ -55,5 +57,5 @@ curl --fail --silent --show-error \
   --user "$FARHELM_ADMIN_USER:$FARHELM_ADMIN_PASSWORD" \
   "$FARHELM_HUB_URL/agents" | grep -q 'FarHelm smoke'
 
-cargo run -q -p farhelm-agent -- worker-smoke
+target/debug/farhelm-agent worker-smoke
 printf 'Deployment smoke passed.\n'
