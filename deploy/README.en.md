@@ -1,4 +1,4 @@
-# FarHelm minimal deployment
+# FarHelm installation, upgrade, and rollback
 
 [简体中文](README.md) · [English](README.en.md)
 
@@ -11,9 +11,9 @@ Downloading and extracting a bundle creates only one same-named directory and do
 No compilation or GitHub login is required. Download the Hub bundle on the public server, the Agent bundle on the training server, and the checksum file on both:
 
 ```bash
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.2.0/farhelm-hub-0.2.0-linux-x86_64.tar.gz
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.2.0/farhelm-agent-0.2.0-linux-x86_64.tar.gz
-curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/v0.2.0/SHA256SUMS
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.0/farhelm-hub-0.1.0-linux-x86_64.tar.gz
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.0/farhelm-agent-0.1.0-linux-x86_64.tar.gz
+curl -fLO https://github.com/Xiiiing/FarHelm/releases/download/V0.1.0/SHA256SUMS
 sha256sum -c SHA256SUMS
 ```
 
@@ -27,17 +27,17 @@ grep 'farhelm-agent-' SHA256SUMS | sha256sum -c -
 
 ## 1. Public server
 
-Upload and extract `farhelm-hub-0.2.0-linux-x86_64.tar.gz`:
+Upload and extract `farhelm-hub-0.1.0-linux-x86_64.tar.gz`:
 
 ```bash
-tar -xzf farhelm-hub-0.2.0-linux-x86_64.tar.gz
-cd farhelm-hub-0.2.0-linux-x86_64
+tar -xzf farhelm-hub-0.1.0-linux-x86_64.tar.gz
+cd farhelm-hub-0.1.0-linux-x86_64
 sudo ./install.sh
 ```
 
 The installer generates an admin password and an Agent token, displays them once, and stores them in `/etc/farhelm/hub.env`. The Hub installer manages only:
 
-- `/opt/farhelm-hub/` for binaries, Console, and the uninstaller.
+- `/opt/farhelm-hub/` for `releases/<version>`, atomic `current/previous` links, Console, and management scripts.
 - `/etc/farhelm/hub.env` and `/etc/farhelm/Caddyfile.example` for configuration and the proxy example.
 - `/etc/systemd/system/farhelm-hub.service` for the system service.
 - `/usr/local/bin/farhelmctl` for the health-check CLI.
@@ -54,6 +54,16 @@ curl https://your-domain.example/api/v1/health
 
 Expose only ports 80/443, never 8787. Open the HTTPS URL and sign in with the generated admin credentials. The uploaded archive and extracted directory can be deleted after installation.
 
+Later releases need neither uninstall nor manual download. Check first, then upgrade; a failed health check restores previous automatically:
+
+```bash
+farhelmctl upgrade --check
+sudo farhelmctl upgrade
+sudo farhelmctl rollback
+```
+
+Crossing the first version number is denied by default. Use `sudo farhelmctl upgrade --allow-major` only after you explicitly decide to change it.
+
 Completely uninstall Hub with:
 
 ```bash
@@ -67,8 +77,8 @@ The uninstaller stops the service and removes every FarHelm-specific managed pat
 Do not use `sudo`. Use the Agent token printed by the Hub installer:
 
 ```bash
-tar -xzf farhelm-agent-0.2.0-linux-x86_64.tar.gz
-cd farhelm-agent-0.2.0-linux-x86_64
+tar -xzf farhelm-agent-0.1.0-linux-x86_64.tar.gz
+cd farhelm-agent-0.1.0-linux-x86_64
 
 FARHELM_HUB_URL="https://your-domain.example" \
 FARHELM_AGENT_TOKEN="agent-token-from-hub" \
@@ -78,7 +88,7 @@ FARHELM_AGENT_ID="gpu-a" \
 
 By default, only two FarHelm-specific locations are created:
 
-- `${XDG_DATA_HOME:-~/.local/share}/farhelm-agent/` for the binary, Worker, configuration, command-state database, and uninstaller; configuration mode is `0600`.
+- `${XDG_DATA_HOME:-~/.local/share}/farhelm-agent/` for persistent configuration/state, `releases/<version>`, atomic `current/previous` links, and the uninstaller; configuration mode is `0600`.
 - `${XDG_CONFIG_HOME:-~/.config}/systemd/user/farhelm-agent.service` for the current user's systemd unit.
 
 No system user/group is created, and nothing is written under `/opt`, `/etc`, or `/usr/local`. You may delete the downloaded archive and extracted directory after installation.
@@ -92,7 +102,7 @@ journalctl --user -u farhelm-agent -n 50 --no-pager
 
 Within one heartbeat interval, Console's Agents page shows the real hostname, Agent ID, version, last heartbeat, and presence.
 
-The `0.2.0` command channel exposes only `agent.probe` to verify persistence, TTL, and idempotent recovery. It neither reads projects nor runs shell commands. Create a probe with admin authentication, then query the returned `status_url`:
+The `V0.1.0` command channel exposes only `agent.probe` to verify persistence, TTL, and idempotent recovery. It neither reads projects nor runs shell commands. Create a probe with admin authentication, then query the returned `status_url`:
 
 ```bash
 curl --user admin \
@@ -116,7 +126,7 @@ FARHELM_AGENT_TOKEN="agent-token-from-hub" \
 FARHELM_AGENT_ID="gpu-a" \
 ./install.sh
 
-~/.local/share/farhelm-agent/run.sh
+~/.local/share/farhelm-agent/current/run.sh
 ```
 
 You can also skip installation entirely and run directly from the extracted directory:
@@ -134,8 +144,23 @@ Deleting the extracted directory then leaves no FarHelm files. To completely rem
 ${XDG_DATA_HOME:-$HOME/.local/share}/farhelm-agent/uninstall.sh
 ```
 
+Use the installed Agent for later upgrades and rollback, never `sudo`:
+
+```bash
+~/.local/share/farhelm-agent/current/bin/farhelm-agent upgrade --check
+~/.local/share/farhelm-agent/current/bin/farhelm-agent upgrade
+~/.local/share/farhelm-agent/current/bin/farhelm-agent rollback
+```
+
+Replace the root path if you used a custom `XDG_DATA_HOME`. Upgrade accepts only immutable uppercase `V*` Releases from the fixed official repository and verifies the GitHub asset length and SHA-256; configuration and databases remain outside release directories.
+
+## Establishing the new baseline from legacy lowercase releases
+
+Legacy `v0.1.0/v0.2.0` installs use a different layout and are outside the new update series. As planned, remove Hub and Agent with their legacy uninstallers, then install uppercase `V0.1.0`. This is the final uninstall required; use upgrade/rollback from `V0.1.0` onward.
+
 ## Security notes
 
 - Never expose Hub directly on a public bind address; the application rejects non-loopback binds.
 - Never paste `agent.env` or `hub.env` into chat, Git, or public logs.
 - Beyond presence, this version executes only a side-effect-free probe. It cannot control training and does not connect to real Codex.
+- Formal versions use uppercase `VMAJOR.MINOR.PATCH` tags only. The user alone decides the first number; features and bug fixes increment the second and third numbers respectively.

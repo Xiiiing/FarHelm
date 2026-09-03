@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-install_root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+release_root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+install_root=$(cd "$release_root/../.." && pwd)
 config_file="$install_root/config/agent.env"
 if [[ ! -r "$config_file" ]]; then
   printf 'Agent configuration is missing or unreadable: %s\n' "$config_file" >&2
@@ -17,4 +18,4 @@ while IFS='=' read -r key value; do
   export "$key=$value"
 done <"$config_file"
 
-exec "$install_root/bin/farhelm-agent" run "$@"
+exec "$release_root/bin/farhelm-agent" run "$@"

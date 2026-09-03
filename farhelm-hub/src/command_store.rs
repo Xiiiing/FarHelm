@@ -439,7 +439,7 @@ mod tests {
             command_id: command_id.to_owned(),
             state,
             result: (state == CommandState::Completed).then(|| ProbeResult {
-                agent_version: "0.2.0".to_owned(),
+                agent_version: "0.1.0".to_owned(),
                 hostname: "trainer-a".to_owned(),
             }),
             detail: None,

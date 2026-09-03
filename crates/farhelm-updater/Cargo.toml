@@ -1,5 +1,5 @@
 [package]
-name = "farhelmctl"
+name = "farhelm-updater"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,9 +8,14 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-clap.workspace = true
-farhelm-core.workspace = true
-farhelm-protocol.workspace = true
-farhelm-updater.workspace = true
+flate2.workspace = true
 reqwest.workspace = true
+semver.workspace = true
+serde.workspace = true
+sha2.workspace = true
+tar.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

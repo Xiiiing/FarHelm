@@ -4,13 +4,14 @@ members = [
   "crates/farhelm-core",
   "crates/farhelm-protocol",
   "crates/farhelm-test-support",
+  "crates/farhelm-updater",
   "farhelm-hub",
   "farhelm-agent",
   "farhelmctl",
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
@@ -25,12 +26,18 @@ constant_time_eq = "0.4"
 farhelm-core = { path = "crates/farhelm-core" }
 farhelm-protocol = { path = "crates/farhelm-protocol" }
 farhelm-test-support = { path = "crates/farhelm-test-support" }
+farhelm-updater = { path = "crates/farhelm-updater" }
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+semver = "1.0.28"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.11.0"
+tar = { version = "0.4.46", default-features = false }
+tempfile = "3.27.0"
 thiserror = "2.0"
-tokio = { version = "1.47", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.47", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["fs"] }
 tracing = "0.1"

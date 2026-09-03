@@ -12,6 +12,7 @@ use farhelm_protocol::{
     CommandState, CommandStatusResponse, FARHELM_PROTOCOL, ProbeResult, WORKER_PROTOCOL,
     WorkerHelloResult, WorkerRequest, WorkerResponse, read_frame, write_frame,
 };
+use farhelm_updater::{Role, Updater};
 use reqwest::{Client, Url};
 use tokio::{process::Command, time::timeout};
 use tracing::{info, warn};
@@ -75,6 +76,20 @@ enum CommandKind {
         #[arg(long, default_value = "farhelm-worker-codex")]
         worker_root: PathBuf,
     },
+    /// Check for or install an immutable official Agent release.
+    Upgrade {
+        /// Only report whether an update is available.
+        #[arg(long)]
+        check: bool,
+        /// Install one exact formal version, such as V0.2.0.
+        #[arg(long)]
+        version: Option<String>,
+        /// Permit a user-approved first-number version change.
+        #[arg(long)]
+        allow_major: bool,
+    },
+    /// Atomically switch the Agent to its locally installed previous version.
+    Rollback,
 }
 
 #[derive(Args)]
@@ -115,7 +130,85 @@ async fn main() -> Result<()> {
             python,
             worker_root,
         } => worker_smoke(&python, &worker_root).await,
+        CommandKind::Upgrade {
+            check,
+            version,
+            allow_major,
+        } => upgrade(check, version.as_deref(), allow_major).await,
+        CommandKind::Rollback => rollback().await,
     }
+}
+
+async fn upgrade(check_only: bool, requested: Option<&str>, allow_major: bool) -> Result<()> {
+    let updater = Updater::new()?;
+    let Some(candidate) = updater
+        .check(Role::Agent, PRODUCT_VERSION, requested, allow_major)
+        .await?
+    else {
+        println!("FarHelm Agent {PRODUCT_VERSION} is up to date.");
+        return Ok(());
+    };
+    if check_only {
+        println!(
+            "FarHelm Agent {} is available (current {}).",
+            candidate.version, PRODUCT_VERSION
+        );
+        return Ok(());
+    }
+    ensure!(!is_root(), "Agent upgrade must be run without sudo/root");
+    let install_root = installed_agent_root()?;
+    println!(
+        "Downloading verified {} for immutable release {}...",
+        candidate.archive_name(),
+        candidate.tag
+    );
+    let bundle = updater.download(Role::Agent, &candidate).await?;
+    updater.install(&bundle, Some(&install_root)).await?;
+    println!("FarHelm Agent upgraded to {}.", candidate.version);
+    Ok(())
+}
+
+async fn rollback() -> Result<()> {
+    ensure!(!is_root(), "Agent rollback must be run without sudo/root");
+    let script = installed_agent_root()?.join("rollback.sh");
+    let status = Command::new("bash")
+        .arg(&script)
+        .status()
+        .await
+        .with_context(|| format!("failed to start {}", script.display()))?;
+    ensure!(status.success(), "Agent rollback failed");
+    Ok(())
+}
+
+fn installed_agent_root() -> Result<PathBuf> {
+    let executable = std::env::current_exe()
+        .context("failed to locate the running Agent binary")?
+        .canonicalize()
+        .context("failed to resolve the running Agent binary")?;
+    let release_dir = executable
+        .parent()
+        .and_then(Path::parent)
+        .context("Agent is not running from an installed release")?;
+    let releases_dir = release_dir
+        .parent()
+        .context("Agent release directory is invalid")?;
+    ensure!(
+        releases_dir
+            .file_name()
+            .is_some_and(|name| name == "releases"),
+        "Agent is not running from the versioned installation layout"
+    );
+    releases_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .context("Agent installation root is invalid")
+}
+
+fn is_root() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .is_ok_and(|output| output.status.success() && output.stdout == b"0\n")
 }
 
 async fn run(

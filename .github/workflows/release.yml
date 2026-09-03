@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "V*"
 
 permissions:
   contents: write
@@ -29,8 +29,7 @@ jobs:
           python-version: "3.12"
       - name: Verify tag matches package version
         run: |
-          package_version=$(cargo pkgid -p farhelm-core | sed 's/.*#//')
-          test "$GITHUB_REF_NAME" = "v$package_version"
+          ./scripts/check-version-policy.sh
       - run: ./scripts/build-release.sh
       - run: ./tests/deployment-package.sh
       - name: Publish GitHub Release
@@ -42,4 +41,6 @@ jobs:
             dist/release/SHA256SUMS \
             --verify-tag \
             --title "FarHelm $GITHUB_REF_NAME" \
+            --draft \
             --generate-notes
+          gh release edit "$GITHUB_REF_NAME" --draft=false

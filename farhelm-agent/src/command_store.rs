@@ -277,7 +277,7 @@ mod tests {
             .mark_reported(&accepted.command_id, CommandState::Accepted, 102)
             .unwrap();
         let result = ProbeResult {
-            agent_version: "0.2.0".to_owned(),
+            agent_version: "0.1.0".to_owned(),
             hostname: "trainer-a".to_owned(),
         };
         store

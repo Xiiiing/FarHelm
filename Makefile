@@ -1,6 +1,7 @@
 .PHONY: check test test-ui run-hub run-console smoke smoke-worker privacy release test-release
 
 check:
+	./scripts/check-version-policy.sh
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	corepack pnpm@10.17.1 --dir farhelm-console lint

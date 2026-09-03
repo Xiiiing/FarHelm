@@ -6,8 +6,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=__FARHELM_CONFIG_FILE__
-WorkingDirectory=__FARHELM_INSTALL_ROOT__
-ExecStart=__FARHELM_INSTALL_ROOT__/bin/farhelm-agent run
+WorkingDirectory=__FARHELM_INSTALL_ROOT__/current
+ExecStart=__FARHELM_INSTALL_ROOT__/current/run.sh
 Restart=always
 RestartSec=5s
 NoNewPrivileges=true
