@@ -23,6 +23,9 @@ importers:
       react-router-dom:
         specifier: 7.18.3
         version: 7.18.3(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
+      workbox-precaching:
+        specifier: 7.4.1
+        version: 7.4.1
       workbox-window:
         specifier: 7.4.1
         version: 7.4.1

@@ -14,6 +14,12 @@ button, a { -webkit-tap-highlight-color: transparent; }
 :focus-visible { outline: 2px solid #22C7A9; outline-offset: 2px; }
 
 .app-layout { min-height: 100vh; }
+.session-loading { min-height: 100vh; display: grid; place-content: center; justify-items: center; gap: 12px; background: var(--farhelm-canvas, #0B0F14); }
+.login-page { min-height: 100vh; padding: 24px; display: grid; place-items: center; background: var(--farhelm-canvas, #0B0F14); }
+.login-card { width: min(440px, 100%); }
+.login-brand { display: flex; align-items: center; gap: 16px; margin-bottom: 28px; }
+.login-brand h1 { margin: 0 !important; font-size: 28px; }
+.login-card .ant-alert { margin-bottom: 20px; }
 
 .app-sider {
   position: fixed !important;
@@ -98,11 +104,19 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .empty-icon { color: #9AA8B6; font-size: 48px; }
 .agent-list-card { margin-top: 20px; min-height: 128px; }
 .agent-row { padding: 20px 24px !important; align-items: center !important; }
+.agent-row.highlighted { background: color-mix(in srgb, #22C7A9 12%, transparent); }
 .agent-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .agent-facts { margin: 0; display: flex; gap: 32px; }
 .agent-facts div { display: grid; gap: 4px; }
 .agent-facts dt { color: #9AA8B6; font-size: 12px; }
 .agent-facts dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+.experiment-detail { max-width: 420px; display: grid; gap: 6px; color: #9AA8B6; text-align: right; }
+.experiment-detail time { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.codex-grid { margin-top: 20px; display: grid; grid-template-columns: minmax(260px, .8fr) minmax(420px, 1.4fr); gap: 16px; }
+.session-list { min-height: 480px; }
+.session-row { min-height: 72px; padding: 16px 20px !important; cursor: pointer; }
+.session-row.selected { background: color-mix(in srgb, #22C7A9 12%, transparent); }
+.stream-panel { min-height: 220px; margin: 20px 0; padding: 16px; border: 1px solid var(--farhelm-border); border-radius: 8px; color: #9AA8B6; white-space: pre-wrap; }
 
 .mobile-nav {
   position: fixed;
@@ -147,6 +161,9 @@ button, a { -webkit-tap-highlight-color: transparent; }
   .empty-card { min-height: 300px; }
   .agent-row { align-items: flex-start !important; flex-direction: column; gap: 16px; padding: 20px !important; }
   .agent-facts { width: 100%; display: grid; grid-template-columns: 1fr; gap: 12px; }
+  .experiment-detail { text-align: left; }
+  .codex-grid { grid-template-columns: 1fr; }
+  .session-list { min-height: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {

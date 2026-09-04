@@ -1,46 +1,81 @@
 use std::{
     collections::BTreeMap,
+    convert::Infallible,
     path::{Component, Path as FsPath, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Result, ensure};
+use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Path, Request, State},
+    extract::{DefaultBodyLimit, Extension, Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response, Sse,
+        sse::{Event, KeepAlive},
+    },
     routing::{any, get, post},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use constant_time_eq::constant_time_eq;
 use farhelm_core::PRODUCT_VERSION;
 use farhelm_protocol::{
-    AgentHeartbeat, AgentHeartbeatAck, AgentListResponse, AgentSummary, CommandAccepted,
-    CommandClaimRequest, CommandClaimResponse, CommandReportRequest, CreateProbeCommand,
-    FARHELM_PROTOCOL, HealthResponse,
+    AgentEventAck, AgentEventBatch, AgentHeartbeat, AgentHeartbeatAck, AgentListResponse,
+    AgentSummary, CommandAccepted, CommandAction, CommandClaimRequest, CommandClaimResponse,
+    CommandReportRequest, CreateCodexSessionRequest, CreateProbeCommand, FARHELM_PROTOCOL,
+    HealthResponse, PromptDelivery, SendCodexMessageRequest,
 };
-use serde::Serialize;
-use tokio::sync::RwLock;
+use rand::RngCore;
+use reqwest::{Client, redirect::Policy};
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use tokio::sync::{Mutex as AsyncMutex, RwLock, broadcast};
+use web_push_native::{
+    Auth, WebPushBuilder,
+    p256::{
+        PublicKey, SecretKey,
+        ecdsa::{Signature, SigningKey, signature::Signer},
+        elliptic_curve::sec1::ToEncodedPoint,
+    },
+};
 
 include!(concat!(env!("OUT_DIR"), "/embedded_console.rs"));
 
 pub const ONLINE_WINDOW_SECS: u64 = 45;
 
 mod command_store;
+mod event_store;
+mod typed_command_store;
 
 use command_store::{CommandStore, CreateCommandError, ReportCommandError};
+use event_store::{EventStore, PushDelivery, StoredEvent};
+use typed_command_store::TypedCommandStore;
 
 #[derive(Clone)]
 pub struct HubConfig {
     pub admin_user: String,
     pub admin_password: String,
+    pub admin_totp_secret: Option<String>,
+    pub recovery_code_hashes: Vec<String>,
     pub agent_token: String,
+    pub agent_tokens: BTreeMap<String, String>,
+    pub push: Option<PushConfig>,
     pub console_dir: Option<PathBuf>,
     pub database_path: PathBuf,
+}
+
+#[derive(Clone)]
+pub struct PushConfig {
+    pub private_key: String,
+    pub public_key: String,
+    pub contact: String,
 }
 
 #[derive(Clone)]
@@ -48,6 +83,26 @@ pub struct AppState {
     config: Arc<HubConfig>,
     agents: Arc<RwLock<BTreeMap<String, StoredAgent>>>,
     commands: Arc<CommandStore>,
+    events: Arc<EventStore>,
+    event_bus: broadcast::Sender<StoredEvent>,
+    typed_commands: Arc<TypedCommandStore>,
+    sessions: Arc<RwLock<BTreeMap<String, BrowserSession>>>,
+    login_failures: Arc<AsyncMutex<Vec<u64>>>,
+    recovery_codes: Arc<AsyncMutex<Vec<String>>>,
+    push_client: Client,
+}
+
+#[derive(Clone)]
+struct BrowserSession {
+    user: String,
+    csrf_token: String,
+    expires_at_unix: u64,
+}
+
+#[derive(Clone)]
+enum AgentIdentity {
+    Dedicated(String),
+    Legacy,
 }
 
 #[derive(Clone)]
@@ -65,11 +120,42 @@ struct ApiError {
 impl AppState {
     pub fn new(config: HubConfig) -> Result<Self> {
         let commands = CommandStore::open(&config.database_path)?;
+        let events = EventStore::open(&config.database_path)?;
+        let typed_commands = TypedCommandStore::open(&config.database_path)?;
+        let (event_bus, _) = broadcast::channel(256);
+        let recovery_codes = events.sync_recovery_codes(&config.recovery_code_hashes)?;
+        let push_client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20))
+            .redirect(Policy::none())
+            .user_agent(format!("farhelm-hub/{PRODUCT_VERSION}"))
+            .build()?;
         Ok(Self {
             config: Arc::new(config),
             agents: Arc::new(RwLock::new(BTreeMap::new())),
             commands: Arc::new(commands),
+            events: Arc::new(events),
+            event_bus,
+            typed_commands: Arc::new(typed_commands),
+            sessions: Arc::new(RwLock::new(BTreeMap::new())),
+            login_failures: Arc::new(AsyncMutex::new(Vec::new())),
+            recovery_codes: Arc::new(AsyncMutex::new(recovery_codes)),
+            push_client,
         })
+    }
+
+    pub fn spawn_background_tasks(&self) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(10));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                if let Err(error) = deliver_pending_pushes(&state).await {
+                    tracing::warn!(%error, "Web Push delivery cycle failed; retrying");
+                }
+            }
+        });
     }
 }
 
@@ -81,13 +167,50 @@ impl HubConfig {
             "admin.user cannot contain ':'"
         );
         ensure!(
-            self.admin_password.len() >= 12,
-            "admin.password must contain at least 12 characters"
+            self.admin_password.starts_with("$argon2") || self.admin_password.len() >= 12,
+            "admin password hash is invalid"
         );
+        if let Some(secret) = &self.admin_totp_secret {
+            ensure!(
+                totp_rs::Secret::Encoded(secret.clone()).to_bytes().is_ok(),
+                "admin.totp_secret is invalid"
+            );
+            ensure!(
+                !self.recovery_code_hashes.is_empty(),
+                "admin recovery codes are missing"
+            );
+        }
         ensure!(
-            self.agent_token.len() >= 32,
-            "agents.token must contain at least 32 characters"
+            self.agent_token.len() >= 32 || !self.agent_tokens.is_empty(),
+            "at least one Agent token is required"
         );
+        for (agent_id, token) in &self.agent_tokens {
+            ensure!(
+                valid_agent_id(agent_id) && token.len() >= 32,
+                "dedicated Agent token is invalid"
+            );
+        }
+        if let Some(push) = &self.push {
+            let private = URL_SAFE_NO_PAD
+                .decode(&push.private_key)
+                .map_err(|error| anyhow::anyhow!("push.private_key is invalid: {error}"))?;
+            ensure!(private.len() == 32, "push.private_key has invalid length");
+            let secret = SecretKey::from_slice(&private)
+                .map_err(|error| anyhow::anyhow!("push.private_key is invalid: {error}"))?;
+            let public = URL_SAFE_NO_PAD
+                .decode(&push.public_key)
+                .map_err(|error| anyhow::anyhow!("push.public_key is invalid: {error}"))?;
+            PublicKey::from_sec1_bytes(&public)
+                .map_err(|_| anyhow::anyhow!("push.public_key is invalid"))?;
+            ensure!(
+                secret.public_key().to_encoded_point(false).as_bytes() == public,
+                "push public and private keys do not match"
+            );
+            ensure!(
+                push.contact.starts_with("mailto:") || push.contact.starts_with("https://"),
+                "push.contact must use mailto: or HTTPS"
+            );
+        }
         if let Some(console_dir) = &self.console_dir {
             ensure!(
                 console_dir.join("index.html").is_file(),
@@ -110,17 +233,225 @@ impl HubConfig {
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/auth/login", post(auth_login))
+        .route("/api/v1/auth/logout", post(auth_logout))
+        .route("/api/v1/auth/session", get(auth_session))
         .route("/api/v1/agents", get(list_agents))
         .route("/api/v1/agents/heartbeat", post(agent_heartbeat))
         .route("/api/v1/agents/{agent_id}/probe", post(create_probe))
         .route("/api/v1/commands/{command_id}", get(command_status))
         .route("/api/v1/agent/commands/claim", post(claim_command))
         .route("/api/v1/agent/commands/report", post(report_command))
+        .route("/api/v1/agent/events", post(agent_events))
+        .route("/api/v1/experiments", get(list_experiments))
+        .route(
+            "/api/v1/codex/sessions",
+            get(list_codex_sessions).post(create_codex_session),
+        )
+        .route(
+            "/api/v1/codex/sessions/{session_id}",
+            get(get_codex_session),
+        )
+        .route(
+            "/api/v1/codex/sessions/{session_id}/messages",
+            post(send_codex_message),
+        )
+        .route(
+            "/api/v1/codex/sessions/{session_id}/interrupt",
+            post(interrupt_codex_session),
+        )
+        .route("/api/v1/events/stream", get(event_stream))
+        .route(
+            "/api/v1/push/subscriptions",
+            post(save_push_subscription).delete(delete_push_subscription),
+        )
+        .route("/api/v1/push/public-key", get(push_public_key))
         .route("/api/{*path}", any(api_not_found))
         .fallback(static_content)
-        .layer(DefaultBodyLimit::max(16 * 1024))
+        .layer(DefaultBodyLimit::max(512 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), authorize))
         .with_state(state)
+}
+
+#[derive(Serialize)]
+struct PushPublicKeyResponse {
+    public_key: String,
+}
+
+async fn push_public_key(State(state): State<AppState>) -> Response {
+    match &state.config.push {
+        Some(push) => Json(PushPublicKeyResponse {
+            public_key: push.public_key.clone(),
+        })
+        .into_response(),
+        None => api_error(StatusCode::SERVICE_UNAVAILABLE, "push_not_configured"),
+    }
+}
+
+async fn deliver_pending_pushes(state: &AppState) -> Result<()> {
+    let Some(push) = &state.config.push else {
+        return Ok(());
+    };
+    let private = URL_SAFE_NO_PAD.decode(&push.private_key)?;
+    let key_pair = SigningKey::from_slice(&private)
+        .map_err(|error| anyhow::anyhow!("invalid configured VAPID key: {error}"))?;
+    for delivery in state.events.pending_push_deliveries(unix_time(), 32)? {
+        let Some(payload) = push_payload(&delivery) else {
+            state.events.mark_push_sent(&delivery)?;
+            continue;
+        };
+        let result = send_push(state, push, &key_pair, &delivery, payload).await;
+        match result {
+            Ok(()) => state.events.mark_push_sent(&delivery)?,
+            Err((permanent, detail)) => {
+                state
+                    .events
+                    .mark_push_failed(&delivery, permanent, &detail, unix_time())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn send_push(
+    state: &AppState,
+    push: &PushConfig,
+    key_pair: &SigningKey,
+    delivery: &PushDelivery,
+    payload: serde_json::Value,
+) -> std::result::Result<(), (bool, String)> {
+    let public = URL_SAFE_NO_PAD
+        .decode(&delivery.p256dh)
+        .map_err(|_| (true, "invalid subscription public key".to_owned()))?;
+    let auth = URL_SAFE_NO_PAD
+        .decode(&delivery.auth)
+        .map_err(|_| (true, "invalid subscription auth key".to_owned()))?;
+    if auth.len() != 16 {
+        return Err((true, "invalid subscription auth key length".to_owned()));
+    }
+    let request = WebPushBuilder::new(
+        delivery
+            .endpoint
+            .parse()
+            .map_err(|_| (true, "invalid subscription endpoint".to_owned()))?,
+        PublicKey::from_sec1_bytes(&public)
+            .map_err(|_| (true, "invalid subscription public key".to_owned()))?,
+        Auth::clone_from_slice(&auth),
+    )
+    .with_valid_duration(Duration::from_secs(300))
+    .build(
+        serde_json::to_vec(&payload)
+            .map_err(|error| (false, format!("failed to encode Push payload: {error}")))?,
+    )
+    .map_err(|error| (true, format!("failed to encrypt Push payload: {error}")))?;
+    let (parts, body) = request.into_parts();
+    let endpoint = reqwest::Url::parse(&parts.uri.to_string())
+        .map_err(|_| (true, "invalid subscription endpoint".to_owned()))?;
+    let authorization =
+        vapid_authorization(&endpoint, push, key_pair).map_err(|detail| (true, detail))?;
+    let mut outgoing = state
+        .push_client
+        .post(endpoint)
+        .header(header::AUTHORIZATION, authorization)
+        .body(body);
+    for (name, value) in &parts.headers {
+        outgoing = outgoing.header(name, value);
+    }
+    let response = outgoing
+        .send()
+        .await
+        .map_err(|error| (false, format!("Push transport failed: {error}")))?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let code = response.status().as_u16();
+    Err((
+        matches!(code, 404 | 410),
+        format!("Push service returned HTTP {code}"),
+    ))
+}
+
+fn vapid_authorization(
+    endpoint: &reqwest::Url,
+    push: &PushConfig,
+    key_pair: &SigningKey,
+) -> std::result::Result<String, String> {
+    if endpoint.scheme() != "https" || endpoint.host_str().is_none() {
+        return Err("Push endpoint must use HTTPS".to_owned());
+    }
+    let header_json = serde_json::json!({"typ": "JWT", "alg": "ES256"});
+    let claims_json = serde_json::json!({
+        "aud": endpoint.origin().ascii_serialization(),
+        "exp": unix_time().saturating_add(300),
+        "sub": push.contact,
+    });
+    let header = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&header_json)
+            .map_err(|error| format!("failed to encode VAPID header: {error}"))?,
+    );
+    let claims = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&claims_json)
+            .map_err(|error| format!("failed to encode VAPID claims: {error}"))?,
+    );
+    let signing_input = format!("{header}.{claims}");
+    let signature: Signature = key_pair.sign(signing_input.as_bytes());
+    let token = format!(
+        "{signing_input}.{}",
+        URL_SAFE_NO_PAD.encode(signature.to_bytes())
+    );
+    Ok(format!("vapid t={token}, k={}", push.public_key))
+}
+
+fn push_payload(delivery: &PushDelivery) -> Option<serde_json::Value> {
+    let (summary, url) = match delivery.event_type.as_str() {
+        "experiment.updated" => {
+            let state = delivery.payload.get("state")?.as_str()?;
+            let name = delivery
+                .payload
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("实验");
+            let watch_id = delivery.payload.get("watch_id")?.as_str()?;
+            let label = match state {
+                "succeeded" => "已完成",
+                "failed" => "失败",
+                "unknown" => "结果未知",
+                _ => return None,
+            };
+            (
+                format!("{name}{label}"),
+                format!("/experiments?watch={}", urlencoding::encode(watch_id)),
+            )
+        }
+        "codex.turn.completed" | "codex.turn.failed" | "codex.turn.orphaned" => {
+            let session_id = delivery
+                .payload
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    delivery
+                        .payload
+                        .get("data")
+                        .and_then(|data| data.get("session_id"))
+                        .and_then(serde_json::Value::as_str)
+                })?;
+            let summary = match delivery.event_type.as_str() {
+                "codex.turn.completed" => "Codex 回复已完成",
+                "codex.turn.failed" => "Codex 执行失败",
+                _ => "Codex turn 已中断",
+            };
+            (
+                summary.to_owned(),
+                format!("/codex?session={}", urlencoding::encode(session_id)),
+            )
+        }
+        _ => return None,
+    };
+    Some(serde_json::json!({
+        "summary":summary,
+        "event_id":delivery.event_id,
+        "url":url
+    }))
 }
 
 #[must_use]
@@ -210,27 +541,63 @@ fn content_type(path: &str) -> &'static str {
     }
 }
 
-async fn authorize(State(state): State<AppState>, request: Request, next: Next) -> Response {
+async fn authorize(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
     let path = request.uri().path();
-    if path == "/api/v1/health" {
+    if path == "/api/v1/health" || path == "/api/v1/auth/login" || !path.starts_with("/api/") {
         return next.run(request).await;
     }
 
-    if path == "/api/v1/agents/heartbeat" || path.starts_with("/api/v1/agent/commands/") {
-        if bearer_matches(request.headers(), &state.config.agent_token) {
+    if path == "/api/v1/agents/heartbeat"
+        || path == "/api/v1/agent/events"
+        || path.starts_with("/api/v1/agent/commands/")
+    {
+        if let Some((agent_id, _)) = state
+            .config
+            .agent_tokens
+            .iter()
+            .find(|(_, token)| bearer_matches(request.headers(), token))
+        {
+            request
+                .extensions_mut()
+                .insert(AgentIdentity::Dedicated(agent_id.clone()));
+            return next.run(request).await;
+        }
+        if !state.config.agent_token.is_empty()
+            && bearer_matches(request.headers(), &state.config.agent_token)
+        {
+            request.extensions_mut().insert(AgentIdentity::Legacy);
             return next.run(request).await;
         }
         return unauthorized(false);
     }
 
-    if basic_matches(
-        request.headers(),
-        &state.config.admin_user,
-        &state.config.admin_password,
-    ) {
+    if let Some(session) = browser_session(request.headers(), &state).await {
+        if matches!(
+            *request.method(),
+            axum::http::Method::POST
+                | axum::http::Method::PUT
+                | axum::http::Method::PATCH
+                | axum::http::Method::DELETE
+        ) && request
+            .headers()
+            .get("x-csrf-token")
+            .and_then(|value| value.to_str().ok())
+            .is_none_or(|value| !secure_eq(value, &session.csrf_token))
+        {
+            return api_error(StatusCode::FORBIDDEN, "csrf_failed");
+        }
         return next.run(request).await;
     }
-    unauthorized(true)
+    if state.config.admin_totp_secret.is_none()
+        && basic_matches(
+            request.headers(),
+            &state.config.admin_user,
+            &state.config.admin_password,
+        )
+    {
+        return next.run(request).await;
+    }
+    unauthorized(false)
 }
 
 fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
@@ -286,15 +653,192 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse::hub(PRODUCT_VERSION))
 }
 
+#[derive(Debug, Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
+    totp: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionResponse {
+    authenticated: bool,
+    user: String,
+    csrf_token: String,
+    expires_at_unix: u64,
+}
+
+async fn auth_login(State(state): State<AppState>, Json(request): Json<LoginRequest>) -> Response {
+    let now = unix_time();
+    {
+        let mut failures = state.login_failures.lock().await;
+        failures.retain(|timestamp| now.saturating_sub(*timestamp) < 300);
+        if failures.len() >= 5 {
+            return api_error(StatusCode::TOO_MANY_REQUESTS, "login_rate_limited");
+        }
+    }
+    let password_ok = verify_secret(&request.password, &state.config.admin_password);
+    let user_ok = secure_eq(&request.username, &state.config.admin_user);
+    let second_factor_ok = if password_ok && user_ok {
+        match &state.config.admin_totp_secret {
+            Some(secret) => {
+                verify_totp(secret, &state.config.admin_user, &request.totp)
+                    || consume_recovery_code(&state, &request.totp).await
+            }
+            None => true,
+        }
+    } else {
+        false
+    };
+    if !(password_ok && user_ok && second_factor_ok) {
+        state.login_failures.lock().await.push(now);
+        return unauthorized(false);
+    }
+    state.login_failures.lock().await.clear();
+    let token = random_token();
+    let csrf_token = random_token();
+    let expires_at_unix = now + 12 * 60 * 60;
+    state.sessions.write().await.insert(
+        token.clone(),
+        BrowserSession {
+            user: request.username.clone(),
+            csrf_token: csrf_token.clone(),
+            expires_at_unix,
+        },
+    );
+    let mut response = Json(SessionResponse {
+        authenticated: true,
+        user: request.username,
+        csrf_token,
+        expires_at_unix,
+    })
+    .into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&format!(
+            "farhelm_session={token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=43200"
+        ))
+        .expect("session cookie is valid"),
+    );
+    response
+}
+
+async fn auth_logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(token) = cookie_value(&headers, "farhelm_session") {
+        state.sessions.write().await.remove(token);
+    }
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_static(
+            "farhelm_session=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0",
+        ),
+    );
+    response
+}
+
+async fn auth_session(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    match browser_session(&headers, &state).await {
+        Some(session) => Json(SessionResponse {
+            authenticated: true,
+            user: session.user,
+            csrf_token: session.csrf_token,
+            expires_at_unix: session.expires_at_unix,
+        })
+        .into_response(),
+        None => unauthorized(false),
+    }
+}
+
+async fn browser_session(headers: &HeaderMap, state: &AppState) -> Option<BrowserSession> {
+    let token = cookie_value(headers, "farhelm_session")?;
+    let session = state.sessions.read().await.get(token).cloned()?;
+    if session.expires_at_unix <= unix_time() {
+        state.sessions.write().await.remove(token);
+        return None;
+    }
+    Some(session)
+}
+
+fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .map(str::trim)
+        .find_map(|item| {
+            let (key, value) = item.split_once('=')?;
+            (key == name).then_some(value)
+        })
+}
+
+fn verify_secret(secret: &str, encoded_or_plain: &str) -> bool {
+    if encoded_or_plain.starts_with("$argon2") {
+        return PasswordHash::new(encoded_or_plain)
+            .ok()
+            .is_some_and(|hash| {
+                Argon2::default()
+                    .verify_password(secret.as_bytes(), &hash)
+                    .is_ok()
+            });
+    }
+    secure_eq(secret, encoded_or_plain)
+}
+
+fn verify_totp(secret: &str, account: &str, code: &str) -> bool {
+    let bytes = match totp_rs::Secret::Encoded(secret.to_owned()).to_bytes() {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    totp_rs::TOTP::new(
+        totp_rs::Algorithm::SHA1,
+        6,
+        1,
+        30,
+        bytes,
+        Some("FarHelm".to_owned()),
+        account.to_owned(),
+    )
+    .ok()
+    .and_then(|totp| totp.check_current(code).ok())
+    .unwrap_or(false)
+}
+
+async fn consume_recovery_code(state: &AppState, code: &str) -> bool {
+    let mut codes = state.recovery_codes.lock().await;
+    if let Some(index) = codes.iter().position(|hash| verify_secret(code, hash)) {
+        let hash = codes.remove(index);
+        state.events.consume_recovery_code(&hash).unwrap_or(false)
+    } else {
+        false
+    }
+}
+
+fn random_token() -> String {
+    let mut bytes = [0_u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
 async fn api_not_found() -> (StatusCode, Json<ApiError>) {
     (StatusCode::NOT_FOUND, Json(ApiError { error: "not_found" }))
 }
 
 async fn agent_heartbeat(
     State(state): State<AppState>,
+    Extension(identity): Extension<AgentIdentity>,
     Json(heartbeat): Json<AgentHeartbeat>,
 ) -> Result<Json<AgentHeartbeatAck>, (StatusCode, Json<ApiError>)> {
     validate_heartbeat(&heartbeat)?;
+    if !identity_allows(&identity, &heartbeat.agent_id) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError {
+                error: "agent_token_scope",
+            }),
+        ));
+    }
     let now = unix_time();
     state.agents.write().await.insert(
         heartbeat.agent_id,
@@ -358,6 +902,405 @@ async fn list_agents(State(state): State<AppState>) -> Json<AgentListResponse> {
     })
 }
 
+async fn agent_events(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AgentIdentity>,
+    Json(batch): Json<AgentEventBatch>,
+) -> Response {
+    if !matches!(&identity, AgentIdentity::Dedicated(agent_id) if agent_id == &batch.agent_id) {
+        return api_error(StatusCode::FORBIDDEN, "dedicated_agent_token_required");
+    }
+    if batch.protocol != FARHELM_PROTOCOL
+        || batch.events.is_empty()
+        || batch.events.len() > 100
+        || batch
+            .events
+            .iter()
+            .any(|event| event.agent_id != batch.agent_id)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "invalid_event_batch",
+            }),
+        )
+            .into_response();
+    }
+    let inserted = match state.events.ingest(&batch.agent_id, &batch.events) {
+        Ok(inserted) => inserted,
+        Err(error) => {
+            tracing::warn!(%error, agent_id = %batch.agent_id, "Agent event batch rejected");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "invalid_event_batch",
+                }),
+            )
+                .into_response();
+        }
+    };
+    for event in inserted {
+        let _ = state.event_bus.send(event);
+    }
+    Json(AgentEventAck {
+        protocol: FARHELM_PROTOCOL.to_owned(),
+        accepted_event_ids: batch
+            .events
+            .into_iter()
+            .map(|event| event.event_id)
+            .collect(),
+    })
+    .into_response()
+}
+
+async fn list_experiments(State(state): State<AppState>) -> Response {
+    match state.events.experiments() {
+        Ok(experiments) => Json(experiments).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to list experiments");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: "internal_error",
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionQuery {
+    project: Option<String>,
+}
+
+async fn list_codex_sessions(
+    State(state): State<AppState>,
+    Query(query): Query<SessionQuery>,
+) -> Response {
+    match state.events.sessions(query.project.as_deref()) {
+        Ok(sessions) => Json(sessions).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to list Codex sessions");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: "internal_error",
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn create_codex_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateCodexSessionRequest>,
+) -> Response {
+    if !valid_agent_id(&request.agent_id) || !valid_project_id(&request.project_id) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_session");
+    }
+    let Some(key) = idempotency_header(&headers) else {
+        return api_error(StatusCode::BAD_REQUEST, "missing_idempotency_key");
+    };
+    let payload = serde_json::json!({"project_id":request.project_id,"mode":request.mode});
+    create_typed_response(
+        &state,
+        &request.agent_id,
+        CommandAction::CodexSessionCreate,
+        payload,
+        key,
+        300,
+    )
+}
+
+async fn get_codex_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Response {
+    match state.events.session(&session_id) {
+        Ok(Some(session)) => Json(session).into_response(),
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "session_not_found"),
+        Err(error) => {
+            tracing::error!(%error, "failed to read Codex session");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "event_store_failed")
+        }
+    }
+}
+
+async fn send_codex_message(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<SendCodexMessageRequest>,
+) -> Response {
+    if request.prompt.is_empty() || request.prompt.len() > 32 * 1024 {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_prompt");
+    }
+    let Some(key) = idempotency_header(&headers) else {
+        return api_error(StatusCode::BAD_REQUEST, "missing_idempotency_key");
+    };
+    let session = match state.events.session(&session_id) {
+        Ok(Some(session)) => session,
+        Ok(None) => return api_error(StatusCode::NOT_FOUND, "session_not_found"),
+        Err(error) => {
+            tracing::error!(%error, "failed to read Codex session");
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "event_store_failed");
+        }
+    };
+    let (action, turn_id) = match request.delivery {
+        PromptDelivery::Queue => (CommandAction::CodexTurnStart, None),
+        PromptDelivery::Steer => {
+            let Some(turn_id) = session.active_turn_id.clone() else {
+                return api_error(StatusCode::CONFLICT, "session_is_not_running");
+            };
+            (CommandAction::CodexTurnSteer, Some(turn_id))
+        }
+    };
+    let payload = serde_json::json!({
+        "session_id":session_id,"project_id":session.project_id,"mode":session.mode,
+        "turn_id":turn_id,"prompt":request.prompt,"delivery":request.delivery
+    });
+    create_typed_response(&state, &session.agent_id, action, payload, key, 300)
+}
+
+async fn interrupt_codex_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(key) = idempotency_header(&headers) else {
+        return api_error(StatusCode::BAD_REQUEST, "missing_idempotency_key");
+    };
+    let session = match state.events.session(&session_id) {
+        Ok(Some(session)) => session,
+        Ok(None) => return api_error(StatusCode::NOT_FOUND, "session_not_found"),
+        Err(error) => {
+            tracing::error!(%error, "failed to read Codex session");
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "event_store_failed");
+        }
+    };
+    let Some(turn_id) = session.active_turn_id else {
+        return api_error(StatusCode::CONFLICT, "session_is_not_running");
+    };
+    create_typed_response(
+        &state,
+        &session.agent_id,
+        CommandAction::CodexTurnInterrupt,
+        serde_json::json!({"session_id":session_id,"project_id":session.project_id,"turn_id":turn_id}),
+        key,
+        300,
+    )
+}
+
+fn create_typed_response(
+    state: &AppState,
+    agent_id: &str,
+    action: CommandAction,
+    payload: serde_json::Value,
+    idempotency_key: &str,
+    ttl: u64,
+) -> Response {
+    match state.typed_commands.create(
+        agent_id,
+        action,
+        &payload,
+        idempotency_key,
+        ttl,
+        unix_time(),
+    ) {
+        Ok(command) => (
+            StatusCode::ACCEPTED,
+            Json(CommandAccepted {
+                protocol: FARHELM_PROTOCOL.to_owned(),
+                command_id: command.command_id.clone(),
+                state: command.state,
+                expires_at_unix: command.expires_at_unix,
+                status_url: format!("/api/v1/commands/{}", command.command_id),
+            }),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "failed to create typed command");
+            api_error(StatusCode::CONFLICT, "idempotency_conflict")
+        }
+    }
+}
+
+fn idempotency_header(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| valid_idempotency_key(value))
+}
+
+fn valid_project_id(value: &str) -> bool {
+    valid_agent_id(value)
+}
+
+async fn event_stream(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let after = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    // Subscribe before reading history so an event committed between replay and
+    // live delivery remains buffered in the receiver. Sequence filtering below
+    // removes the resulting overlap.
+    let mut receiver = state.event_bus.subscribe();
+    let replay = match state.events.replay(after, 1000) {
+        Ok(replay) => replay,
+        Err(error) => {
+            tracing::error!(%error, "failed to replay events");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: "internal_error",
+                }),
+            )
+                .into_response();
+        }
+    };
+    let stream = async_stream::stream! {
+        let mut cursor = after;
+        for event in replay {
+            cursor = cursor.max(event.sequence);
+            yield Ok::<Event, Infallible>(sse_event(&event));
+        }
+        loop {
+            let page = match state.events.replay(cursor, 1000) {
+                Ok(page) => page,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to continue SSE replay");
+                    break;
+                }
+            };
+            if page.is_empty() {
+                break;
+            }
+            for event in page {
+                if event.sequence > cursor {
+                    cursor = event.sequence;
+                    yield Ok::<Event, Infallible>(sse_event(&event));
+                }
+            }
+        }
+        loop {
+            match receiver.recv().await {
+                Ok(event) if event.sequence > cursor => {
+                    cursor = event.sequence;
+                    yield Ok::<Event, Infallible>(sse_event(&event));
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => loop {
+                    let page = match state.events.replay(cursor, 1000) {
+                        Ok(page) => page,
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to recover lagged SSE stream");
+                            break;
+                        }
+                    };
+                    let page_len = page.len();
+                    for event in page {
+                        if event.sequence > cursor {
+                            cursor = event.sequence;
+                            yield Ok::<Event, Infallible>(sse_event(&event));
+                        }
+                    }
+                    if page_len < 1000 {
+                        break;
+                    }
+                },
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keepalive"),
+        )
+        .into_response()
+}
+
+fn sse_event(event: &StoredEvent) -> Event {
+    Event::default()
+        .id(event.sequence.to_string())
+        .event(event.event_type.clone())
+        .data(
+            serde_json::to_string(
+                &serde_json::json!({"event_id":event.event_id,"payload":event.payload}),
+            )
+            .unwrap_or_else(|_| "{}".to_owned()),
+        )
+}
+
+#[derive(Debug, Deserialize)]
+struct PushKeys {
+    p256dh: String,
+    auth: String,
+}
+#[derive(Debug, Deserialize)]
+struct PushSubscriptionRequest {
+    endpoint: String,
+    keys: PushKeys,
+}
+#[derive(Debug, Deserialize)]
+struct DeletePushSubscriptionRequest {
+    endpoint: String,
+}
+
+async fn save_push_subscription(
+    State(state): State<AppState>,
+    Json(request): Json<PushSubscriptionRequest>,
+) -> Response {
+    let valid_endpoint = reqwest::Url::parse(&request.endpoint).is_ok_and(|endpoint| {
+        endpoint.scheme() == "https"
+            && endpoint.host_str().is_some()
+            && endpoint.username().is_empty()
+            && endpoint.password().is_none()
+    });
+    let valid_keys = valid_endpoint
+        && URL_SAFE_NO_PAD
+            .decode(&request.keys.p256dh)
+            .ok()
+            .and_then(|key| PublicKey::from_sec1_bytes(&key).ok())
+            .is_some()
+        && URL_SAFE_NO_PAD
+            .decode(&request.keys.auth)
+            .is_ok_and(|auth| auth.len() == 16);
+    if !valid_keys {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_push_subscription");
+    }
+    match state.events.save_push_subscription(
+        &request.endpoint,
+        &request.keys.p256dh,
+        &request.keys.auth,
+        unix_time(),
+    ) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            tracing::warn!(%error,"push subscription rejected");
+            api_error(StatusCode::BAD_REQUEST, "invalid_push_subscription")
+        }
+    }
+}
+
+async fn delete_push_subscription(
+    State(state): State<AppState>,
+    Json(request): Json<DeletePushSubscriptionRequest>,
+) -> Response {
+    match state.events.delete_push_subscription(&request.endpoint) {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            tracing::error!(%error,"push subscription deletion failed");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "event_store_failed")
+        }
+    }
+}
+
 async fn create_probe(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
@@ -400,6 +1343,16 @@ async fn command_status(State(state): State<AppState>, Path(command_id): Path<St
     if !valid_command_id(&command_id) {
         return api_error(StatusCode::BAD_REQUEST, "invalid_command_id");
     }
+    if command_id.starts_with("cmd_cdx_") {
+        return match state.typed_commands.get(&command_id) {
+            Ok(Some(command)) => Json(command).into_response(),
+            Ok(None) => api_error(StatusCode::NOT_FOUND, "command_not_found"),
+            Err(error) => {
+                tracing::error!(%error, "failed to read typed command");
+                api_error(StatusCode::INTERNAL_SERVER_ERROR, "command_store_failed")
+            }
+        };
+    }
     match state.commands.get(&command_id) {
         Ok(Some(command)) => Json(command).into_response(),
         Ok(None) => api_error(StatusCode::NOT_FOUND, "command_not_found"),
@@ -412,10 +1365,30 @@ async fn command_status(State(state): State<AppState>, Path(command_id): Path<St
 
 async fn claim_command(
     State(state): State<AppState>,
+    Extension(identity): Extension<AgentIdentity>,
     Json(request): Json<CommandClaimRequest>,
 ) -> Response {
     if request.protocol != FARHELM_PROTOCOL || !valid_agent_id(&request.agent_id) {
         return api_error(StatusCode::BAD_REQUEST, "invalid_claim");
+    }
+    if !identity_allows(&identity, &request.agent_id) {
+        return api_error(StatusCode::FORBIDDEN, "agent_token_scope");
+    }
+    if matches!(identity, AgentIdentity::Dedicated(_)) {
+        match state.typed_commands.claim(&request.agent_id, unix_time()) {
+            Ok(Some(command)) => {
+                return Json(CommandClaimResponse {
+                    protocol: FARHELM_PROTOCOL.to_owned(),
+                    command: Some(command),
+                })
+                .into_response();
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(%error, agent_id=%request.agent_id, "failed to claim typed command");
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "command_store_failed");
+            }
+        }
     }
     match state.commands.claim(&request.agent_id, unix_time()) {
         Ok(command) => Json(CommandClaimResponse {
@@ -432,6 +1405,7 @@ async fn claim_command(
 
 async fn report_command(
     State(state): State<AppState>,
+    Extension(identity): Extension<AgentIdentity>,
     Json(report): Json<CommandReportRequest>,
 ) -> Response {
     if report.protocol != FARHELM_PROTOCOL
@@ -439,6 +1413,21 @@ async fn report_command(
         || !valid_command_id(&report.command_id)
     {
         return api_error(StatusCode::BAD_REQUEST, "invalid_report");
+    }
+    if !identity_allows(&identity, &report.agent_id) {
+        return api_error(StatusCode::FORBIDDEN, "agent_token_scope");
+    }
+    if report.command_id.starts_with("cmd_cdx_") {
+        if matches!(identity, AgentIdentity::Legacy) {
+            return api_error(StatusCode::FORBIDDEN, "dedicated_agent_token_required");
+        }
+        return match state.typed_commands.report(&report, unix_time()) {
+            Ok(command) => Json(command).into_response(),
+            Err(error) => {
+                tracing::warn!(%error, command_id=%report.command_id, "typed command report rejected");
+                api_error(StatusCode::CONFLICT, "invalid_command_transition")
+            }
+        };
     }
     match state.commands.report(&report, unix_time()) {
         Ok(command) => Json(command).into_response(),
@@ -466,6 +1455,13 @@ fn valid_agent_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
+fn identity_allows(identity: &AgentIdentity, agent_id: &str) -> bool {
+    match identity {
+        AgentIdentity::Dedicated(expected) => secure_eq(expected, agent_id),
+        AgentIdentity::Legacy => true,
+    }
+}
+
 fn valid_idempotency_key(value: &str) -> bool {
     (16..=128).contains(&value.len())
         && value
@@ -474,9 +1470,12 @@ fn valid_idempotency_key(value: &str) -> bool {
 }
 
 fn valid_command_id(value: &str) -> bool {
-    value.len() == 20
+    (value.len() == 20
         && value.starts_with("cmd_")
-        && value[4..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        && value[4..].bytes().all(|byte| byte.is_ascii_hexdigit()))
+        || (value.len() == 24
+            && value.starts_with("cmd_cdx_")
+            && value[8..].bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 const fn is_online(now: u64, last_seen: u64) -> bool {
@@ -496,9 +1495,9 @@ mod tests {
         http::{Request, StatusCode},
     };
     use farhelm_protocol::{
-        AgentHeartbeat, CommandAccepted, CommandClaimRequest, CommandClaimResponse,
-        CommandReportRequest, CommandState, CommandStatusResponse, CreateProbeCommand,
-        FARHELM_PROTOCOL, HealthResponse, HealthStatus, ProbeResult,
+        AgentEvent, AgentEventBatch, AgentHeartbeat, CommandAccepted, CommandClaimRequest,
+        CommandClaimResponse, CommandReportRequest, CommandState, CommandStatusResponse,
+        CreateProbeCommand, FARHELM_PROTOCOL, HealthResponse, HealthStatus, ProbeResult,
     };
     use tower::ServiceExt;
 
@@ -508,11 +1507,148 @@ mod tests {
         AppState::new(HubConfig {
             admin_user: "admin".to_owned(),
             admin_password: "correct-horse".to_owned(),
+            admin_totp_secret: None,
+            recovery_code_hashes: Vec::new(),
             agent_token: "agent-token-with-at-least-32-characters".to_owned(),
+            agent_tokens: BTreeMap::new(),
+            push: None,
             console_dir: Some(PathBuf::from("missing-test-console")),
             database_path: PathBuf::from(":memory:"),
         })
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn password_totp_cookie_and_csrf_form_one_session_boundary() {
+        let secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_owned();
+        let mut config = test_state().config.as_ref().clone();
+        config.admin_totp_secret = Some(secret.clone());
+        config.recovery_code_hashes = vec!["recovery-code".to_owned()];
+        let router = app(AppState::new(config).unwrap());
+        let code = totp_rs::TOTP::new(
+            totp_rs::Algorithm::SHA1,
+            6,
+            1,
+            30,
+            totp_rs::Secret::Encoded(secret).to_bytes().unwrap(),
+            Some("FarHelm".to_owned()),
+            "admin".to_owned(),
+        )
+        .unwrap()
+        .generate_current()
+        .unwrap();
+        let response = router.clone().oneshot(Request::builder().method("POST").uri("/api/v1/auth/login").header(header::CONTENT_TYPE,"application/json").body(Body::from(serde_json::json!({"username":"admin","password":"correct-horse","totp":code}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let session: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let csrf = session["csrf_token"].as_str().unwrap();
+        let restored = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/session")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(restored.status(), StatusCode::OK);
+        let rejected = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/logout")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+        let logout = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/logout")
+                    .header(header::COOKIE, cookie)
+                    .header("x-csrf-token", csrf)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn dedicated_agent_events_are_deduplicated_and_materialized() {
+        let mut config = test_state().config.as_ref().clone();
+        config.agent_tokens.insert(
+            "gpu-a".to_owned(),
+            "dedicated-agent-token-with-32-characters".to_owned(),
+        );
+        let router = app(AppState::new(config).unwrap());
+        let event = AgentEvent {
+            protocol: FARHELM_PROTOCOL.to_owned(),
+            event_id: "watch-1:succeeded".to_owned(),
+            agent_id: "gpu-a".to_owned(),
+            sequence: 1,
+            event_type: "experiment.updated".to_owned(),
+            created_at_unix: 100,
+            payload: serde_json::json!({"watch_id":"watch-1","agent_id":"gpu-a","project_id":"cc08","name":"trial","pid":42,"state":"succeeded","session_id":"ses_1","detail":"matched","updated_at_unix":100}),
+        };
+        for _ in 0..2 {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/agent/events")
+                        .header(
+                            header::AUTHORIZATION,
+                            "Bearer dedicated-agent-token-with-32-characters",
+                        )
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&AgentEventBatch {
+                                protocol: FARHELM_PROTOCOL.to_owned(),
+                                agent_id: "gpu-a".to_owned(),
+                                events: vec![event.clone()],
+                            })
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/experiments")
+                    .header(header::AUTHORIZATION, basic_header())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["experiments"].as_array().unwrap().len(), 1);
+        assert_eq!(value["experiments"][0]["state"], "succeeded");
     }
 
     fn basic_header() -> String {
@@ -540,7 +1676,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_api_requires_basic_auth() {
+    async fn admin_api_requires_authentication() {
         let response = app(test_state())
             .oneshot(
                 Request::builder()
@@ -551,7 +1687,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert!(response.headers().contains_key(header::WWW_AUTHENTICATE));
+        assert!(!response.headers().contains_key(header::WWW_AUTHENTICATE));
     }
 
     #[tokio::test]
@@ -664,7 +1800,11 @@ mod tests {
         let config = HubConfig {
             admin_user: "admin".to_owned(),
             admin_password: "short".to_owned(),
+            admin_totp_secret: None,
+            recovery_code_hashes: Vec::new(),
             agent_token: "short".to_owned(),
+            agent_tokens: BTreeMap::new(),
+            push: None,
             console_dir: Some(PathBuf::from("missing-test-console")),
             database_path: PathBuf::from(":memory:"),
         };
@@ -675,6 +1815,60 @@ mod tests {
     fn agent_expires_after_online_window() {
         assert!(is_online(100, 55));
         assert!(!is_online(101, 55));
+    }
+
+    #[test]
+    fn push_payload_contains_only_summary_identity_and_deep_link() {
+        let delivery = PushDelivery {
+            event_sequence: 1,
+            event_id: "event-a".into(),
+            event_type: "experiment.updated".into(),
+            payload: serde_json::json!({
+                "watch_id":"watch-a","name":"训练一","state":"succeeded",
+                "prompt":"secret prompt","log":"secret log"
+            }),
+            endpoint: "https://push.example.test/id".into(),
+            p256dh: String::new(),
+            auth: String::new(),
+            attempts: 0,
+        };
+        let payload = push_payload(&delivery).unwrap();
+        assert_eq!(payload["event_id"], "event-a");
+        assert_eq!(payload["url"], "/experiments?watch=watch-a");
+        let encoded = serde_json::to_string(&payload).unwrap();
+        assert!(!encoded.contains("secret"));
+        assert_eq!(payload.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn vapid_authorization_is_a_verifiable_es256_jwt() {
+        use web_push_native::p256::ecdsa::{VerifyingKey, signature::Verifier};
+
+        let private = [7_u8; 32];
+        let signing_key = SigningKey::from_slice(&private).unwrap();
+        let public = signing_key.verifying_key().to_encoded_point(false);
+        let push = PushConfig {
+            private_key: URL_SAFE_NO_PAD.encode(private),
+            public_key: URL_SAFE_NO_PAD.encode(public.as_bytes()),
+            contact: "mailto:admin@example.test".to_owned(),
+        };
+        let endpoint = reqwest::Url::parse("https://push.example.test:8443/sub/1").unwrap();
+        let authorization = vapid_authorization(&endpoint, &push, &signing_key).unwrap();
+        let value = authorization.strip_prefix("vapid t=").unwrap();
+        let (token, encoded_key) = value.split_once(", k=").unwrap();
+        assert_eq!(encoded_key, push.public_key);
+        let parts: Vec<_> = token.split('.').collect();
+        assert_eq!(parts.len(), 3);
+        let claims: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+        assert_eq!(claims["aud"], "https://push.example.test:8443");
+        assert_eq!(claims["sub"], push.contact);
+        let signature = Signature::from_slice(&URL_SAFE_NO_PAD.decode(parts[2]).unwrap()).unwrap();
+        let verifier =
+            VerifyingKey::from_sec1_bytes(&URL_SAFE_NO_PAD.decode(encoded_key).unwrap()).unwrap();
+        verifier
+            .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature)
+            .unwrap();
     }
 
     #[tokio::test]
@@ -758,6 +1952,7 @@ mod tests {
                                 state,
                                 result,
                                 detail: None,
+                                data: None,
                             })
                             .unwrap(),
                         ))
@@ -861,6 +2056,7 @@ mod tests {
                             state: CommandState::Accepted,
                             result: None,
                             detail: None,
+                            data: None,
                         })
                         .unwrap(),
                     ))

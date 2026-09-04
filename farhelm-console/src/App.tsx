@@ -11,13 +11,18 @@ import {
   SunOutlined,
   UnorderedListOutlined,
 } from '@ant-design/icons'
-import { Button, ConfigProvider, Drawer, Grid, Layout, Menu, Space, Typography } from 'antd'
-import { useState } from 'react'
+import { Button, ConfigProvider, Drawer, Grid, Layout, Menu, Space, Spin, Typography } from 'antd'
+import { useEffect, useState } from 'react'
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 
 import { EmptyFeature } from './components/EmptyFeature'
 import { AgentListPage } from './components/AgentListPage'
+import { CodexPage } from './components/CodexPage'
+import { ExperimentPage } from './components/ExperimentPage'
+import { LoginPage } from './components/LoginPage'
+import { NotificationPage } from './components/NotificationPage'
 import { Overview } from './components/Overview'
+import { logout, readSession, type BrowserSession } from './api/auth'
 import { useAgents } from './hooks/useAgents'
 import { useColorMode } from './hooks/useColorMode'
 import { useHubHealth } from './hooks/useHubHealth'
@@ -28,7 +33,7 @@ const { Header, Content, Sider } = Layout
 const desktopItems = [
   { key: '/', icon: <DashboardOutlined />, label: '总览' },
   { key: '/agents', icon: <DesktopOutlined />, label: 'Agent' },
-  { key: '/jobs', icon: <UnorderedListOutlined />, label: '任务' },
+  { key: '/experiments', icon: <UnorderedListOutlined />, label: '实验' },
   { key: '/codex', icon: <CodeOutlined />, label: 'Codex' },
   { key: '/notifications', icon: <BellOutlined />, label: '通知' },
   { key: '/audit', icon: <FileSearchOutlined />, label: '审计' },
@@ -37,12 +42,12 @@ const desktopItems = [
 
 const mobileItems = [
   { key: '/', icon: <DashboardOutlined />, label: '总览' },
-  { key: '/jobs', icon: <UnorderedListOutlined />, label: '任务' },
+  { key: '/experiments', icon: <UnorderedListOutlined />, label: '实验' },
   { key: '/codex', icon: <CodeOutlined />, label: 'Codex' },
   { key: '/more', icon: <MoreOutlined />, label: '更多' },
 ]
 
-function FeatureRoutes() {
+function FeatureRoutes({ csrf }: { csrf: string }) {
   const { health, refresh } = useHubHealth()
   const { agents, refresh: refreshAgents } = useAgents()
   const refreshOverview = () => {
@@ -53,10 +58,11 @@ function FeatureRoutes() {
     <Routes>
       <Route path="/" element={<Overview health={health} agents={agents} onRefresh={refreshOverview} />} />
       <Route path="/agents" element={<AgentListPage agents={agents} onRefresh={refreshAgents} />} />
-      <Route path="/jobs" element={<EmptyFeature title="任务" description="任务编排与监控尚未接入真实数据。" icon={<UnorderedListOutlined className="empty-icon" />} />} />
-      <Route path="/codex" element={<EmptyFeature title="Codex" description="真实 Codex 会话不在首轮骨架范围内。" icon={<CodeOutlined className="empty-icon" />} />} />
-      <Route path="/notifications" element={<EmptyFeature title="通知" description="通知与 Web Push 将在可靠性设计完成后提供。" icon={<BellOutlined className="empty-icon" />} />} />
-      <Route path="/audit" element={<EmptyFeature title="审计" description="审计记录尚未接入持久化存储。" icon={<FileSearchOutlined className="empty-icon" />} />} />
+      <Route path="/experiments" element={<ExperimentPage />} />
+      <Route path="/jobs" element={<Navigate to="/experiments" replace />} />
+      <Route path="/codex" element={<CodexPage csrf={csrf} />} />
+      <Route path="/notifications" element={<NotificationPage csrf={csrf} />} />
+      <Route path="/audit" element={<EmptyFeature title="审计" description="命令与结果已持久化；独立审计查询界面暂未开放。" icon={<FileSearchOutlined className="empty-icon" />} />} />
       <Route path="/settings" element={<EmptyFeature title="设置" description="配置项会在安全模型确定后开放。" icon={<SettingOutlined className="empty-icon" />} />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
@@ -70,6 +76,8 @@ export default function App() {
   const location = useLocation()
   const [drawerOpen, setDrawerOpen] = useState(false)
   const { mode, toggleMode } = useColorMode()
+  const [session, setSession] = useState<BrowserSession | null | undefined>(undefined)
+  useEffect(() => { void readSession().then(setSession).catch(() => setSession(null)) }, [])
   const mobileSelection = ['/agents', '/notifications', '/audit', '/settings'].includes(location.pathname)
     ? '/more'
     : location.pathname
@@ -83,6 +91,9 @@ export default function App() {
     setDrawerOpen(false)
   }
 
+  if (session === undefined) return <ConfigProvider theme={createTheme(mode)}><div className="session-loading"><Spin /><span>正在恢复安全会话…</span></div></ConfigProvider>
+  if (session === null) return <ConfigProvider theme={createTheme(mode)}><LoginPage onLogin={setSession} /></ConfigProvider>
+
   return (
     <ConfigProvider theme={createTheme(mode)}>
       <Layout className="app-layout">
@@ -93,7 +104,7 @@ export default function App() {
               <div><strong>FarHelm</strong><span>远程训练控制台</span></div>
             </div>
             <Menu mode="inline" selectedKeys={[location.pathname]} items={desktopItems} onClick={({ key }) => go(key)} />
-            <div className="sider-footer"><Typography.Text type="secondary">V0.3.0 · Native role programs</Typography.Text></div>
+            <div className="sider-footer"><Typography.Text type="secondary">V0.4.0 · Experiment → Codex</Typography.Text></div>
           </Sider>
         )}
 
@@ -107,10 +118,11 @@ export default function App() {
                 onClick={toggleMode}
                 aria-label={mode === 'dark' ? '切换到浅色主题' : '切换到深色主题'}
               />
+              {isDesktop && <Button onClick={() => void logout(session.csrf_token).then(() => setSession(null))}>退出</Button>}
               {!isDesktop && <Button type="text" icon={<MenuOutlined />} onClick={() => setDrawerOpen(true)} aria-label="打开更多导航" />}
             </Space>
           </Header>
-          <Content className="app-content"><FeatureRoutes /></Content>
+          <Content className="app-content"><FeatureRoutes csrf={session.csrf_token} /></Content>
         </Layout>
 
         {!isDesktop && (

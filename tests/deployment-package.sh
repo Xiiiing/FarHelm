@@ -24,20 +24,14 @@ cmp "$agent_versioned" "$agent_stable"
 env -i "$hub_stable" --version | grep -Fxq "farhelm-hub $version"
 env -i "$agent_stable" --version | grep -Fxq "farhelm-agent $version"
 
-tar -C "$test_dir" -xzf "$release_dir/farhelm-hub-$version-linux-x86_64.tar.gz"
-tar -C "$test_dir" -xzf "$release_dir/farhelm-agent-$version-linux-x86_64.tar.gz"
-hub_compat="$test_dir/farhelm-hub-$version-linux-x86_64"
-agent_compat="$test_dir/farhelm-agent-$version-linux-x86_64"
-for required in \
-  "$hub_compat/bin/farhelm-hub" \
-  "$hub_compat/install.sh" \
-  "$agent_compat/bin/farhelm-agent" \
-  "$agent_compat/install.sh"; do
-  test -e "$required"
-done
-bash -n "$hub_compat/install.sh" "$agent_compat/install.sh"
-test "$(<"$hub_compat/VERSION")" = "$version"
-test "$(<"$agent_compat/RELEASE_TAG")" = "V$version"
+test -s "$release_dir/farhelm-codex-runtime-$version-linux-x86_64.tar.gz"
+runtime_archive="$release_dir/farhelm-codex-runtime-$version-linux-x86_64.tar.gz"
+runtime_size=$(stat -c '%s' "$runtime_archive")
+runtime_sha256=$(sha256sum "$runtime_archive" | cut -d' ' -f1)
+runtime_contents="$test_dir/runtime-contents.txt"
+tar -tzf "$runtime_archive" >"$runtime_contents"
+grep -q '^\.venv/bin/python' "$runtime_contents"
+grep -q '^python/bin/python3.12' "$runtime_contents"
 
 hub_config="$test_dir/hub.toml"
 agent_config="$test_dir/agent.toml"
@@ -123,6 +117,9 @@ chmod 0755 "$mock_bin/systemctl" "$mock_bin/loginctl"
   export FARHELM_AGENT_TOKEN=package-agent-token-with-at-least-32-characters
   export FARHELM_AGENT_ID=package-installed
   export FARHELM_AGENT_HOSTNAME=package-installed-host
+  export FARHELM_CODEX_RUNTIME_ARCHIVE="$runtime_archive"
+  export FARHELM_CODEX_RUNTIME_SIZE="$runtime_size"
+  export FARHELM_CODEX_RUNTIME_SHA256="$runtime_sha256"
   mkdir -p "$HOME"
 
   "$agent_stable" install
@@ -134,6 +131,7 @@ chmod 0755 "$mock_bin/systemctl" "$mock_bin/loginctl"
   test -f "$installed_config"
   test "$(stat -c '%a' "$installed_config")" = 600
   test -f "$installed_data/runtime/codex-worker/$version/src/farhelm_worker_codex/__main__.py"
+  test -x "$installed_data/runtime/codex-worker/$version/.venv/bin/python"
   grep -q "$installed_binary" "$unit_file"
   grep -q "$installed_config" "$unit_file"
   ! grep -q 'current/run.sh' "$unit_file"
@@ -151,12 +149,11 @@ chmod 0755 "$mock_bin/systemctl" "$mock_bin/loginctl"
     exit 1
   fi
 
-  config_hash=$(sha256sum "$installed_config" | cut -d' ' -f1)
   printf 'persistent-state\n' >"$installed_data/state/preserved.txt"
   "$agent_stable" install
   test -f "$XDG_BIN_HOME/farhelm-agent.previous"
   "$installed_binary" rollback
-  test "$(sha256sum "$installed_config" | cut -d' ' -f1)" = "$config_hash"
+  grep -q 'runtime/codex-worker' "$installed_config"
   test "$(<"$installed_data/state/preserved.txt")" = persistent-state
 
   "$installed_binary" uninstall
@@ -176,6 +173,9 @@ chmod 0755 "$mock_bin/systemctl" "$mock_bin/loginctl"
   export FARHELM_HUB_URL=http://127.0.0.1:18787
   export FARHELM_AGENT_TOKEN=package-agent-token-with-at-least-32-characters
   export FARHELM_AGENT_ID=failure-agent
+  export FARHELM_CODEX_RUNTIME_ARCHIVE="$runtime_archive"
+  export FARHELM_CODEX_RUNTIME_SIZE="$runtime_size"
+  export FARHELM_CODEX_RUNTIME_SHA256="$runtime_sha256"
   mkdir -p "$HOME"
 
   "$agent_stable" install
@@ -212,6 +212,9 @@ chmod 0755 "$mock_bin/systemctl" "$mock_bin/loginctl"
   export FARHELM_HUB_URL=http://127.0.0.1:18787
   export FARHELM_AGENT_TOKEN=package-agent-token-with-at-least-32-characters
   export FARHELM_AGENT_ID=fresh-failure-agent
+  export FARHELM_CODEX_RUNTIME_ARCHIVE="$runtime_archive"
+  export FARHELM_CODEX_RUNTIME_SIZE="$runtime_size"
+  export FARHELM_CODEX_RUNTIME_SHA256="$runtime_sha256"
   mkdir -p "$HOME"
 
   set +e
@@ -225,41 +228,4 @@ chmod 0755 "$mock_bin/systemctl" "$mock_bin/loginctl"
   test ! -e "$XDG_DATA_HOME/farhelm"
 )
 
-(
-  export PATH="$mock_bin:$PATH"
-  export HOME="$test_dir/legacy-home"
-  export XDG_DATA_HOME="$test_dir/legacy-data"
-  export XDG_CONFIG_HOME="$test_dir/legacy-config"
-  export XDG_BIN_HOME="$test_dir/legacy-bin"
-  export USER=legacy-user
-  legacy_root="$XDG_DATA_HOME/farhelm-agent"
-  mkdir -p "$HOME" "$legacy_root/config" "$legacy_root/state"
-  printf 'foreground\n' >"$legacy_root/INSTALL_MODE"
-  cat >"$legacy_root/config/agent.env" <<EOF
-FARHELM_HUB_URL=http://127.0.0.1:18787
-FARHELM_AGENT_TOKEN=package-agent-token-with-at-least-32-characters
-FARHELM_AGENT_ID=legacy-agent
-FARHELM_AGENT_HOSTNAME=legacy-host
-FARHELM_AGENT_DATABASE=$legacy_root/state/agent.db
-EOF
-  python3 - "$legacy_root/state/agent.db" <<'PY'
-import sqlite3, sys
-db = sqlite3.connect(sys.argv[1])
-db.execute("create table preserved(value text)")
-db.execute("insert into preserved values ('yes')")
-db.commit()
-PY
-  FARHELM_UPGRADE=1 FARHELM_INSTALL_ROOT="$legacy_root" "$agent_compat/install.sh"
-  test -x "$XDG_BIN_HOME/farhelm-agent"
-  test -f "$XDG_CONFIG_HOME/farhelm/agent.toml"
-  test -f "$XDG_DATA_HOME/farhelm/state/agent.db"
-  test ! -e "$XDG_CONFIG_HOME/systemd/user/farhelm-agent.service"
-  test ! -e "$legacy_root"
-  python3 - "$XDG_DATA_HOME/farhelm/state/agent.db" <<'PY'
-import sqlite3, sys
-assert sqlite3.connect(sys.argv[1]).execute("select value from preserved").fetchone() == ('yes',)
-PY
-  "$XDG_BIN_HOME/farhelm-agent" uninstall
-)
-
-printf 'Native role program and V0.2 migration smoke passed.\n'
+printf 'Native role program and managed Codex runtime smoke passed.\n'

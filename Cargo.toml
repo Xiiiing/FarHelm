@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
@@ -19,10 +19,16 @@ repository = "https://github.com/Xiiiing/FarHelm"
 
 [workspace.dependencies]
 anyhow = "1.0"
+async-stream = "0.3"
+argon2 = "0.5"
 axum = "0.8"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive", "env"] }
 constant_time_eq = "0.4"
+flate2 = "1.1"
+libc = "0.2"
+regex = "1.11"
+rand = "0.9"
 farhelm-core = { path = "crates/farhelm-core" }
 farhelm-lifecycle = { path = "crates/farhelm-lifecycle" }
 farhelm-protocol = { path = "crates/farhelm-protocol" }
@@ -36,12 +42,16 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11.0"
 tempfile = "3.27.0"
+tar = "0.4"
 thiserror = "2.0"
 tokio = { version = "1.47", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.9"
+totp-rs = { version = "5.7", features = ["otpauth"] }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+urlencoding = "2.1"
+web-push-native = { version = "0.5.0", default-features = false }
 
 [profile.release]
 codegen-units = 1

@@ -10,7 +10,7 @@ use farhelm_updater::{Role, Updater};
 
 use crate::{
     config::{AgentFileConfig, AgentPaths},
-    resources::materialize_worker,
+    resources::ensure_worker_environment,
 };
 
 pub const UNIT_NAME: &str = "farhelm-agent.service";
@@ -37,12 +37,13 @@ pub async fn install(no_service: bool) -> Result<()> {
         fs::create_dir_all(parent)?;
         set_mode(parent, 0o700)?;
     }
-    materialize_worker(&paths.worker)?;
+    config.worker.python = ensure_worker_environment(&paths.worker, &config.worker.python)
+        .await?
+        .to_string_lossy()
+        .into_owned();
     let current = std::env::current_exe().context("failed to locate current Agent executable")?;
     let replaced_binary = install_binary(&current, &paths.binary, &paths.previous)?;
-    if !paths.config.is_file() {
-        write_atomic(&paths.config, config.encode()?.as_bytes(), 0o600)?;
-    }
+    write_atomic(&paths.config, config.encode()?.as_bytes(), 0o600)?;
     set_mode(&paths.config, 0o600)?;
 
     if no_service {
@@ -148,7 +149,6 @@ pub fn doctor(config_path: Option<&Path>) -> Result<(AgentFileConfig, AgentPaths
     let config = AgentFileConfig::load(path)?;
     let mode = fs::metadata(path)?.permissions().mode() & 0o777;
     ensure!(mode & 0o077 == 0, "Agent config must use mode 0600");
-    materialize_worker(&paths.worker)?;
     let python_ok = Command::new(&config.worker.python)
         .arg("--version")
         .output()
@@ -184,6 +184,12 @@ pub async fn update(check: bool, requested: Option<&str>, allow_major: bool) -> 
     ensure!(paths.binary.is_file(), "FarHelm Agent is not installed");
     println!("Downloading verified {}...", candidate.asset_name());
     let executable = updater.download(Role::Agent, &candidate).await?;
+    let mut config = AgentFileConfig::load(&paths.config)?;
+    config.worker.python = ensure_worker_environment(&paths.worker, &config.worker.python)
+        .await?
+        .to_string_lossy()
+        .into_owned();
+    write_atomic(&paths.config, config.encode()?.as_bytes(), 0o600)?;
     install_binary(&executable.path, &paths.binary, &paths.previous)?;
     if let Err(error) = restart_and_check().await {
         swap_with_previous(&paths.binary, &paths.previous)?;
@@ -400,7 +406,7 @@ mod tests {
             config: "/tmp/home/.config/farhelm/agent.toml".into(),
             data: "/tmp/home/.local/share/farhelm".into(),
             database: "/tmp/home/.local/share/farhelm/state/agent.db".into(),
-            worker: "/tmp/home/.local/share/farhelm/runtime/codex-worker/0.3.0".into(),
+            worker: "/tmp/home/.local/share/farhelm/runtime/codex-worker/0.4.0".into(),
             unit: "/tmp/home/.config/systemd/user/farhelm-agent.service".into(),
             legacy_root: "/tmp/home/.local/share/farhelm-agent".into(),
         };

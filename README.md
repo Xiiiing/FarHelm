@@ -4,14 +4,14 @@
   <p><strong>面向个人科研与 GPU 训练环境的远程控制平面</strong></p>
   <p>从手机查看训练服务器状态，并在不开放训练机入站端口的前提下安全扩展远程控制能力。</p>
   <p>
-    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.3.0">V0.3.0</a> ·
+    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.4.0">V0.4.0</a> ·
     <a href="./deploy/README.md">部署文档</a> ·
     <a href="./README.en.md">English</a>
   </p>
 </div>
 
 > [!IMPORTANT]
-> 当前 `V0.3.0` 已提供 Hub 健康检查、Agent 心跳与列表、可靠命令状态和无副作用的 `agent.probe`。GPU 指标、训练控制、Codex 会话和 Web Push 仍在路线图中，README 不把规划能力描述成已完成能力。
+> 当前 `V0.4.0` 提供最小“实验结束 → Codex 下一步”闭环：本地登记 PID、可靠完成事件、按日志标记判断结果、成功时可幂等发送预设 prompt，以及手机端旧/新 Codex 会话与流式回复。它不提供远程训练启停、自动进程扫描、GPU/TensorBoard 图表或任意 shell。
 
 ## 快速安装
 
@@ -28,7 +28,7 @@ chmod +x farhelm-hub
 sudo ./farhelm-hub install
 ```
 
-程序会交互询问管理员用户名、管理员密码和 Agent token。安装后的实际程序位于 `/usr/local/bin/farhelm-hub`。
+程序会交互询问管理员用户名、管理员密码和迁移用 Agent token，并生成 TOTP 密钥与一次性恢复码。安装后的实际程序位于 `/usr/local/bin/farhelm-hub`；每台 Agent 的独立 256-bit token 在 `hub.toml` 的 `agents.tokens` 中配置。
 
 ### Agent
 
@@ -73,18 +73,27 @@ farhelm-agent restart
 farhelm-agent update --check
 farhelm-agent update
 farhelm-agent rollback
+
+# 查看旧 Codex 会话
+farhelm-agent codex sessions --project cc08
+
+# 登记现有训练 PID；prompt 只从文件或 stdin 读取
+farhelm-agent experiment watch --project cc08 --pid 12345 \
+  --session ses_xxx --log outputs/exp42/train.log \
+  --on-success-prompt-file next-step.txt
+farhelm-agent experiment list
 ```
 
 如果当前 shell 尚未包含 `~/.local/bin`，暂时使用完整路径 `~/.local/bin/farhelm-agent`。升级会验证不可变 Release、长度、SHA-256、角色和版本；激活失败会自动恢复本地 previous。
 
 ## 当前实现
 
-- `farhelm-hub`：Rust 控制平面、Basic Auth、内嵌 Console、SQLite 命令事实源和服务生命周期。
-- `farhelm-agent`：普通用户运行、只主动连接 Hub、心跳、命令 claim/report、本地幂等状态和服务生命周期。
-- `farhelm-console`：React、TypeScript、Ant Design、Vite PWA；正式构建内嵌到 Hub。
-- `farhelm-worker-codex`：Agent 私有的 Python stdio 适配层；当前仅验证协议握手，尚未连接真实 Codex 生命周期。
+- `farhelm-hub`：Rust 控制平面、密码 + TOTP、Secure HttpOnly Cookie、CSRF、登录限速、SQLite 命令/事件事实源、SSE 补发，以及 VAPID Push 加密投递与有限退避重试。
+- `farhelm-agent`：普通用户出站连接、明确登记的 PID 监视、PID 复用防护、日志尾部判定、SQLite inbox/outbox、独立 Agent token 和隔离 worktree。
+- `farhelm-console`：React、TypeScript、Ant Design、Vite PWA；提供实验与 Codex 手机/桌面界面、流式回复和通知深链处理。
+- `farhelm-worker-codex`：Agent 私有 Python stdio 适配层，固定 `openai-codex==0.147.0`，覆盖 thread list/start/resume 与 turn start/steer/interrupt。
 
-当前远程动作只允许无副作用的 `agent.probe`，不提供任意远程 shell，也不能远程启动或停止训练。
+所有远程动作都是固定类型；不接受 action、cwd、argv、环境变量或 shell 文本。训练仍由用户原有方式启动和停止。
 
 ## 架构
 
@@ -131,11 +140,9 @@ make test-release
 
 ## 路线图
 
-1. 加入 WSS 唤醒和 Agent 事件 outbox。
-2. 验证正式 Codex SDK 生命周期并扩展 Worker 协议。
-3. 完成单台训练服务器的训练任务与 Codex 会话闭环。
-4. 加入 GPU、训练指标、日志和 Web Push 通知。
-5. 扩展到多服务器并验证 canary 升级。
+1. 在 A6000/CC08、Titan/work831 与 3090/work832 完成 V0.4 canary。
+2. 在 iPhone 主屏幕 PWA 上完成后台 Web Push 的生产验证。
+3. 按实际实验需求评估 GPU 指标与 TensorBoard；不加入远程训练控制。
 
 ## 许可证
 

@@ -85,6 +85,16 @@ pub struct AgentListResponse {
 pub enum CommandAction {
     #[serde(rename = "agent.probe")]
     AgentProbe,
+    #[serde(rename = "codex.session.create")]
+    CodexSessionCreate,
+    #[serde(rename = "codex.session.resume")]
+    CodexSessionResume,
+    #[serde(rename = "codex.turn.start")]
+    CodexTurnStart,
+    #[serde(rename = "codex.turn.steer")]
+    CodexTurnSteer,
+    #[serde(rename = "codex.turn.interrupt")]
+    CodexTurnInterrupt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +124,8 @@ pub struct AgentCommand {
     pub action: CommandAction,
     pub created_at_unix: u64,
     pub expires_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +166,8 @@ pub struct CommandReportRequest {
     pub result: Option<ProbeResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,6 +184,136 @@ pub struct CommandStatusResponse {
     pub result: Option<ProbeResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExperimentState {
+    Watching,
+    Succeeded,
+    Failed,
+    Unknown,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodexSessionState {
+    Creating,
+    Idle,
+    Queued,
+    Running,
+    Interrupting,
+    Failed,
+    Orphaned,
+    Archived,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodexSessionMode {
+    Inspect,
+    Edit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExperimentSummary {
+    pub watch_id: String,
+    pub agent_id: String,
+    pub project_id: String,
+    pub name: String,
+    pub pid: u32,
+    pub state: ExperimentState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub updated_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExperimentListResponse {
+    pub protocol: String,
+    pub experiments: Vec<ExperimentSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexSessionSummary {
+    pub session_id: String,
+    pub agent_id: String,
+    pub project_id: String,
+    pub mode: CodexSessionMode,
+    pub state: CodexSessionState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_turn_id: Option<String>,
+    pub updated_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexSessionListResponse {
+    pub protocol: String,
+    pub sessions: Vec<CodexSessionSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateCodexSessionRequest {
+    pub agent_id: String,
+    pub project_id: String,
+    pub mode: CodexSessionMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptDelivery {
+    Queue,
+    Steer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendCodexMessageRequest {
+    pub prompt: String,
+    #[serde(default = "default_prompt_delivery")]
+    pub delivery: PromptDelivery,
+}
+
+const fn default_prompt_delivery() -> PromptDelivery {
+    PromptDelivery::Queue
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEvent {
+    pub protocol: String,
+    pub event_id: String,
+    pub agent_id: String,
+    pub sequence: u64,
+    pub event_type: String,
+    pub created_at_unix: u64,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEventBatch {
+    pub protocol: String,
+    pub agent_id: String,
+    pub events: Vec<AgentEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEventAck {
+    pub protocol: String,
+    pub accepted_event_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkerEvent {
+    pub protocol: String,
+    pub kind: String,
+    pub event: String,
+    pub data: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -13,6 +13,7 @@ test:
 	cd farhelm-worker-codex && uv run pytest
 
 test-ui:
+	corepack pnpm@10.17.1 --dir farhelm-console build
 	corepack pnpm@10.17.1 --dir farhelm-console test:e2e
 
 run-hub:

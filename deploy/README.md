@@ -1,4 +1,4 @@
-# FarHelm V0.3.0 部署与生命周期
+# FarHelm V0.4.0 部署与生命周期
 
 [简体中文](README.md) · [English](README.en.md)
 
@@ -21,6 +21,18 @@ sudo env \
   FARHELM_AGENT_TOKEN="至少32字符的随机token" \
   ./farhelm-hub install
 ```
+
+从 V0.3.0 升级 Hub 时，请先备份数据库和配置，再让 V0.4.0 实际二进制执行一次 `install`；它会把明文密码迁移为 Argon2id，并在终端显示 TOTP 密钥和一次性恢复码：
+
+```bash
+sudo cp /var/lib/farhelm/farhelm.db /var/lib/farhelm/farhelm.db.v0.3.bak
+sudo cp /etc/farhelm/hub.toml /etc/farhelm/hub.toml.v0.3.bak
+sudo ./farhelm-hub install
+sudo farhelm-hub doctor
+curl -f http://127.0.0.1:8787/api/v1/health
+```
+
+升级每台 Agent 前，在 `[agents].tokens` 中为其配置独立 token；旧 `[agents].token` 只保留心跳和 `agent.probe` 迁移能力，不能接收 Codex 命令或上传实验事件。
 
 Hub 创建并管理：
 
@@ -67,6 +79,15 @@ sudo farhelm-hub uninstall
 ```bash
 curl -fL https://github.com/Xiiiing/FarHelm/releases/latest/download/farhelm-agent-linux-x86_64 -o farhelm-agent
 chmod +x farhelm-agent
+./farhelm-agent install
+```
+
+Agent 会从同版本不可变 Release 下载独立 Python 3.12/Codex runtime，并校验资产长度和 SHA-256。离线安装时，先传输同版本 runtime 资产，再提供受信任的校验元数据：
+
+```bash
+FARHELM_CODEX_RUNTIME_ARCHIVE="$PWD/farhelm-codex-runtime-0.4.0-linux-x86_64.tar.gz" \
+FARHELM_CODEX_RUNTIME_SIZE="$(stat -c '%s' farhelm-codex-runtime-0.4.0-linux-x86_64.tar.gz)" \
+FARHELM_CODEX_RUNTIME_SHA256="从受信任的SHA256SUMS复制" \
 ./farhelm-agent install
 ```
 
@@ -126,14 +147,14 @@ farhelm-agent uninstall --keep-data
 
 ## 从 V0.2.0 迁移
 
-大写正式版本 `V0.2.0` 可以直接执行原有 `farhelmctl upgrade` 或 `farhelm-agent upgrade`。V0.3.0 Release 保留一次兼容 tar.gz，旧 updater 验证后会调用新角色程序完成 `.env` 到 TOML、数据库、unit 和稳定二进制迁移。成功后旧 `releases/current/run.sh` 目录会被清理。
+已安装 `V0.3.0` 的主机可以直接执行 `farhelm-hub update` 或 `farhelm-agent update`。`V0.2.0` 必须先升级到仍带兼容归档的 `V0.3.0`，完成 `.env` 到 TOML、数据库、unit 和稳定二进制迁移后，再升级到 V0.4.0；V0.4.0 不再重复发布兼容 tar.gz。
 
-旧小写 `v0.1.0/v0.2.0` 不属于正式升级序列，仍需先使用对应旧卸载器清理，再安装 V0.3.0。
+旧小写 `v0.1.0/v0.2.0` 不属于正式升级序列，仍需先使用对应旧卸载器清理，再安装 V0.4.0。
 
 ## 安全说明
 
 - 下载文件就是程序；首次安装不执行远端动态脚本。
-- V0.3+ updater 只下载版本化实际二进制，并验证固定官方仓库、immutable Release、长度、SHA-256、角色和版本。
+- V0.3+ updater 只下载版本化资产，并验证固定官方仓库、immutable Release、长度、SHA-256、角色和版本；V0.4 对独立 Codex runtime 使用相同校验。
 - 新程序完整写入同一文件系统后才原子替换，服务健康失败自动恢复 previous。
 - 配置、数据库和 Worker runtime 不随二进制覆盖；日志进入 journald。
-- 当前除在线状态外只执行无副作用 probe，不能启动/停止训练，也不连接真实 Codex。
+- 当前只允许固定类型的实验观察和 Codex session/turn 命令；不能启动/停止训练、传入任意 cwd/argv/env/shell，Codex Worker 只通过 Agent 的本地 stdio 连接真实 SDK。

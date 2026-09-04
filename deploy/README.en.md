@@ -1,4 +1,4 @@
-# FarHelm V0.3.0 deployment and lifecycle
+# FarHelm V0.4.0 deployment and lifecycle
 
 [简体中文](README.md) · [English](README.en.md)
 
@@ -21,6 +21,18 @@ sudo env \
   FARHELM_AGENT_TOKEN="a-random-token-of-at-least-32-characters" \
   ./farhelm-hub install
 ```
+
+When upgrading the Hub from V0.3.0, back up its database and configuration, then run `install` once with the V0.4.0 executable. It migrates the plaintext password to Argon2id and prints the TOTP secret and one-time recovery codes to the terminal:
+
+```bash
+sudo cp /var/lib/farhelm/farhelm.db /var/lib/farhelm/farhelm.db.v0.3.bak
+sudo cp /etc/farhelm/hub.toml /etc/farhelm/hub.toml.v0.3.bak
+sudo ./farhelm-hub install
+sudo farhelm-hub doctor
+curl -f http://127.0.0.1:8787/api/v1/health
+```
+
+Before upgrading each Agent, configure a dedicated token for it under `[agents].tokens`. The old `[agents].token` retains only heartbeat and `agent.probe` migration access; it cannot receive Codex commands or upload experiment events.
 
 Hub creates and manages:
 
@@ -67,6 +79,15 @@ Run as the target regular user on the training host:
 ```bash
 curl -fL https://github.com/Xiiiing/FarHelm/releases/latest/download/farhelm-agent-linux-x86_64 -o farhelm-agent
 chmod +x farhelm-agent
+./farhelm-agent install
+```
+
+Agent downloads the independent Python 3.12/Codex runtime from the matching immutable Release and verifies its length and SHA-256. For an offline installation, transfer the matching runtime asset first and provide trusted verification metadata:
+
+```bash
+FARHELM_CODEX_RUNTIME_ARCHIVE="$PWD/farhelm-codex-runtime-0.4.0-linux-x86_64.tar.gz" \
+FARHELM_CODEX_RUNTIME_SIZE="$(stat -c '%s' farhelm-codex-runtime-0.4.0-linux-x86_64.tar.gz)" \
+FARHELM_CODEX_RUNTIME_SHA256="copy-from-trusted-SHA256SUMS" \
 ./farhelm-agent install
 ```
 
@@ -126,14 +147,14 @@ farhelm-agent uninstall --keep-data
 
 ## Migrating from V0.2.0
 
-The uppercase formal `V0.2.0` release can run its existing `farhelmctl upgrade` or `farhelm-agent upgrade`. The V0.3.0 Release retains one compatibility tar.gz; the old updater verifies it, then invokes the new role program to migrate `.env`, database state, the unit, and the stable executable. The old `releases/current/run.sh` tree is removed after success.
+Hosts already on `V0.3.0` can run `farhelm-hub update` or `farhelm-agent update` directly. `V0.2.0` must first upgrade to `V0.3.0`, which retains the compatibility archive needed to migrate `.env`, database state, the unit, and the stable executable, and can then upgrade to V0.4.0. V0.4.0 does not republish compatibility tarballs.
 
-Lowercase legacy `v0.1.0/v0.2.0` releases are outside the formal update sequence. Remove them with their matching old uninstaller before installing V0.3.0.
+Lowercase legacy `v0.1.0/v0.2.0` releases are outside the formal update sequence. Remove them with their matching old uninstaller before installing V0.4.0.
 
 ## Security notes
 
 - The downloaded file is the program; initial installation executes no dynamic remote script.
-- V0.3+ updater downloads only versioned actual executables and verifies the fixed official repository, immutable Release, length, SHA-256, role, and version.
+- V0.3+ updater only downloads versioned assets and verifies the fixed official repository, immutable Release, length, SHA-256, role, and version; V0.4 applies the same checks to the independent Codex runtime.
 - A new program is fully written on the same filesystem before atomic replacement; failed service health restores previous.
 - Configuration, database, and Worker runtime are not overwritten with the executable; logs go to journald.
-- The current release executes only the side-effect-free probe beyond presence reporting; it cannot start/stop training and does not connect to real Codex yet.
+- The current release permits only typed experiment-observation and Codex session/turn commands. It cannot start or stop training or accept arbitrary cwd/argv/env/shell values; the Codex Worker connects to the real SDK only through the Agent's local stdio channel.

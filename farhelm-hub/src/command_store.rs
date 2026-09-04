@@ -192,6 +192,7 @@ impl CommandStore {
                         action: parse_action(&row.get::<_, String>(2)?)?,
                         created_at_unix: row_u64(row, 3)?,
                         expires_at_unix: row_u64(row, 4)?,
+                        payload: None,
                     })
                 },
             )
@@ -358,6 +359,7 @@ fn command_from_row(row: &Row<'_>) -> rusqlite::Result<(CommandStatusResponse, u
             updated_at_unix: row_u64(row, 6)?,
             result,
             detail: row.get(8)?,
+            data: None,
         },
         row_u64(row, 9)?,
     ))
@@ -443,6 +445,7 @@ mod tests {
                 hostname: "trainer-a".to_owned(),
             }),
             detail: None,
+            data: None,
         }
     }
 

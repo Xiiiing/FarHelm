@@ -172,6 +172,7 @@ impl CommandStore {
             state: pending.state,
             result: pending.result.clone(),
             detail: pending.detail.clone(),
+            data: None,
         }
     }
 
@@ -265,6 +266,7 @@ mod tests {
             action: CommandAction::AgentProbe,
             created_at_unix: 100,
             expires_at_unix: 160,
+            payload: None,
         }
     }
 

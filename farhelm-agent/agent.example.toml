@@ -9,3 +9,8 @@ database = "/home/user/.local/share/farhelm/state/agent.db"
 
 [worker]
 python = "python3"
+
+[projects.cc08]
+path = "/srv/projects/cc08"
+success_patterns = ["TRAINING COMPLETE", "Finished training"]
+failure_patterns = ["CUDA out of memory", "Traceback \\(most recent call last\\)"]

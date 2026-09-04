@@ -58,7 +58,7 @@ pub async fn install(no_start: bool) -> Result<()> {
     );
     let config_path = Path::new(DEFAULT_CONFIG_PATH);
     let old_unit = fs::read(UNIT_PATH).ok();
-    let had_config = config_path.is_file();
+    let old_config = fs::read(config_path).ok();
     let had_data = Path::new(DATA_ROOT).is_dir();
     let had_identity = service_identity_exists()?;
     let mut config = if config_path.is_file() {
@@ -66,6 +66,7 @@ pub async fn install(no_start: bool) -> Result<()> {
     } else {
         HubFileConfig::from_install_input()?
     };
+    config.ensure_modern_auth()?;
 
     let _ = farhelm_lifecycle::systemctl(ServiceScope::System, &["stop", UNIT_NAME]);
     ensure_service_identity()?;
@@ -80,9 +81,7 @@ pub async fn install(no_start: bool) -> Result<()> {
     fs::create_dir_all("/etc/farhelm").context("failed to create Hub config directory")?;
     set_mode(Path::new("/etc/farhelm"), 0o750)?;
     chown("root:farhelm-hub", Path::new("/etc/farhelm"))?;
-    if !config_path.is_file() {
-        write_atomic(config_path, config.encode()?.as_bytes(), 0o640)?;
-    }
+    write_atomic(config_path, config.encode()?.as_bytes(), 0o640)?;
     set_mode(config_path, 0o640)?;
     chown("root:farhelm-hub", config_path)?;
     write_atomic(Path::new(UNIT_PATH), UNIT.as_bytes(), 0o644)?;
@@ -101,8 +100,8 @@ pub async fn install(no_start: bool) -> Result<()> {
     if let Err(error) = activation {
         restore_failed_install(
             old_unit.as_deref(),
+            old_config.as_deref(),
             replaced_binary,
-            had_config,
             had_data,
             had_identity,
         )?;
@@ -116,8 +115,8 @@ pub async fn install(no_start: bool) -> Result<()> {
 
 fn restore_failed_install(
     old_unit: Option<&[u8]>,
+    old_config: Option<&[u8]>,
     replaced_binary: bool,
-    had_config: bool,
     had_data: bool,
     had_identity: bool,
 ) -> Result<()> {
@@ -131,7 +130,10 @@ fn restore_failed_install(
     } else {
         remove_regular_file_if_exists(Path::new(BINARY_PATH))?;
     }
-    if !had_config {
+    if let Some(contents) = old_config {
+        write_atomic(Path::new(DEFAULT_CONFIG_PATH), contents, 0o640)?;
+        chown("root:farhelm-hub", Path::new(DEFAULT_CONFIG_PATH))?;
+    } else {
         remove_regular_file_if_exists(Path::new(DEFAULT_CONFIG_PATH))?;
     }
     if !had_data {

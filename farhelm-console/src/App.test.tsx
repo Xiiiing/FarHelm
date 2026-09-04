@@ -13,6 +13,7 @@ const healthy = {
 }
 
 const noAgents = { protocol: 'farhelm/1', agents: [] }
+const session = { authenticated: true, user: 'admin', csrf_token: 'csrf-test', expires_at_unix: 2_000_000_000 }
 
 function mockApi(agentResponse: unknown = noAgents) {
   return vi.fn().mockImplementation((input: RequestInfo | URL) => {
@@ -20,7 +21,7 @@ function mockApi(agentResponse: unknown = noAgents) {
     return Promise.resolve({
       ok: true,
       status: 200,
-      json: () => Promise.resolve(url.endsWith('/api/v1/agents') ? agentResponse : healthy),
+      json: () => Promise.resolve(url.endsWith('/api/v1/auth/session') ? session : url.endsWith('/api/v1/agents') ? agentResponse : healthy),
     })
   })
 }
@@ -35,13 +36,13 @@ describe('FarHelm Console', () => {
     vi.stubGlobal('fetch', mockApi())
     render(<MemoryRouter><App /></MemoryRouter>)
 
-    expect(screen.getByText('正在验证协议与服务状态…')).toBeInTheDocument()
+    expect(screen.getByText('正在恢复安全会话…')).toBeInTheDocument()
     expect(await screen.findByText('在线 · 已验证')).toBeInTheDocument()
     expect(screen.getByText('farhelm/1')).toBeInTheDocument()
   })
 
   it('shows an in-place error when Hub cannot be reached', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('connection refused')))
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((input: RequestInfo | URL) => String(input).endsWith('/api/v1/auth/session') ? Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(session) }) : Promise.reject(new Error('connection refused'))))
     render(<MemoryRouter><App /></MemoryRouter>)
 
     expect(await screen.findByText('Hub 当前不可用')).toBeInTheDocument()
@@ -49,11 +50,11 @@ describe('FarHelm Console', () => {
   })
 
   it('persists an explicit theme choice', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')))
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((input: RequestInfo | URL) => String(input).endsWith('/api/v1/auth/session') ? Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(session) }) : Promise.reject(new Error('offline'))))
     const user = userEvent.setup()
     render(<MemoryRouter><App /></MemoryRouter>)
 
-    await user.click(screen.getByRole('button', { name: '切换到深色主题' }))
+    await user.click(await screen.findByRole('button', { name: '切换到深色主题' }))
     await waitFor(() => expect(localStorage.getItem('farhelm-color-mode')).toBe('dark'))
     expect(document.documentElement.dataset.theme).toBe('dark')
   })

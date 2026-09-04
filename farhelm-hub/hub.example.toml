@@ -4,7 +4,10 @@ database = "/var/lib/farhelm/farhelm.db"
 
 [admin]
 user = "admin"
-password = "replace-with-a-long-random-password"
+password_hash = "$argon2id$generated-by-farhelm-hub-install"
+totp_secret = "BASE32SECRETGENERATEDBYINSTALL"
+recovery_code_hashes = ["$argon2id$generated-by-farhelm-hub-install"]
 
 [agents]
-token = "replace-with-a-random-token-of-at-least-32-characters"
+token = "v0.3-migration-token-heartbeat-and-probe-only"
+tokens = { "gpu-a6000" = "one-random-256-bit-token-per-agent" }

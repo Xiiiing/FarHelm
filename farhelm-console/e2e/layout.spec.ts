@@ -3,6 +3,12 @@ import { expect, test } from '@playwright/test'
 
 test.beforeEach(async ({ page }) => {
   await page.emulateMedia({ reducedMotion: 'reduce' })
+  await page.route('**/api/v1/auth/session', (route) =>
+    route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ authenticated: true, user: 'admin', csrf_token: 'csrf-test', expires_at_unix: 2_000_000_000 }),
+    }),
+  )
   await page.route('**/api/v1/health', (route) =>
     route.fulfill({
       contentType: 'application/json',
@@ -26,6 +32,15 @@ test.beforeEach(async ({ page }) => {
       }),
     }),
   )
+  await page.route('**/api/v1/experiments', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({ protocol: 'farhelm/1', experiments: [{ watch_id: 'watch-a', agent_id: 'gpu-a', project_id: 'cc08', name: 'exp42', pid: 12345, state: 'succeeded', updated_at_unix: 2_000_000_000 }] }),
+  }))
+  await page.route('**/api/v1/codex/sessions', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({ protocol: 'farhelm/1', sessions: [{ session_id: 'ses-a', agent_id: 'gpu-a', project_id: 'cc08', mode: 'inspect', state: 'idle', updated_at_unix: 2_000_000_000 }] }),
+  }))
+  await page.route('**/api/v1/events/stream', (route) => route.fulfill({ status: 200, contentType: 'text/event-stream', body: '' }))
   await page.goto('/')
 })
 
@@ -59,4 +74,30 @@ test('agent page renders validated Hub data', async ({ page }) => {
   await expect(page.getByText('trainer-a')).toBeVisible()
   await expect(page.getByText('gpu-a')).toBeVisible()
   await expect(page.getByText('在线', { exact: true })).toBeVisible()
+})
+
+test('experiment deep link and Codex manual queue use the mobile-safe workflow', async ({ page }) => {
+  await page.goto('/experiments?watch=watch-a')
+  await expect(page.getByRole('heading', { name: '实验' })).toBeVisible()
+  await expect(page.getByText('exp42')).toBeVisible()
+  await expect(page.locator('.agent-row.highlighted')).toHaveCount(1)
+  await expect(page.getByRole('button', { name: /启动|停止|重启/ })).toHaveCount(0)
+
+  let sent: unknown
+  await page.route('**/api/v1/codex/sessions/ses-a/messages', async (route) => {
+    sent = route.request().postDataJSON()
+    await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' })
+  })
+  await page.goto('/codex?session=ses-a')
+  await expect(page.getByText('ses-a').first()).toBeVisible()
+  await page.getByLabel('下一条指令').fill('继续分析结果')
+  await page.getByRole('button', { name: '发送' }).click()
+  await expect.poll(() => sent).toEqual({ prompt: '继续分析结果', delivery: 'queue' })
+})
+
+test('notification page exposes explicit device opt-in', async ({ page }) => {
+  await page.goto('/notifications')
+  await expect(page.getByRole('heading', { name: '通知' })).toBeVisible()
+  await expect(page.getByText(/不包含日志、源码或 prompt/)).toBeVisible()
+  await expect(page.getByRole('button', { name: /启用此设备通知|关闭此设备通知/ })).toBeVisible()
 })

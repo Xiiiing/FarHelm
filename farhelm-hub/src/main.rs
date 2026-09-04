@@ -110,7 +110,9 @@ async fn serve(path: PathBuf) -> Result<()> {
         .with_context(|| format!("failed to bind FarHelm Hub to {address}"))?;
 
     info!(version = PRODUCT_VERSION, %address, "FarHelm Hub is listening");
-    axum::serve(listener, farhelm_hub::app(AppState::new(config)?))
+    let state = AppState::new(config)?;
+    state.spawn_background_tasks();
+    axum::serve(listener, farhelm_hub::app(state))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("FarHelm Hub server failed")?;

@@ -62,14 +62,14 @@ export function Overview({ health, agents, onRefresh }: { health: HubHealth; age
         <Col xs={24} lg={12}>
           <Card title="系统范围" className="status-card">
             <Typography.Paragraph type="secondary">
-              Agent 在线状态来自真实心跳；训练任务与 Codex 会话仍未接入。
+              Agent 在线状态、已登记实验与 Codex 会话均来自真实 Hub 数据。
             </Typography.Paragraph>
             <Space wrap>
               {onlineAgents === undefined && <Tag>Agent 状态不可用</Tag>}
               {onlineAgents === 0 && <Tag>尚无 Agent 心跳</Tag>}
               {onlineAgents !== undefined && onlineAgents > 0 && <Tag color="success">{onlineAgents} 台 Agent 在线</Tag>}
-              <Tag>任务未接入</Tag>
-              <Tag>Codex 未连接</Tag>
+              <Tag>PID 实验监视</Tag>
+              <Tag>Codex 闭环已启用</Tag>
             </Space>
           </Card>
         </Col>

@@ -25,6 +25,17 @@ pub struct AgentFileConfig {
     pub agent: AgentSection,
     #[serde(default)]
     pub worker: WorkerSection,
+    #[serde(default)]
+    pub projects: BTreeMap<String, ProjectSection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectSection {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub success_patterns: Vec<String>,
+    #[serde(default)]
+    pub failure_patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +159,7 @@ impl AgentFileConfig {
                 database,
             },
             worker: WorkerSection::default(),
+            projects: BTreeMap::new(),
         };
         config.validate()?;
         Ok(config)
@@ -179,6 +191,33 @@ impl AgentFileConfig {
             "agent.database is empty"
         );
         ensure!(!self.worker.python.is_empty(), "worker.python is empty");
+        for (project_id, project) in &self.projects {
+            ensure!(
+                !project_id.is_empty()
+                    && project_id.len() <= 64
+                    && project_id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric()
+                            || matches!(byte, b'-' | b'_' | b'.')),
+                "project id {project_id:?} is invalid"
+            );
+            ensure!(
+                project.path.is_absolute(),
+                "project {project_id} path must be absolute"
+            );
+            ensure!(
+                !project.success_patterns.is_empty() && !project.failure_patterns.is_empty(),
+                "project {project_id} must configure success and failure patterns"
+            );
+            for pattern in project
+                .success_patterns
+                .iter()
+                .chain(&project.failure_patterns)
+            {
+                regex::Regex::new(pattern)
+                    .with_context(|| format!("project {project_id} contains an invalid regex"))?;
+            }
+        }
         let url =
             reqwest::Url::parse(&self.agent.hub_url).context("agent.hub_url is not a valid URL")?;
         let local_http = url.scheme() == "http"
@@ -283,7 +322,7 @@ mod tests {
             config: PathBuf::from("/tmp/config/farhelm/agent.toml"),
             data: PathBuf::from("/tmp/data/farhelm"),
             database: PathBuf::from("/tmp/data/farhelm/state/agent.db"),
-            worker: PathBuf::from("/tmp/data/farhelm/runtime/codex-worker/0.3.0"),
+            worker: PathBuf::from("/tmp/data/farhelm/runtime/codex-worker/0.4.0"),
             unit: PathBuf::from("/tmp/config/systemd/user/farhelm-agent.service"),
             legacy_root: PathBuf::from("/tmp/data/farhelm-agent"),
         };
@@ -298,6 +337,7 @@ mod tests {
                 database: paths.database.clone(),
             },
             worker: WorkerSection::default(),
+            projects: BTreeMap::new(),
         };
         let decoded: AgentFileConfig = toml::from_str(&config.encode().unwrap()).unwrap();
         decoded.validate().unwrap();
