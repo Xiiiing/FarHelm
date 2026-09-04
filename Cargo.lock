@@ -587,7 +587,7 @@ checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
 name = "farhelm-agent"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -614,14 +614,14 @@ dependencies = [
 
 [[package]]
 name = "farhelm-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "farhelm-hub"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -653,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "farhelm-lifecycle"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "tempfile",
@@ -661,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "farhelm-protocol"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "farhelm-test-support"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "farhelm-protocol",
  "serde_json",
@@ -679,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "farhelm-updater"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "reqwest",

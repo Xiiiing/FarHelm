@@ -4,14 +4,14 @@
   <p><strong>面向个人科研与 GPU 训练环境的远程控制平面</strong></p>
   <p>从手机查看训练服务器状态，并在不开放训练机入站端口的前提下安全扩展远程控制能力。</p>
   <p>
-    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.4.0">V0.4.0</a> ·
+    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.4.1">V0.4.1</a> ·
     <a href="./deploy/README.md">部署文档</a> ·
     <a href="./README.en.md">English</a>
   </p>
 </div>
 
 > [!IMPORTANT]
-> 当前 `V0.4.0` 提供最小“实验结束 → Codex 下一步”闭环：本地登记 PID、可靠完成事件、按日志标记判断结果、成功时可幂等发送预设 prompt，以及手机端旧/新 Codex 会话与流式回复。它不提供远程训练启停、自动进程扫描、GPU/TensorBoard 图表或任意 shell。
+> 当前 `V0.4.1` 提供最小“实验结束 → Codex 下一步”闭环：本地登记 PID、可靠完成事件、按日志标记判断结果、成功时可幂等发送预设 prompt，以及手机端旧/新 Codex 会话与流式回复。它不提供远程训练启停、自动进程扫描、GPU/TensorBoard 图表或任意 shell。
 
 ## 快速安装
 

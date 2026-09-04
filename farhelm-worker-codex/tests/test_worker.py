@@ -3,13 +3,17 @@ from __future__ import annotations
 import io
 import threading
 from collections.abc import Mapping
+from types import SimpleNamespace
 from typing import Any
+
+from openai_codex.generated.v2_all import AbsolutePathBuf
 
 from farhelm_worker_codex.__main__ import run
 from farhelm_worker_codex.framing import read_frame, write_frame
 from farhelm_worker_codex.worker import (
     CAPABILITIES,
     WORKER_PROTOCOL,
+    CodexBackend,
     Emit,
     _snapshot_agent_text,
     handle_request,
@@ -32,7 +36,7 @@ def test_worker_hello_advertises_implemented_capabilities() -> None:
     assert response["request_id"] == "req_test"
     assert response["result"] == {
         "worker": "farhelm-worker-codex",
-        "version": "0.4.0",
+        "version": "0.4.1",
         "capabilities": CAPABILITIES,
     }
 
@@ -150,6 +154,38 @@ def test_lists_and_resumes_sessions_with_approved_cwd() -> None:
     )
     assert listed["result"]["sessions"][0]["session_id"] == "ses_old"
     assert resumed["result"]["mode"] == "inspect"
+
+
+def test_sdk_absolute_path_root_model_is_used_for_session_filtering() -> None:
+    class FakeClient:
+        def thread_list(self, _params: Mapping[str, Any]) -> SimpleNamespace:
+            thread = SimpleNamespace(
+                id="ses_sdk",
+                name=None,
+                preview="Existing task",
+                cwd=AbsolutePathBuf(root="/srv/project"),
+                created_at=10,
+                updated_at=20,
+            )
+            return SimpleNamespace(data=[thread], next_cursor=None)
+
+    backend: Any = CodexBackend.__new__(CodexBackend)
+    backend._client = FakeClient()
+
+    result = backend.sessions_list("/srv/project")
+
+    assert result == {
+        "sessions": [
+            {
+                "session_id": "ses_sdk",
+                "title": "Existing task",
+                "cwd": "/srv/project",
+                "created_at_unix": 10,
+                "updated_at_unix": 20,
+            }
+        ],
+        "next_cursor": None,
+    }
 
 
 def test_turn_streams_and_preserves_idempotency_key() -> None:

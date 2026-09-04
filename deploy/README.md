@@ -1,4 +1,4 @@
-# FarHelm V0.4.0 部署与生命周期
+# FarHelm V0.4.1 部署与生命周期
 
 [简体中文](README.md) · [English](README.en.md)
 
@@ -22,7 +22,7 @@ sudo env \
   ./farhelm-hub install
 ```
 
-从 V0.3.0 升级 Hub 时，请先备份数据库和配置，再让 V0.4.0 实际二进制执行一次 `install`；它会把明文密码迁移为 Argon2id，并在终端显示 TOTP 密钥和一次性恢复码：
+从 V0.3.0 升级 Hub 时，请先备份数据库和配置，再让 V0.4.1 实际二进制执行一次 `install`；它会把明文密码迁移为 Argon2id，并在终端显示 TOTP 密钥和一次性恢复码：
 
 ```bash
 sudo cp /var/lib/farhelm/farhelm.db /var/lib/farhelm/farhelm.db.v0.3.bak
@@ -85,8 +85,8 @@ chmod +x farhelm-agent
 Agent 会从同版本不可变 Release 下载独立 Python 3.12/Codex runtime，并校验资产长度和 SHA-256。离线安装时，先传输同版本 runtime 资产，再提供受信任的校验元数据：
 
 ```bash
-FARHELM_CODEX_RUNTIME_ARCHIVE="$PWD/farhelm-codex-runtime-0.4.0-linux-x86_64.tar.gz" \
-FARHELM_CODEX_RUNTIME_SIZE="$(stat -c '%s' farhelm-codex-runtime-0.4.0-linux-x86_64.tar.gz)" \
+FARHELM_CODEX_RUNTIME_ARCHIVE="$PWD/farhelm-codex-runtime-0.4.1-linux-x86_64.tar.gz" \
+FARHELM_CODEX_RUNTIME_SIZE="$(stat -c '%s' farhelm-codex-runtime-0.4.1-linux-x86_64.tar.gz)" \
 FARHELM_CODEX_RUNTIME_SHA256="从受信任的SHA256SUMS复制" \
 ./farhelm-agent install
 ```
@@ -147,9 +147,9 @@ farhelm-agent uninstall --keep-data
 
 ## 从 V0.2.0 迁移
 
-已安装 `V0.3.0` 的主机可以直接执行 `farhelm-hub update` 或 `farhelm-agent update`。`V0.2.0` 必须先升级到仍带兼容归档的 `V0.3.0`，完成 `.env` 到 TOML、数据库、unit 和稳定二进制迁移后，再升级到 V0.4.0；V0.4.0 不再重复发布兼容 tar.gz。
+已安装 `V0.3.0` 或 `V0.4.0` 的主机可以直接执行 `farhelm-hub update` 或 `farhelm-agent update`。`V0.2.0` 必须先升级到仍带兼容归档的 `V0.3.0`，完成 `.env` 到 TOML、数据库、unit 和稳定二进制迁移后，再升级到 V0.4.1；V0.4.1 不再重复发布兼容 tar.gz。
 
-旧小写 `v0.1.0/v0.2.0` 不属于正式升级序列，仍需先使用对应旧卸载器清理，再安装 V0.4.0。
+旧小写 `v0.1.0/v0.2.0` 不属于正式升级序列，仍需先使用对应旧卸载器清理，再安装 V0.4.1。
 
 ## 安全说明
 

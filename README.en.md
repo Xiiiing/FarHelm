@@ -4,14 +4,14 @@
   <p><strong>A remote control plane for personal research and GPU training environments</strong></p>
   <p>See training-host status from your phone and safely extend remote control without exposing inbound ports on training machines.</p>
   <p>
-    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.4.0">V0.4.0</a> ·
+    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.4.1">V0.4.1</a> ·
     <a href="./deploy/README.en.md">Deployment guide</a> ·
     <a href="./README.md">简体中文</a>
   </p>
 </div>
 
 > [!IMPORTANT]
-> The current `V0.4.0` release provides the minimum “experiment finished → next Codex step” loop: explicit local PID registration, reliable completion events, log-marker outcome classification, idempotent preset prompts on success, and mobile access to old/new Codex sessions with streamed replies. It does not provide remote training control, automatic process discovery, GPU/TensorBoard charts, or arbitrary shell execution.
+> The current `V0.4.1` release provides the minimum “experiment finished → next Codex step” loop: explicit local PID registration, reliable completion events, log-marker outcome classification, idempotent preset prompts on success, and mobile access to old/new Codex sessions with streamed replies. It does not provide remote training control, automatic process discovery, GPU/TensorBoard charts, or arbitrary shell execution.
 
 ## Quick install
 

@@ -53,13 +53,14 @@ class CodexBackend:
         response = self._client.thread_list({"cwd": project_path, "archived": False, "limit": 100})
         sessions = []
         for thread in response.data:
-            if Path(str(thread.cwd)) != Path(project_path):
+            thread_cwd = _absolute_path(thread.cwd)
+            if Path(thread_cwd) != Path(project_path):
                 continue
             sessions.append(
                 {
                     "session_id": thread.id,
                     "title": thread.name or thread.preview,
-                    "cwd": str(thread.cwd),
+                    "cwd": thread_cwd,
                     "created_at_unix": thread.created_at,
                     "updated_at_unix": thread.updated_at,
                 }
@@ -77,7 +78,7 @@ class CodexBackend:
             session_id,
             {"cwd": cwd, "sandbox": _sandbox(mode), "approvalPolicy": "on-request"},
         )
-        if Path(str(response.thread.cwd)) != Path(cwd):
+        if Path(_absolute_path(response.thread.cwd)) != Path(cwd):
             raise ValueError("session cwd does not match approved project")
         return _thread_result(response.thread)
 
@@ -178,10 +179,29 @@ def _snapshot_agent_text(turn: Mapping[str, Any]) -> str:
 def _thread_result(thread: Any) -> Mapping[str, Any]:
     return {
         "session_id": str(thread.id),
-        "cwd": str(thread.cwd),
+        "cwd": _absolute_path(thread.cwd),
         "title": thread.name or thread.preview,
         "updated_at_unix": int(thread.updated_at),
     }
+
+
+def _absolute_path(value: Any) -> str:
+    """Extract a filesystem path from the SDK's AbsolutePathBuf root model."""
+
+    candidate = value
+    root = getattr(value, "root", None)
+    if root is not None:
+        candidate = root
+    elif hasattr(value, "model_dump"):
+        candidate = value.model_dump(mode="json", by_alias=True)
+    if isinstance(candidate, Mapping):
+        candidate = candidate.get("root")
+    if not isinstance(candidate, (str, Path)):
+        raise ValueError("Codex SDK returned an invalid cwd")
+    path = Path(candidate)
+    if not path.is_absolute():
+        raise ValueError("Codex SDK returned a non-absolute cwd")
+    return str(path)
 
 
 def _model_json(value: Any) -> dict[str, Any]:

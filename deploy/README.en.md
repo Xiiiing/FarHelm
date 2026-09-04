@@ -1,4 +1,4 @@
-# FarHelm V0.4.0 deployment and lifecycle
+# FarHelm V0.4.1 deployment and lifecycle
 
 [简体中文](README.md) · [English](README.en.md)
 
@@ -22,7 +22,7 @@ sudo env \
   ./farhelm-hub install
 ```
 
-When upgrading the Hub from V0.3.0, back up its database and configuration, then run `install` once with the V0.4.0 executable. It migrates the plaintext password to Argon2id and prints the TOTP secret and one-time recovery codes to the terminal:
+When upgrading the Hub from V0.3.0, back up its database and configuration, then run `install` once with the V0.4.1 executable. It migrates the plaintext password to Argon2id and prints the TOTP secret and one-time recovery codes to the terminal:
 
 ```bash
 sudo cp /var/lib/farhelm/farhelm.db /var/lib/farhelm/farhelm.db.v0.3.bak
@@ -85,8 +85,8 @@ chmod +x farhelm-agent
 Agent downloads the independent Python 3.12/Codex runtime from the matching immutable Release and verifies its length and SHA-256. For an offline installation, transfer the matching runtime asset first and provide trusted verification metadata:
 
 ```bash
-FARHELM_CODEX_RUNTIME_ARCHIVE="$PWD/farhelm-codex-runtime-0.4.0-linux-x86_64.tar.gz" \
-FARHELM_CODEX_RUNTIME_SIZE="$(stat -c '%s' farhelm-codex-runtime-0.4.0-linux-x86_64.tar.gz)" \
+FARHELM_CODEX_RUNTIME_ARCHIVE="$PWD/farhelm-codex-runtime-0.4.1-linux-x86_64.tar.gz" \
+FARHELM_CODEX_RUNTIME_SIZE="$(stat -c '%s' farhelm-codex-runtime-0.4.1-linux-x86_64.tar.gz)" \
 FARHELM_CODEX_RUNTIME_SHA256="copy-from-trusted-SHA256SUMS" \
 ./farhelm-agent install
 ```
@@ -147,9 +147,9 @@ farhelm-agent uninstall --keep-data
 
 ## Migrating from V0.2.0
 
-Hosts already on `V0.3.0` can run `farhelm-hub update` or `farhelm-agent update` directly. `V0.2.0` must first upgrade to `V0.3.0`, which retains the compatibility archive needed to migrate `.env`, database state, the unit, and the stable executable, and can then upgrade to V0.4.0. V0.4.0 does not republish compatibility tarballs.
+Hosts already on `V0.3.0` or `V0.4.0` can run `farhelm-hub update` or `farhelm-agent update` directly. `V0.2.0` must first upgrade to `V0.3.0`, which retains the compatibility archive needed to migrate `.env`, database state, the unit, and the stable executable, and can then upgrade to V0.4.1. V0.4.1 does not republish compatibility tarballs.
 
-Lowercase legacy `v0.1.0/v0.2.0` releases are outside the formal update sequence. Remove them with their matching old uninstaller before installing V0.4.0.
+Lowercase legacy `v0.1.0/v0.2.0` releases are outside the formal update sequence. Remove them with their matching old uninstaller before installing V0.4.1.
 
 ## Security notes
 

@@ -112,7 +112,7 @@ enum CommandKind {
         /// Only report whether an update is available.
         #[arg(long)]
         check: bool,
-        /// Install one exact formal version, such as V0.4.0.
+        /// Install one exact formal version, such as V0.4.1.
         #[arg(long)]
         version: Option<String>,
         /// Permit a user-approved first-number version change.
