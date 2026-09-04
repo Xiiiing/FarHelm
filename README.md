@@ -1,94 +1,73 @@
-# FarHelm
+<div align="center">
+  <img src="./farhelm-console/public/farhelm-mark.svg" width="180" height="180" alt="FarHelm Logo">
+  <h1>FarHelm</h1>
+  <p><strong>面向个人科研与 GPU 训练环境的远程控制平面</strong></p>
+  <p>从手机查看训练服务器状态，并在不开放训练机入站端口的前提下安全扩展远程控制能力。</p>
+  <p>
+    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.3.0">V0.3.0</a> ·
+    <a href="./deploy/README.md">部署文档</a> ·
+    <a href="./README.en.md">English</a>
+  </p>
+</div>
 
-[简体中文](README.md) · [English](README.en.md)
+> [!IMPORTANT]
+> 当前 `V0.3.0` 已提供 Hub 健康检查、Agent 心跳与列表、可靠命令状态和无副作用的 `agent.probe`。GPU 指标、训练控制、Codex 会话和 Web Push 仍在路线图中，README 不把规划能力描述成已完成能力。
 
-FarHelm 是一个面向个人科研与 GPU 训练环境的远程控制平面。它把多台训练服务器的状态、训练任务和 Codex 会话汇总到一个移动优先的 Web 控制台中，同时保持训练服务器仅主动出站、源码与凭据留在本机。
+## 快速安装
 
-> 当前状态：`V0.3.0` 角色原生单程序版。下载文件就是实际的 Hub 或 Agent，不再是展开旧安装包的引导器。安装、配置校验、启停、重启、状态、升级、回滚和卸载均由对应程序提供。当前开放动作仍只有无副作用的 `agent.probe`。
+正式程序面向 Ubuntu 24.04 x86_64，或带 systemd、glibc 2.39+ 的兼容系统。下载文件就是实际程序，不需要解压安装包。
 
-## 架构
+### Hub
 
-```mermaid
-flowchart LR
-    Console["farhelm-console\nReact PWA"]
-    Hub["farhelm-hub\nRust control plane + management"]
-    Agent["farhelm-agent\nRust host agent + management"]
-    Worker["farhelm-worker-codex\nprivate Python adapter"]
-
-    Console -->|HTTPS + Basic Auth| Hub
-    Agent -->|outbound HTTPS| Hub
-    Agent -->|framed JSON over stdio| Worker
-```
-
-FarHelm 是一个产品和一个 monorepo，但 Hub 与 Agent 保持不同的权限和攻击面：
-
-| 组件 | 职责 | 技术 |
-| --- | --- | --- |
-| `farhelm-hub` | 公网 API、Console、状态、服务与升级管理 | Rust、Axum、Tokio |
-| `farhelm-agent` | 服务器状态、任务、Worker、服务与升级管理 | Rust、Tokio |
-| `farhelm-console` | 手机与桌面控制台；正式构建嵌入 Hub | React、TypeScript、Ant Design、Vite PWA |
-| `farhelm-worker-codex` | Agent 私有的 Codex SDK 隔离适配层 | Python 3.12、uv |
-
-共享 Rust 类型位于 `crates/`。Worker 不监听网络，也不持有 Hub token。
-
-## 开发快速开始
-
-需要 Rust 1.98、Node.js 24、Corepack、Python 3.12 和 [uv](https://docs.astral.sh/uv/)。
+在公网服务器上执行。下载文件可以放在 `/apps`：
 
 ```bash
-corepack pnpm@10.17.1 --dir farhelm-console install
-uv sync --project farhelm-worker-codex --all-groups
-```
-
-复制 `farhelm-hub/hub.example.toml`，把 `hub.console_dir` 指向 `farhelm-console/dist`，然后启动：
-
-```bash
-corepack pnpm@10.17.1 --dir farhelm-console build
-cargo run -p farhelm-hub -- serve --config /path/to/hub.toml
-```
-
-验证 Hub 和 Worker：
-
-```bash
-cargo run -p farhelm-hub -- health
-cargo run -p farhelm-agent -- worker-smoke
-```
-
-发送一次本机 Agent 心跳：
-
-```bash
-cargo run -p farhelm-agent -- heartbeat --config /path/to/agent.toml
-```
-
-## 下载和安装
-
-正式目标为 Ubuntu 24.04 x86_64，或带 systemd、glibc 2.39+ 的兼容系统。Hub 下载后执行：
-
-```bash
+cd /apps
 curl -fL https://github.com/Xiiiing/FarHelm/releases/latest/download/farhelm-hub-linux-x86_64 -o farhelm-hub
 chmod +x farhelm-hub
 sudo ./farhelm-hub install
 ```
 
-训练服务器使用普通用户安装 Agent，不使用 sudo：
+程序会交互询问管理员用户名、管理员密码和 Agent token。安装后的实际程序位于 `/usr/local/bin/farhelm-hub`。
+
+### Agent
+
+在训练服务器上使用目标普通用户执行，不要使用 sudo：
 
 ```bash
+mkdir -p "$HOME/apps"
+cd "$HOME/apps"
 curl -fL https://github.com/Xiiiing/FarHelm/releases/latest/download/farhelm-agent-linux-x86_64 -o farhelm-agent
 chmod +x farhelm-agent
 ./farhelm-agent install
 ```
 
-缺少配置时程序会交互询问必要值。自动化安装仍可使用 `FARHELM_ADMIN_USER`、`FARHELM_ADMIN_PASSWORD`、`FARHELM_AGENT_TOKEN`、`FARHELM_HUB_URL` 和 `FARHELM_AGENT_ID` 环境变量，秘密不要写在命令行参数中。
+程序会询问 Hub HTTPS 地址、Agent token 和 Agent ID。安装后的实际程序位于 `${XDG_BIN_HOME:-$HOME/.local/bin}/farhelm-agent`；成功后可以删除下载副本。
 
-安装后的统一命令：
+更完整的非交互安装、Caddy、systemd、迁移和卸载说明见[部署文档](deploy/README.md)。
+
+## 日常使用
+
+Hub 与 Agent 各自只有一个面向用户的程序入口：
+
+| 项目 | Hub | Agent |
+| --- | --- | --- |
+| 配置 | `/etc/farhelm/hub.toml` | `${XDG_CONFIG_HOME:-$HOME/.config}/farhelm/agent.toml` |
+| 服务 | systemd 系统服务 | systemd 用户服务 |
+| 权限 | 使用 sudo | 普通用户，不使用 sudo |
+| 日志 | `journalctl -u farhelm-hub` | `journalctl --user -u farhelm-agent` |
 
 ```bash
+# Hub
+sudo farhelm-hub doctor
 sudo farhelm-hub status
 sudo farhelm-hub restart
 sudo farhelm-hub update --check
 sudo farhelm-hub update
 sudo farhelm-hub rollback
 
+# Agent
+farhelm-agent doctor
 farhelm-agent status
 farhelm-agent restart
 farhelm-agent update --check
@@ -96,14 +75,42 @@ farhelm-agent update
 farhelm-agent rollback
 ```
 
-配置位置：
+如果当前 shell 尚未包含 `~/.local/bin`，暂时使用完整路径 `~/.local/bin/farhelm-agent`。升级会验证不可变 Release、长度、SHA-256、角色和版本；激活失败会自动恢复本地 previous。
 
-- Hub：`/etc/farhelm/hub.toml`
-- Agent：`${XDG_CONFIG_HOME:-$HOME/.config}/farhelm/agent.toml`
+## 当前实现
 
-程序位置、配置、数据库、systemd unit、完整卸载和 Caddy 配置见[部署说明](deploy/README.md)。Hub 必须只监听 loopback，并通过 Caddy 或等价 HTTPS 反向代理公开。
+- `farhelm-hub`：Rust 控制平面、Basic Auth、内嵌 Console、SQLite 命令事实源和服务生命周期。
+- `farhelm-agent`：普通用户运行、只主动连接 Hub、心跳、命令 claim/report、本地幂等状态和服务生命周期。
+- `farhelm-console`：React、TypeScript、Ant Design、Vite PWA；正式构建内嵌到 Hub。
+- `farhelm-worker-codex`：Agent 私有的 Python stdio 适配层；当前仅验证协议握手，尚未连接真实 Codex 生命周期。
 
-## 开发检查
+当前远程动作只允许无副作用的 `agent.probe`，不提供任意远程 shell，也不能远程启动或停止训练。
+
+## 架构
+
+```mermaid
+flowchart LR
+    Phone["手机 PWA"] -->|"HTTPS"| Hub["farhelm-hub<br/>公网控制平面"]
+    Agent["farhelm-agent<br/>训练服务器"] -->|"主动出站 HTTPS"| Hub
+    Agent -->|"长度前缀 JSON / stdio"| Worker["私有 Python Worker"]
+```
+
+FarHelm 是一个 monorepo，但 Hub 与 Agent 分离编译并保持不同权限与攻击面。Worker 不监听网络，也不持有 Hub token。
+
+## 本地开发
+
+需要 Rust 1.98、Node.js 24、Corepack、Python 3.12 和 [uv](https://docs.astral.sh/uv/)。
+
+```bash
+corepack pnpm@10.17.1 --dir farhelm-console install
+uv sync --project farhelm-worker-codex --all-groups
+corepack pnpm@10.17.1 --dir farhelm-console build
+cargo run -p farhelm-hub -- serve --config /path/to/hub.toml
+```
+
+示例配置位于 `farhelm-hub/hub.example.toml` 和 `farhelm-agent/agent.example.toml`。
+
+完整检查：
 
 ```bash
 make check
@@ -113,16 +120,14 @@ make test-ui
 make test-release
 ```
 
-## 安全边界
+## 安全与版本规则
 
-- 训练服务器不开放新的公网入站端口，Agent 不需要 root。
-- Hub 拒绝绑定非 loopback 地址；公网 TLS 由反向代理终止。
-- 管理员凭据和 Agent token 相互独立，TOML 配置采用受限权限。
-- Hub 不保存 Codex 登录凭据、SSH 私钥或项目源码。
-- Worker 仅通过 stdin/stdout 与 Agent 通信。
-- 不提供任意远程 shell；写操作必须经过白名单、TTL、幂等和审计。
-- 自升级只接受固定官方仓库中不可变的大写 `V*` Release 和版本化实际二进制；跨第一段版本必须由用户明确允许。
-- `V0.3.0` 保留一次兼容归档，使大写正式序列的 V0.2.0 可迁移；新安装和后续升级不再操作归档目录。
+- Agent 不需要 root，也不开放公网入站端口；Hub 只监听 loopback，由 Caddy 或等价 HTTPS 反向代理公开。
+- 管理员凭据与 Agent token 相互独立，并保存在受限权限的 TOML 配置中。
+- Hub 不保存 Codex 登录凭据、SSH 私钥、项目源码或完整本地日志。
+- Worker 只通过 stdin/stdout 与 Agent 通信；写操作必须经过白名单、TTL、幂等和审计。
+- 版本使用 `MAJOR.MINOR.PATCH`：第一段只能由用户决定，功能提升第二段，纯修复提升第三段。
+- GitHub Releases 只保留最新正式版本；历史 Git 标签保留但不复用。在线更新只升级到最新版本，降级只使用本机 previous。
 
 ## 路线图
 

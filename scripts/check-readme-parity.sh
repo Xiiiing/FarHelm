@@ -3,6 +3,10 @@ set -euo pipefail
 
 for file in README.md README.en.md; do
   test -s "$file"
+  grep -Fq '<div align="center">' "$file"
+  grep -Fq 'farhelm-console/public/farhelm-mark.svg' "$file"
+  grep -Fq 'releases/latest/download/farhelm-hub-linux-x86_64' "$file"
+  grep -Fq 'releases/latest/download/farhelm-agent-linux-x86_64' "$file"
   for component in farhelm-hub farhelm-agent farhelm-console farhelm-worker-codex; do
     grep -q "$component" "$file"
   done
