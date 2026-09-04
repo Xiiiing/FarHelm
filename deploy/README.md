@@ -1,4 +1,4 @@
-# FarHelm V0.4.1 部署与生命周期
+# FarHelm V0.5.0 部署与生命周期
 
 [简体中文](README.md) · [English](README.en.md)
 
@@ -12,17 +12,16 @@ chmod +x farhelm-hub
 sudo ./farhelm-hub install
 ```
 
-缺少配置时会询问管理员用户名、管理员密码和 Agent token，密码与 token 隐藏输入。非交互安装使用环境变量：
+缺少配置时只询问管理员用户名和密码。非交互安装使用环境变量：
 
 ```bash
 sudo env \
   FARHELM_ADMIN_USER="admin" \
   FARHELM_ADMIN_PASSWORD="至少12字符的随机密码" \
-  FARHELM_AGENT_TOKEN="至少32字符的随机token" \
   ./farhelm-hub install
 ```
 
-从 V0.3.0 升级 Hub 时，请先备份数据库和配置，再让 V0.4.1 实际二进制执行一次 `install`；它会把明文密码迁移为 Argon2id，并在终端显示 TOTP 密钥和一次性恢复码：
+V0.4.1 可直接执行 `update` 升级；SQLite 会话、配对和项目表会在重启时幂等创建。旧 TOTP 与 Token 字段保留供本机回滚，但 V0.5.0 不再要求 TOTP。V0.3.0 首次跨代安装前仍建议备份：
 
 ```bash
 sudo cp /var/lib/farhelm/farhelm.db /var/lib/farhelm/farhelm.db.v0.3.bak
@@ -32,7 +31,7 @@ sudo farhelm-hub doctor
 curl -f http://127.0.0.1:8787/api/v1/health
 ```
 
-升级每台 Agent 前，在 `[agents].tokens` 中为其配置独立 token；旧 `[agents].token` 只保留心跳和 `agent.probe` 迁移能力，不能接收 Codex 命令或上传实验事件。
+已有独立 Token 会自动导入数据库，无需重新配对。仍使用旧共享 Token 的 Agent 会标记“需要配对”；在网页创建 8 位码后执行 `farhelm-agent pair`。
 
 Hub 创建并管理：
 
@@ -51,6 +50,8 @@ sudo farhelm-hub doctor
 sudo farhelm-hub restart
 sudo farhelm-hub status
 ```
+
+忘记密码时执行 `sudo farhelm-hub admin reset-password`；它会交互设置新密码并撤销全部浏览器会话。
 
 Hub 仍只监听 `127.0.0.1:8787`。参考仓库中的 `deploy/hub/Caddyfile.example` 配置 Caddy；只向公网开放 80/443。
 
@@ -85,18 +86,17 @@ chmod +x farhelm-agent
 Agent 会从同版本不可变 Release 下载独立 Python 3.12/Codex runtime，并校验资产长度和 SHA-256。离线安装时，先传输同版本 runtime 资产，再提供受信任的校验元数据：
 
 ```bash
-FARHELM_CODEX_RUNTIME_ARCHIVE="$PWD/farhelm-codex-runtime-0.4.1-linux-x86_64.tar.gz" \
-FARHELM_CODEX_RUNTIME_SIZE="$(stat -c '%s' farhelm-codex-runtime-0.4.1-linux-x86_64.tar.gz)" \
+FARHELM_CODEX_RUNTIME_ARCHIVE="$PWD/farhelm-codex-runtime-0.5.0-linux-x86_64.tar.gz" \
+FARHELM_CODEX_RUNTIME_SIZE="$(stat -c '%s' farhelm-codex-runtime-0.5.0-linux-x86_64.tar.gz)" \
 FARHELM_CODEX_RUNTIME_SHA256="从受信任的SHA256SUMS复制" \
 ./farhelm-agent install
 ```
 
-程序依次询问 Hub HTTPS URL、Agent token 和 Agent ID；token 隐藏输入。非交互安装：
+先在网页“服务器 → 添加服务器”生成 8 位码。程序只询问 Hub HTTPS URL 和配对码，独立 Token 自动保存。非交互安装：
 
 ```bash
 FARHELM_HUB_URL="https://你的域名" \
-FARHELM_AGENT_TOKEN="Hub配置中的Agent-token" \
-FARHELM_AGENT_ID="gpu-a" \
+FARHELM_PAIRING_CODE="网页显示的8位码" \
 ./farhelm-agent install
 ```
 
@@ -121,9 +121,12 @@ journalctl --user -u farhelm-agent -n 50 --no-pager
 farhelm-agent update --check
 farhelm-agent update
 farhelm-agent rollback
+farhelm-agent pair
 ```
 
-编辑 token 或 Hub URL 后运行 `farhelm-agent doctor && farhelm-agent restart`。Hub 与 Agent 的 token 必须一致；任何曾出现在聊天或日志中的 token 都应轮换。
+`doctor` 会区分 Hub 不可达、Token 错误、旧共享 Token 和 Worker 故障。凭据恢复时生成新配对码并运行 `farhelm-agent pair`，无需复制或编辑长 Token。
+
+Agent 每 60 秒从 Codex 当前与已归档会话发现项目。网页“一键导入全部”后旧会话自动出现；绝对路径仅保留在 Agent 本地。自动发现的项目默认只启用 Codex，实验自动 prompt 仍需项目专属日志规则。
 
 退出登录或重启后继续运行需要为该用户启用 systemd linger；安装程序会检测并提示。管理员只需执行一次：
 
@@ -147,9 +150,9 @@ farhelm-agent uninstall --keep-data
 
 ## 从 V0.2.0 迁移
 
-已安装 `V0.3.0` 或 `V0.4.0` 的主机可以直接执行 `farhelm-hub update` 或 `farhelm-agent update`。`V0.2.0` 必须先升级到仍带兼容归档的 `V0.3.0`，完成 `.env` 到 TOML、数据库、unit 和稳定二进制迁移后，再升级到 V0.4.1；V0.4.1 不再重复发布兼容 tar.gz。
+已安装 `V0.3.0`、`V0.4.0` 或 `V0.4.1` 的主机可以直接执行 `farhelm-hub update` 或 `farhelm-agent update`。`V0.2.0` 必须先升级到 `V0.3.0` 完成旧布局迁移，再升级到 V0.5.0。
 
-旧小写 `v0.1.0/v0.2.0` 不属于正式升级序列，仍需先使用对应旧卸载器清理，再安装 V0.4.1。
+旧小写 `v0.1.0/v0.2.0` 不属于正式升级序列，仍需先使用对应旧卸载器清理，再安装 V0.5.0。
 
 ## 安全说明
 

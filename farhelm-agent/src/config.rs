@@ -165,6 +165,39 @@ impl AgentFileConfig {
         Ok(config)
     }
 
+    pub fn has_legacy_credentials(paths: &AgentPaths) -> Result<bool> {
+        let legacy = read_legacy_env(&paths.legacy_root.join("config/agent.env"))?;
+        Ok(
+            ["FARHELM_HUB_URL", "FARHELM_AGENT_TOKEN", "FARHELM_AGENT_ID"]
+                .iter()
+                .all(|name| legacy.get(*name).is_some_and(|value| !value.is_empty())),
+        )
+    }
+
+    pub fn from_enrollment(
+        paths: &AgentPaths,
+        hub_url: String,
+        id: String,
+        token: String,
+    ) -> Result<Self> {
+        let database = paths.database.clone();
+        let config = Self {
+            agent: AgentSection {
+                id,
+                hostname: None,
+                hub_url,
+                token,
+                heartbeat_seconds: default_heartbeat(),
+                command_poll_seconds: default_command_poll(),
+                database,
+            },
+            worker: WorkerSection::default(),
+            projects: BTreeMap::new(),
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
             !self.agent.id.is_empty()
@@ -322,7 +355,7 @@ mod tests {
             config: PathBuf::from("/tmp/config/farhelm/agent.toml"),
             data: PathBuf::from("/tmp/data/farhelm"),
             database: PathBuf::from("/tmp/data/farhelm/state/agent.db"),
-            worker: PathBuf::from("/tmp/data/farhelm/runtime/codex-worker/0.4.1"),
+            worker: PathBuf::from("/tmp/data/farhelm/runtime/codex-worker/0.5.0"),
             unit: PathBuf::from("/tmp/config/systemd/user/farhelm-agent.service"),
             legacy_root: PathBuf::from("/tmp/data/farhelm-agent"),
         };

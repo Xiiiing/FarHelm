@@ -64,8 +64,15 @@ fi
 target/debug/farhelm-hub health
 target/debug/farhelm-agent heartbeat --config "$agent_config"
 
+cookie_jar="$smoke_dir/cookies.txt"
+login_response=$(curl --fail --silent --show-error --cookie-jar "$cookie_jar" \
+  --header 'Content-Type: application/json' \
+  --data "{\"username\":\"$FARHELM_ADMIN_USER\",\"password\":\"$FARHELM_ADMIN_PASSWORD\"}" \
+  "$FARHELM_HUB_URL/api/v1/auth/login")
+csrf=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["csrf_token"])' <<<"$login_response")
+
 probe_response=$(curl --fail --silent --show-error \
-  --user "$FARHELM_ADMIN_USER:$FARHELM_ADMIN_PASSWORD" \
+  --cookie "$cookie_jar" --header "X-CSRF-Token: $csrf" \
   --header 'Content-Type: application/json' \
   --data '{"idempotency_key":"smoke-probe-request-0001","ttl_secs":60}' \
   "$FARHELM_HUB_URL/api/v1/agents/smoke-gpu/probe")
@@ -75,7 +82,7 @@ target/debug/farhelm-agent command-poll \
   --config "$agent_config"
 
 command_status=$(curl --fail --silent --show-error \
-  --user "$FARHELM_ADMIN_USER:$FARHELM_ADMIN_PASSWORD" \
+  --cookie "$cookie_jar" \
   "$FARHELM_HUB_URL/api/v1/commands/$command_id")
 if ! grep -q '"state":"completed"' <<<"$command_status"; then
   printf 'Probe command did not reach completed state\n' >&2
@@ -83,7 +90,7 @@ if ! grep -q '"state":"completed"' <<<"$command_status"; then
 fi
 
 duplicate_response=$(curl --fail --silent --show-error \
-  --user "$FARHELM_ADMIN_USER:$FARHELM_ADMIN_PASSWORD" \
+  --cookie "$cookie_jar" --header "X-CSRF-Token: $csrf" \
   --header 'Content-Type: application/json' \
   --data '{"idempotency_key":"smoke-probe-request-0001","ttl_secs":60}' \
   "$FARHELM_HUB_URL/api/v1/agents/smoke-gpu/probe")
@@ -94,7 +101,7 @@ if [[ "$duplicate_id" != "$command_id" ]]; then
 fi
 
 agent_list=$(curl --fail --silent --show-error \
-  --user "$FARHELM_ADMIN_USER:$FARHELM_ADMIN_PASSWORD" \
+  --cookie "$cookie_jar" \
   "$FARHELM_HUB_URL/api/v1/agents")
 if ! grep -q '"agent_id":"smoke-gpu"' <<<"$agent_list"; then
   printf 'Authenticated Agent list did not contain smoke-gpu\n' >&2
@@ -107,7 +114,7 @@ if curl --fail --silent "$FARHELM_HUB_URL/api/v1/agents" >/dev/null 2>&1; then
 fi
 
 curl --fail --silent --show-error \
-  --user "$FARHELM_ADMIN_USER:$FARHELM_ADMIN_PASSWORD" \
+  --cookie "$cookie_jar" \
   "$FARHELM_HUB_URL/agents" | grep -q 'FarHelm smoke'
 
 kill "$hub_pid"
@@ -121,7 +128,7 @@ for _ in $(seq 1 40); do
   sleep 0.25
 done
 persisted_status=$(curl --fail --silent --show-error \
-  --user "$FARHELM_ADMIN_USER:$FARHELM_ADMIN_PASSWORD" \
+  --cookie "$cookie_jar" \
   "$FARHELM_HUB_URL/api/v1/commands/$command_id")
 if ! grep -q '"state":"completed"' <<<"$persisted_status"; then
   printf 'Completed command did not survive Hub restart\n' >&2

@@ -14,6 +14,7 @@ WORKER_NAME = "farhelm-worker-codex"
 PROMPT_LIMIT = 32 * 1024
 CAPABILITIES = [
     "worker.hello",
+    "codex.projects.discover",
     "codex.sessions.list",
     "codex.session.start",
     "codex.session.resume",
@@ -25,7 +26,8 @@ Emit = Callable[[Mapping[str, Any]], None]
 
 
 class Backend(Protocol):
-    def sessions_list(self, project_path: str) -> Mapping[str, Any]: ...
+    def projects_discover(self) -> Mapping[str, Any]: ...
+    def sessions_list(self, project_path: str, archived: str) -> Mapping[str, Any]: ...
     def session_start(self, cwd: str, mode: str) -> Mapping[str, Any]: ...
     def session_resume(self, session_id: str, cwd: str, mode: str) -> Mapping[str, Any]: ...
     def turn_start(
@@ -49,23 +51,71 @@ class CodexBackend:
     def close(self) -> None:
         self._client.close()
 
-    def sessions_list(self, project_path: str) -> Mapping[str, Any]:
-        response = self._client.thread_list({"cwd": project_path, "archived": False, "limit": 100})
-        sessions = []
-        for thread in response.data:
-            thread_cwd = _absolute_path(thread.cwd)
-            if Path(thread_cwd) != Path(project_path):
-                continue
-            sessions.append(
-                {
-                    "session_id": thread.id,
-                    "title": thread.name or thread.preview,
-                    "cwd": thread_cwd,
-                    "created_at_unix": thread.created_at,
-                    "updated_at_unix": thread.updated_at,
-                }
+    def _threads(self, *, archived: bool, cwd: str | None = None) -> list[Any]:
+        threads: list[Any] = []
+        cursor: str | None = None
+        for _ in range(100):
+            request: dict[str, Any] = {"archived": archived, "limit": 100}
+            if cwd is not None:
+                request["cwd"] = cwd
+            if cursor is not None:
+                request["cursor"] = cursor
+            response = self._client.thread_list(request)
+            threads.extend(response.data)
+            next_cursor = response.next_cursor
+            if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
+        return threads
+
+    def projects_discover(self) -> Mapping[str, Any]:
+        projects: dict[str, dict[str, Any]] = {}
+        for archived in (False, True):
+            for thread in self._threads(archived=archived):
+                cwd = _absolute_path(thread.cwd)
+                project = projects.setdefault(
+                    cwd,
+                    {
+                        "cwd": cwd,
+                        "session_count": 0,
+                        "active_session_count": 0,
+                        "archived_session_count": 0,
+                        "updated_at_unix": 0,
+                    },
+                )
+                project["session_count"] += 1
+                counter = "archived_session_count" if archived else "active_session_count"
+                project[counter] += 1
+                project["updated_at_unix"] = max(
+                    int(project["updated_at_unix"]), int(thread.updated_at)
+                )
+        return {
+            "projects": sorted(
+                projects.values(),
+                key=lambda item: (-int(item["updated_at_unix"]), str(item["cwd"])),
             )
-        return {"sessions": sessions, "next_cursor": response.next_cursor}
+        }
+
+    def sessions_list(self, project_path: str, archived: str) -> Mapping[str, Any]:
+        sessions = []
+        archive_values = (False, True) if archived == "all" else (archived == "true",)
+        for is_archived in archive_values:
+            for thread in self._threads(archived=is_archived, cwd=project_path):
+                thread_cwd = _absolute_path(thread.cwd)
+                if Path(thread_cwd) != Path(project_path):
+                    continue
+                sessions.append(
+                    {
+                        "session_id": thread.id,
+                        "title": thread.name or thread.preview,
+                        "cwd": thread_cwd,
+                        "archived": is_archived,
+                        "created_at_unix": thread.created_at,
+                        "updated_at_unix": thread.updated_at,
+                    }
+                )
+        sessions.sort(key=lambda item: (-int(item["updated_at_unix"]), str(item["session_id"])))
+        return {"sessions": sessions, "next_cursor": None}
 
     def session_start(self, cwd: str, mode: str) -> Mapping[str, Any]:
         response = self._client.thread_start(
@@ -292,7 +342,12 @@ def _dispatch(
     method: str, params: Mapping[str, Any], backend: Backend, emit: Emit
 ) -> Mapping[str, Any]:
     if method == "codex.sessions.list":
-        return backend.sessions_list(_absolute(params, "project_path"))
+        archived = str(params.get("archived", "false"))
+        if archived not in {"false", "true", "all"}:
+            raise ValueError("archived must be false, true, or all")
+        return backend.sessions_list(_absolute(params, "project_path"), archived)
+    if method == "codex.projects.discover":
+        return backend.projects_discover()
     if method == "codex.session.start":
         return backend.session_start(_absolute(params, "cwd"), _string(params, "mode"))
     if method == "codex.session.resume":

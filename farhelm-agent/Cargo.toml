@@ -17,6 +17,7 @@ flate2.workspace = true
 libc.workspace = true
 regex.workspace = true
 reqwest.workspace = true
+rand.workspace = true
 rusqlite.workspace = true
 rpassword.workspace = true
 serde.workspace = true

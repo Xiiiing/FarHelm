@@ -9,7 +9,7 @@ use farhelm_lifecycle::{
 use farhelm_protocol::{FARHELM_PROTOCOL, HealthResponse, HealthStatus};
 use farhelm_updater::{Role, Updater};
 
-use crate::config::{DEFAULT_CONFIG_PATH, HubFileConfig, LEGACY_CONFIG_PATH};
+use crate::config::{DEFAULT_CONFIG_PATH, HubFileConfig, LEGACY_CONFIG_PATH, hash_secret};
 
 pub const BINARY_PATH: &str = "/usr/local/bin/farhelm-hub";
 pub const PREVIOUS_PATH: &str = "/usr/local/bin/farhelm-hub.previous";
@@ -162,6 +162,45 @@ pub async fn restart() -> Result<()> {
     let config = HubFileConfig::load(Path::new(DEFAULT_CONFIG_PATH))?;
     restart_and_check(&config).await?;
     println!("FarHelm Hub service restart completed and is healthy.");
+    Ok(())
+}
+
+pub async fn reset_password() -> Result<()> {
+    require_root()?;
+    let path = Path::new(DEFAULT_CONFIG_PATH);
+    let mut config = HubFileConfig::load(path)?;
+    let password = rpassword::prompt_password("New FarHelm administrator password: ")?;
+    let confirmation = rpassword::prompt_password("Repeat the new password: ")?;
+    ensure!(password == confirmation, "passwords do not match");
+    ensure!(
+        password.len() >= 12,
+        "password must contain at least 12 characters"
+    );
+    config.admin.password = None;
+    config.admin.password_hash = Some(hash_secret(&password)?);
+    write_atomic(path, config.encode()?.as_bytes(), 0o640)?;
+    set_mode(path, 0o640)?;
+    chown("root:farhelm-hub", path)?;
+    systemctl_checked(ServiceScope::System, &["stop", UNIT_NAME])?;
+    let revoke_result = (|| {
+        let state = farhelm_hub::AppState::new(config.runtime())?;
+        state.revoke_browser_sessions()
+    })();
+    if let Err(error) = revoke_result {
+        let _ = systemctl_checked(ServiceScope::System, &["start", UNIT_NAME]);
+        return Err(error).context("failed to revoke browser sessions");
+    }
+    for database_file in [
+        config.hub.database.clone(),
+        Path::new(&format!("{}-wal", config.hub.database.display())).to_owned(),
+        Path::new(&format!("{}-shm", config.hub.database.display())).to_owned(),
+    ] {
+        if database_file.exists() {
+            chown("farhelm-hub:farhelm-hub", &database_file)?;
+        }
+    }
+    restart_and_check(&config).await?;
+    println!("FarHelm administrator password changed; all browser sessions were revoked.");
     Ok(())
 }
 

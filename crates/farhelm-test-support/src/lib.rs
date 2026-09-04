@@ -4,7 +4,7 @@ use farhelm_protocol::{HealthResponse, WORKER_PROTOCOL, WorkerResponse};
 
 #[must_use]
 pub fn health_fixture() -> HealthResponse {
-    HealthResponse::hub("0.4.1")
+    HealthResponse::hub("0.5.0")
 }
 
 #[must_use]
@@ -16,7 +16,7 @@ pub fn worker_hello_fixture(request_id: impl Into<String>) -> WorkerResponse {
         ok: true,
         result: Some(serde_json::json!({
             "worker": "farhelm-worker-codex",
-            "version": "0.4.1",
+            "version": "0.5.0",
             "capabilities": ["worker.hello"]
         })),
         error: None,

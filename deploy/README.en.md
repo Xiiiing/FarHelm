@@ -1,4 +1,4 @@
-# FarHelm V0.4.1 deployment and lifecycle
+# FarHelm V0.5.0 deployment and lifecycle
 
 [简体中文](README.md) · [English](README.en.md)
 
@@ -12,17 +12,16 @@ chmod +x farhelm-hub
 sudo ./farhelm-hub install
 ```
 
-When configuration is missing, the program prompts for the admin username, admin password, and Agent token. Password and token input is hidden. For non-interactive installation:
+When configuration is missing, the program asks only for the administrator username and password. For non-interactive installation:
 
 ```bash
 sudo env \
   FARHELM_ADMIN_USER="admin" \
   FARHELM_ADMIN_PASSWORD="a-random-password-of-at-least-12-characters" \
-  FARHELM_AGENT_TOKEN="a-random-token-of-at-least-32-characters" \
   ./farhelm-hub install
 ```
 
-When upgrading the Hub from V0.3.0, back up its database and configuration, then run `install` once with the V0.4.1 executable. It migrates the plaintext password to Argon2id and prints the TOTP secret and one-time recovery codes to the terminal:
+V0.4.1 upgrades directly with `update`; SQLite session, pairing, and project tables are created idempotently on restart. Old TOTP and token fields remain for local rollback, but V0.5.0 does not require TOTP. A backup is still recommended before the first V0.3.0 cross-generation install:
 
 ```bash
 sudo cp /var/lib/farhelm/farhelm.db /var/lib/farhelm/farhelm.db.v0.3.bak
@@ -32,7 +31,7 @@ sudo farhelm-hub doctor
 curl -f http://127.0.0.1:8787/api/v1/health
 ```
 
-Before upgrading each Agent, configure a dedicated token for it under `[agents].tokens`. The old `[agents].token` retains only heartbeat and `agent.probe` migration access; it cannot receive Codex commands or upload experiment events.
+Existing dedicated tokens are imported automatically. Agents still using the shared migration token are marked “Pairing required”; create an eight-digit code in the Console and run `farhelm-agent pair`.
 
 Hub creates and manages:
 
@@ -51,6 +50,8 @@ sudo farhelm-hub doctor
 sudo farhelm-hub restart
 sudo farhelm-hub status
 ```
+
+For a forgotten password, run `sudo farhelm-hub admin reset-password`; it sets a new password interactively and revokes every browser session.
 
 Hub still listens only on `127.0.0.1:8787`. Use `deploy/hub/Caddyfile.example` to configure Caddy and expose only ports 80/443 publicly.
 
@@ -85,18 +86,17 @@ chmod +x farhelm-agent
 Agent downloads the independent Python 3.12/Codex runtime from the matching immutable Release and verifies its length and SHA-256. For an offline installation, transfer the matching runtime asset first and provide trusted verification metadata:
 
 ```bash
-FARHELM_CODEX_RUNTIME_ARCHIVE="$PWD/farhelm-codex-runtime-0.4.1-linux-x86_64.tar.gz" \
-FARHELM_CODEX_RUNTIME_SIZE="$(stat -c '%s' farhelm-codex-runtime-0.4.1-linux-x86_64.tar.gz)" \
+FARHELM_CODEX_RUNTIME_ARCHIVE="$PWD/farhelm-codex-runtime-0.5.0-linux-x86_64.tar.gz" \
+FARHELM_CODEX_RUNTIME_SIZE="$(stat -c '%s' farhelm-codex-runtime-0.5.0-linux-x86_64.tar.gz)" \
 FARHELM_CODEX_RUNTIME_SHA256="copy-from-trusted-SHA256SUMS" \
 ./farhelm-agent install
 ```
 
-The program prompts for the Hub HTTPS URL, Agent token, and Agent ID; token input is hidden. For non-interactive installation:
+First generate an eight-digit code under “Servers → Add server”. The installer asks only for the Hub HTTPS URL and pairing code, then stores its dedicated token automatically. For non-interactive installation:
 
 ```bash
 FARHELM_HUB_URL="https://your-domain" \
-FARHELM_AGENT_TOKEN="the-Agent-token-from-Hub-config" \
-FARHELM_AGENT_ID="gpu-a" \
+FARHELM_PAIRING_CODE="the-eight-digit-code-from-the-Console" \
 ./farhelm-agent install
 ```
 
@@ -121,9 +121,12 @@ journalctl --user -u farhelm-agent -n 50 --no-pager
 farhelm-agent update --check
 farhelm-agent update
 farhelm-agent rollback
+farhelm-agent pair
 ```
 
-After editing the token or Hub URL, run `farhelm-agent doctor && farhelm-agent restart`. Hub and Agent tokens must match. Rotate any token that has appeared in chat or logs.
+`doctor` distinguishes an unreachable Hub, an invalid token, an old shared token, and Worker failure. For credential recovery, create a new pairing code and run `farhelm-agent pair`; no long token needs to be copied or edited.
+
+Every 60 seconds the Agent discovers project candidates from current and archived Codex sessions. Existing sessions appear after “Import all” in the Console. Absolute paths stay local to Agent. Newly discovered projects enable Codex only; experiment automation still requires project-specific log markers.
 
 Continued operation after logout or reboot requires systemd linger for that user. Installation detects and reports this; an administrator only needs to run once:
 
@@ -147,9 +150,9 @@ farhelm-agent uninstall --keep-data
 
 ## Migrating from V0.2.0
 
-Hosts already on `V0.3.0` or `V0.4.0` can run `farhelm-hub update` or `farhelm-agent update` directly. `V0.2.0` must first upgrade to `V0.3.0`, which retains the compatibility archive needed to migrate `.env`, database state, the unit, and the stable executable, and can then upgrade to V0.4.1. V0.4.1 does not republish compatibility tarballs.
+Hosts already on `V0.3.0`, `V0.4.0`, or `V0.4.1` can run `farhelm-hub update` or `farhelm-agent update` directly. `V0.2.0` must first upgrade to `V0.3.0` to migrate the old layout, then upgrade to V0.5.0.
 
-Lowercase legacy `v0.1.0/v0.2.0` releases are outside the formal update sequence. Remove them with their matching old uninstaller before installing V0.4.1.
+Lowercase legacy `v0.1.0/v0.2.0` releases are outside the formal update sequence. Remove them with their matching old uninstaller before installing V0.5.0.
 
 ## Security notes
 

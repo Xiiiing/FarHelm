@@ -8,6 +8,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use farhelm_protocol::{
     AgentEvent, CodexSessionListResponse, CodexSessionMode, CodexSessionState, CodexSessionSummary,
     ExperimentListResponse, ExperimentState, ExperimentSummary, FARHELM_PROTOCOL,
+    ProjectCandidateState, ProjectCandidateSummary, ProjectListResponse,
 };
 use rusqlite::{Connection, Row, params};
 use serde_json::Value;
@@ -34,6 +35,29 @@ pub struct PushDelivery {
 
 pub struct EventStore {
     connection: Mutex<Connection>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredBrowserSession {
+    pub user: String,
+    pub csrf_token: String,
+    pub expires_at_unix: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PairingRecord {
+    pub pairing_id: String,
+    pub agent_id: String,
+    pub attempts: u32,
+    pub expires_at_unix: u64,
+    pub consumed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ArchiveFilter {
+    Current,
+    Archived,
+    All,
 }
 
 impl EventStore {
@@ -98,11 +122,278 @@ impl EventStore {
             CREATE TABLE IF NOT EXISTS auth_recovery_codes (
                 hash TEXT PRIMARY KEY,
                 consumed INTEGER NOT NULL DEFAULT 0 CHECK (consumed IN (0,1))
+            );
+            CREATE TABLE IF NOT EXISTS browser_sessions (
+                token_hash TEXT PRIMARY KEY,
+                user TEXT NOT NULL,
+                csrf_token TEXT NOT NULL,
+                created_at_unix INTEGER NOT NULL,
+                expires_at_unix INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS login_failures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                occurred_at_unix INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS agent_credentials (
+                agent_id TEXT PRIMARY KEY,
+                token_hash TEXT NOT NULL UNIQUE,
+                created_at_unix INTEGER NOT NULL,
+                updated_at_unix INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pairing_codes (
+                pairing_id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                code_hash TEXT NOT NULL UNIQUE,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                expires_at_unix INTEGER NOT NULL,
+                consumed INTEGER NOT NULL DEFAULT 0 CHECK (consumed IN (0,1)),
+                created_at_unix INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pairing_failures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                occurred_at_unix INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS project_candidates (
+                candidate_id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                suggested_project_id TEXT NOT NULL,
+                session_count INTEGER NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('discovered','approved')),
+                updated_at_unix INTEGER NOT NULL,
+                UNIQUE(agent_id,candidate_id)
             );",
         )?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
+    }
+
+    pub fn save_browser_session(
+        &self,
+        token_hash: &str,
+        user: &str,
+        csrf_token: &str,
+        created_at_unix: u64,
+        expires_at_unix: u64,
+    ) -> Result<()> {
+        self.lock()?.execute(
+            "INSERT INTO browser_sessions (token_hash,user,csrf_token,created_at_unix,expires_at_unix) VALUES (?1,?2,?3,?4,?5)",
+            params![token_hash,user,csrf_token,as_i64(created_at_unix)?,as_i64(expires_at_unix)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn browser_session(
+        &self,
+        token_hash: &str,
+        now: u64,
+    ) -> Result<Option<StoredBrowserSession>> {
+        use rusqlite::OptionalExtension;
+        let connection = self.lock()?;
+        connection.execute(
+            "DELETE FROM browser_sessions WHERE expires_at_unix<=?1",
+            [as_i64(now)?],
+        )?;
+        connection
+            .query_row(
+                "SELECT user,csrf_token,expires_at_unix FROM browser_sessions WHERE token_hash=?1",
+                [token_hash],
+                |row| {
+                    Ok(StoredBrowserSession {
+                        user: row.get(0)?,
+                        csrf_token: row.get(1)?,
+                        expires_at_unix: row_u64(row, 2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn delete_browser_session(&self, token_hash: &str) -> Result<bool> {
+        Ok(self.lock()?.execute(
+            "DELETE FROM browser_sessions WHERE token_hash=?1",
+            [token_hash],
+        )? == 1)
+    }
+
+    pub fn revoke_browser_sessions(&self) -> Result<()> {
+        self.lock()?.execute("DELETE FROM browser_sessions", [])?;
+        Ok(())
+    }
+
+    pub fn login_failure_count(&self, now: u64, window_secs: u64) -> Result<u64> {
+        let cutoff = now.saturating_sub(window_secs);
+        let connection = self.lock()?;
+        connection.execute(
+            "DELETE FROM login_failures WHERE occurred_at_unix<?1",
+            [as_i64(cutoff)?],
+        )?;
+        let count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM login_failures", [], |row| row.get(0))?;
+        u64::try_from(count).context("invalid login failure count")
+    }
+
+    pub fn record_login_failure(&self, now: u64) -> Result<()> {
+        self.lock()?.execute(
+            "INSERT INTO login_failures (occurred_at_unix) VALUES (?1)",
+            [as_i64(now)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_login_failures(&self) -> Result<()> {
+        self.lock()?.execute("DELETE FROM login_failures", [])?;
+        Ok(())
+    }
+
+    pub fn import_agent_credential(
+        &self,
+        agent_id: &str,
+        token_hash: &str,
+        now: u64,
+    ) -> Result<()> {
+        self.lock()?.execute(
+            "INSERT OR IGNORE INTO agent_credentials (agent_id,token_hash,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?3)",
+            params![agent_id,token_hash,as_i64(now)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn agent_for_token_hash(&self, token_hash: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        self.lock()?
+            .query_row(
+                "SELECT agent_id FROM agent_credentials WHERE token_hash=?1",
+                [token_hash],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn create_pairing_code(
+        &self,
+        pairing_id: &str,
+        agent_id: &str,
+        code_hash: &str,
+        now: u64,
+        expires_at_unix: u64,
+    ) -> Result<()> {
+        let connection = self.lock()?;
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute(
+            "DELETE FROM pairing_codes WHERE agent_id=?1 AND consumed=0",
+            [agent_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO pairing_codes (pairing_id,agent_id,code_hash,expires_at_unix,created_at_unix) VALUES (?1,?2,?3,?4,?5)",
+            params![pairing_id,agent_id,code_hash,as_i64(expires_at_unix)?,as_i64(now)?],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn pairing_by_hash(&self, code_hash: &str) -> Result<Option<PairingRecord>> {
+        use rusqlite::OptionalExtension;
+        self.lock()?.query_row(
+            "SELECT pairing_id,agent_id,attempts,expires_at_unix,consumed FROM pairing_codes WHERE code_hash=?1",
+            [code_hash],
+            |row| Ok(PairingRecord { pairing_id: row.get(0)?, agent_id: row.get(1)?, attempts: u32::try_from(row.get::<_,i64>(2)?).map_err(conversion(2))?, expires_at_unix: row_u64(row,3)?, consumed: row.get::<_,i64>(4)? != 0 }),
+        ).optional().map_err(Into::into)
+    }
+
+    pub fn consume_pairing_and_set_credential(
+        &self,
+        pairing_id: &str,
+        agent_id: &str,
+        token_hash: &str,
+        now: u64,
+    ) -> Result<bool> {
+        let connection = self.lock()?;
+        let transaction = connection.unchecked_transaction()?;
+        let consumed = transaction.execute(
+            "UPDATE pairing_codes SET consumed=1 WHERE pairing_id=?1 AND agent_id=?2 AND consumed=0 AND attempts<5 AND expires_at_unix>?3",
+            params![pairing_id,agent_id,as_i64(now)?],
+        )? == 1;
+        if consumed {
+            transaction.execute(
+                "INSERT INTO agent_credentials (agent_id,token_hash,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?3)
+                 ON CONFLICT(agent_id) DO UPDATE SET token_hash=excluded.token_hash,updated_at_unix=excluded.updated_at_unix",
+                params![agent_id,token_hash,as_i64(now)?],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(consumed)
+    }
+
+    pub fn pairing_failure_count(&self, now: u64, window_secs: u64) -> Result<u64> {
+        let cutoff = now.saturating_sub(window_secs);
+        let connection = self.lock()?;
+        connection.execute(
+            "DELETE FROM pairing_failures WHERE occurred_at_unix<?1",
+            [as_i64(cutoff)?],
+        )?;
+        let count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM pairing_failures", [], |row| {
+                row.get(0)
+            })?;
+        u64::try_from(count).context("invalid pairing failure count")
+    }
+
+    pub fn record_pairing_failure(&self, now: u64) -> Result<()> {
+        self.lock()?.execute(
+            "INSERT INTO pairing_failures (occurred_at_unix) VALUES (?1)",
+            [as_i64(now)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_pairing_failures(&self) -> Result<()> {
+        self.lock()?.execute("DELETE FROM pairing_failures", [])?;
+        Ok(())
+    }
+
+    pub fn delete_pairing_code(&self, pairing_id: &str) -> Result<bool> {
+        Ok(self.lock()?.execute(
+            "DELETE FROM pairing_codes WHERE pairing_id=?1",
+            [pairing_id],
+        )? == 1)
+    }
+
+    pub fn projects(&self) -> Result<ProjectListResponse> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT candidate_id,agent_id,display_name,suggested_project_id,session_count,state,updated_at_unix FROM project_candidates ORDER BY state,updated_at_unix DESC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(ProjectCandidateSummary {
+                candidate_id: row.get(0)?,
+                agent_id: row.get(1)?,
+                display_name: row.get(2)?,
+                suggested_project_id: row.get(3)?,
+                session_count: row_u64(row, 4)?,
+                state: parse_project_state(&row.get::<_, String>(5)?)?,
+                updated_at_unix: row_u64(row, 6)?,
+            })
+        })?;
+        Ok(ProjectListResponse {
+            protocol: FARHELM_PROTOCOL.to_owned(),
+            projects: rows.collect::<rusqlite::Result<Vec<_>>>()?,
+        })
+    }
+
+    pub fn project_candidate_agent(&self, candidate_id: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        self.lock()?
+            .query_row(
+                "SELECT agent_id FROM project_candidates WHERE candidate_id=?1",
+                [candidate_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn ingest(&self, agent_id: &str, events: &[AgentEvent]) -> Result<Vec<StoredEvent>> {
@@ -172,10 +463,21 @@ impl EventStore {
         })
     }
 
-    pub fn sessions(&self, project: Option<&str>) -> Result<CodexSessionListResponse> {
+    pub fn sessions(
+        &self,
+        project: Option<&str>,
+        archived: ArchiveFilter,
+    ) -> Result<CodexSessionListResponse> {
         let connection = self.lock()?;
-        let sql = "SELECT session_id,agent_id,project_id,mode,state,title,active_turn_id,updated_at_unix FROM codex_sessions WHERE (?1 IS NULL OR project_id=?1) ORDER BY updated_at_unix DESC,session_id DESC";
-        let mut statement = connection.prepare(sql)?;
+        let archive_clause = match archived {
+            ArchiveFilter::Current => " AND state!='archived'",
+            ArchiveFilter::Archived => " AND state='archived'",
+            ArchiveFilter::All => "",
+        };
+        let sql = format!(
+            "SELECT session_id,agent_id,project_id,mode,state,title,active_turn_id,updated_at_unix FROM codex_sessions WHERE (?1 IS NULL OR project_id=?1){archive_clause} ORDER BY updated_at_unix DESC,session_id DESC"
+        );
+        let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map([project], |row| {
             Ok(CodexSessionSummary {
                 session_id: row.get(0)?,
@@ -326,32 +628,6 @@ impl EventStore {
         Ok(())
     }
 
-    pub fn sync_recovery_codes(&self, hashes: &[String]) -> Result<Vec<String>> {
-        let connection = self.lock()?;
-        let transaction = connection.unchecked_transaction()?;
-        for hash in hashes {
-            transaction.execute(
-                "INSERT OR IGNORE INTO auth_recovery_codes (hash) VALUES (?1)",
-                [hash],
-            )?;
-        }
-        let mut statement = transaction
-            .prepare("SELECT hash FROM auth_recovery_codes WHERE consumed=0 ORDER BY rowid")?;
-        let available = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(statement);
-        transaction.commit()?;
-        Ok(available)
-    }
-
-    pub fn consume_recovery_code(&self, hash: &str) -> Result<bool> {
-        Ok(self.lock()?.execute(
-            "UPDATE auth_recovery_codes SET consumed=1 WHERE hash=?1 AND consumed=0",
-            [hash],
-        )? == 1)
-    }
-
     fn lock(&self) -> Result<MutexGuard<'_, Connection>> {
         self.connection
             .lock()
@@ -417,9 +693,76 @@ fn apply_materialized_view(
                 params![session.session_id,agent_id,session.project_id,mode_name(session.mode),session_state_name(session.state),session.title,session.active_turn_id,as_i64(session.updated_at_unix)?],
             )?;
         }
+        "project.discovered" | "project.updated" => {
+            let candidate_id = required_string(&event.payload, "candidate_id")?;
+            let display_name = required_string(&event.payload, "display_name")?;
+            let suggested_project_id = required_string(&event.payload, "suggested_project_id")?;
+            ensure!(
+                candidate_id.len() <= 128
+                    && candidate_id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric()
+                            || matches!(byte, b'-' | b'_' | b'.')),
+                "invalid project candidate ID"
+            );
+            ensure!(
+                display_name.len() <= 255 && !display_name.chars().any(char::is_control),
+                "invalid project display name"
+            );
+            ensure!(
+                suggested_project_id.len() <= 64
+                    && suggested_project_id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric()
+                            || matches!(byte, b'-' | b'_' | b'.')),
+                "invalid suggested project ID"
+            );
+            let session_count = event
+                .payload
+                .get("session_count")
+                .and_then(Value::as_u64)
+                .context("project event missing session_count")?;
+            let state = event
+                .payload
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("discovered");
+            ensure!(
+                matches!(state, "discovered" | "approved"),
+                "invalid project state"
+            );
+            let updated_at_unix = event
+                .payload
+                .get("updated_at_unix")
+                .and_then(Value::as_u64)
+                .unwrap_or(event.created_at_unix);
+            connection.execute(
+                "INSERT INTO project_candidates (candidate_id,agent_id,display_name,suggested_project_id,session_count,state,updated_at_unix)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)
+                 ON CONFLICT(candidate_id) DO UPDATE SET display_name=excluded.display_name,suggested_project_id=excluded.suggested_project_id,session_count=excluded.session_count,state=excluded.state,updated_at_unix=excluded.updated_at_unix
+                 WHERE project_candidates.agent_id=excluded.agent_id AND excluded.updated_at_unix>=project_candidates.updated_at_unix",
+                params![candidate_id,agent_id,display_name,suggested_project_id,as_i64(session_count)?,state,as_i64(updated_at_unix)?],
+            )?;
+        }
         _ => {}
     }
     Ok(())
+}
+
+fn required_string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("event missing {key}"))
+}
+
+fn parse_project_state(value: &str) -> rusqlite::Result<ProjectCandidateState> {
+    match value {
+        "discovered" => Ok(ProjectCandidateState::Discovered),
+        "approved" => Ok(ProjectCandidateState::Approved),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
 }
 
 fn event_from_row(row: &Row<'_>) -> rusqlite::Result<StoredEvent> {
@@ -552,19 +895,63 @@ mod tests {
     }
 
     #[test]
-    fn consumed_recovery_code_stays_consumed() {
+    fn browser_sessions_and_pairing_are_durable_and_one_time() {
         let store = EventStore::open(Path::new(":memory:")).unwrap();
+        store
+            .save_browser_session("token-hash", "admin", "csrf", 10, 100)
+            .unwrap();
         assert_eq!(
-            store.sync_recovery_codes(&["hash-a".into()]).unwrap(),
-            ["hash-a"]
+            store
+                .browser_session("token-hash", 11)
+                .unwrap()
+                .unwrap()
+                .user,
+            "admin"
         );
-        assert!(store.consume_recovery_code("hash-a").unwrap());
-        assert!(!store.consume_recovery_code("hash-a").unwrap());
+        store
+            .create_pairing_code("pair-a", "agent-a", "code-hash", 10, 100)
+            .unwrap();
+        let pairing = store.pairing_by_hash("code-hash").unwrap().unwrap();
+        assert_eq!(pairing.agent_id, "agent-a");
         assert!(
             store
-                .sync_recovery_codes(&["hash-a".into()])
+                .consume_pairing_and_set_credential("pair-a", "agent-a", "agent-token-hash", 11)
                 .unwrap()
-                .is_empty()
         );
+        assert!(
+            !store
+                .consume_pairing_and_set_credential("pair-a", "agent-a", "other-token-hash", 12)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .agent_for_token_hash("agent-token-hash")
+                .unwrap()
+                .as_deref(),
+            Some("agent-a")
+        );
+        store
+            .import_agent_credential("agent-a", "old-config-hash", 13)
+            .unwrap();
+        assert!(
+            store
+                .agent_for_token_hash("old-config-hash")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn project_candidates_materialize_without_a_path() {
+        let store = EventStore::open(Path::new(":memory:")).unwrap();
+        store.ingest("titan", &[AgentEvent {
+            protocol: FARHELM_PROTOCOL.into(), sequence: 1, event_id: "project-1".into(), agent_id: "titan".into(),
+            event_type: "project.discovered".into(), created_at_unix: 10,
+            payload: serde_json::json!({"candidate_id":"candidate-a","display_name":"work831","suggested_project_id":"work831","session_count":14,"state":"discovered","updated_at_unix":10}),
+        }]).unwrap();
+        let projects = store.projects().unwrap();
+        assert_eq!(projects.projects.len(), 1);
+        assert_eq!(projects.projects[0].session_count, 14);
+        assert!(!serde_json::to_string(&projects).unwrap().contains("/work/"));
     }
 }

@@ -57,7 +57,7 @@ function FeatureRoutes({ csrf }: { csrf: string }) {
   return (
     <Routes>
       <Route path="/" element={<Overview health={health} agents={agents} onRefresh={refreshOverview} />} />
-      <Route path="/agents" element={<AgentListPage agents={agents} onRefresh={refreshAgents} />} />
+      <Route path="/agents" element={<AgentListPage csrf={csrf} agents={agents} onRefresh={refreshAgents} />} />
       <Route path="/experiments" element={<ExperimentPage />} />
       <Route path="/jobs" element={<Navigate to="/experiments" replace />} />
       <Route path="/codex" element={<CodexPage csrf={csrf} />} />
@@ -104,7 +104,7 @@ export default function App() {
               <div><strong>FarHelm</strong><span>远程训练控制台</span></div>
             </div>
             <Menu mode="inline" selectedKeys={[location.pathname]} items={desktopItems} onClick={({ key }) => go(key)} />
-            <div className="sider-footer"><Typography.Text type="secondary">V0.4.1 · Experiment → Codex</Typography.Text></div>
+            <div className="sider-footer"><Typography.Text type="secondary">V0.5.0 · Zero-config onboarding</Typography.Text></div>
           </Sider>
         )}
 

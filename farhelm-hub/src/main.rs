@@ -68,6 +68,17 @@ enum CommandKind {
         #[arg(long, default_value = "http://127.0.0.1:8787")]
         hub: String,
     },
+    /// Local administrator account management.
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminCommand {
+    /// Set a new password and revoke every browser session.
+    ResetPassword,
 }
 
 #[tokio::main]
@@ -88,6 +99,9 @@ async fn main() -> Result<()> {
         CommandKind::Rollback => management::rollback().await,
         CommandKind::Uninstall { keep_data } => management::uninstall(keep_data),
         CommandKind::Health { hub } => management::health(&hub).await,
+        CommandKind::Admin {
+            command: AdminCommand::ResetPassword,
+        } => management::reset_password().await,
     }
 }
 

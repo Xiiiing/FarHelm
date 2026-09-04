@@ -20,23 +20,23 @@ use axum::{
     },
     routing::{any, get, post},
 };
-use base64::{
-    Engine as _,
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use constant_time_eq::constant_time_eq;
 use farhelm_core::PRODUCT_VERSION;
 use farhelm_protocol::{
-    AgentEventAck, AgentEventBatch, AgentHeartbeat, AgentHeartbeatAck, AgentListResponse,
-    AgentSummary, CommandAccepted, CommandAction, CommandClaimRequest, CommandClaimResponse,
-    CommandReportRequest, CreateCodexSessionRequest, CreateProbeCommand, FARHELM_PROTOCOL,
-    HealthResponse, PromptDelivery, SendCodexMessageRequest,
+    AgentCredentialState, AgentEnrollRequest, AgentEnrollResponse, AgentEventAck, AgentEventBatch,
+    AgentHeartbeat, AgentHeartbeatAck, AgentListResponse, AgentSummary, CommandAccepted,
+    CommandAction, CommandClaimRequest, CommandClaimResponse, CommandReportRequest,
+    CreateCodexSessionRequest, CreatePairingCodeRequest, CreateProbeCommand,
+    DeletePairingCodeRequest, FARHELM_PROTOCOL, HealthResponse, ImportProjectsRequest,
+    PairingCodeResponse, PromptDelivery, SendCodexMessageRequest,
 };
 use rand::RngCore;
 use reqwest::{Client, redirect::Policy};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::time::Duration;
-use tokio::sync::{Mutex as AsyncMutex, RwLock, broadcast};
+use tokio::sync::{RwLock, broadcast};
 use web_push_native::{
     Auth, WebPushBuilder,
     p256::{
@@ -55,7 +55,7 @@ mod event_store;
 mod typed_command_store;
 
 use command_store::{CommandStore, CreateCommandError, ReportCommandError};
-use event_store::{EventStore, PushDelivery, StoredEvent};
+use event_store::{ArchiveFilter, EventStore, PushDelivery, StoredBrowserSession, StoredEvent};
 use typed_command_store::TypedCommandStore;
 
 #[derive(Clone)]
@@ -86,17 +86,7 @@ pub struct AppState {
     events: Arc<EventStore>,
     event_bus: broadcast::Sender<StoredEvent>,
     typed_commands: Arc<TypedCommandStore>,
-    sessions: Arc<RwLock<BTreeMap<String, BrowserSession>>>,
-    login_failures: Arc<AsyncMutex<Vec<u64>>>,
-    recovery_codes: Arc<AsyncMutex<Vec<String>>>,
     push_client: Client,
-}
-
-#[derive(Clone)]
-struct BrowserSession {
-    user: String,
-    csrf_token: String,
-    expires_at_unix: u64,
 }
 
 #[derive(Clone)]
@@ -110,6 +100,7 @@ struct StoredAgent {
     hostname: String,
     agent_version: String,
     last_seen_unix: u64,
+    credential_state: AgentCredentialState,
 }
 
 #[derive(Serialize)]
@@ -123,7 +114,10 @@ impl AppState {
         let events = EventStore::open(&config.database_path)?;
         let typed_commands = TypedCommandStore::open(&config.database_path)?;
         let (event_bus, _) = broadcast::channel(256);
-        let recovery_codes = events.sync_recovery_codes(&config.recovery_code_hashes)?;
+        let now = unix_time();
+        for (agent_id, token) in &config.agent_tokens {
+            events.import_agent_credential(agent_id, &secret_hash(token), now)?;
+        }
         let push_client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(20))
@@ -137,9 +131,6 @@ impl AppState {
             events: Arc::new(events),
             event_bus,
             typed_commands: Arc::new(typed_commands),
-            sessions: Arc::new(RwLock::new(BTreeMap::new())),
-            login_failures: Arc::new(AsyncMutex::new(Vec::new())),
-            recovery_codes: Arc::new(AsyncMutex::new(recovery_codes)),
             push_client,
         })
     }
@@ -157,6 +148,10 @@ impl AppState {
             }
         });
     }
+
+    pub fn revoke_browser_sessions(&self) -> Result<()> {
+        self.events.revoke_browser_sessions()
+    }
 }
 
 impl HubConfig {
@@ -170,19 +165,9 @@ impl HubConfig {
             self.admin_password.starts_with("$argon2") || self.admin_password.len() >= 12,
             "admin password hash is invalid"
         );
-        if let Some(secret) = &self.admin_totp_secret {
-            ensure!(
-                totp_rs::Secret::Encoded(secret.clone()).to_bytes().is_ok(),
-                "admin.totp_secret is invalid"
-            );
-            ensure!(
-                !self.recovery_code_hashes.is_empty(),
-                "admin recovery codes are missing"
-            );
-        }
         ensure!(
-            self.agent_token.len() >= 32 || !self.agent_tokens.is_empty(),
-            "at least one Agent token is required"
+            self.agent_token.is_empty() || self.agent_token.len() >= 32,
+            "legacy Agent token is invalid"
         );
         for (agent_id, token) in &self.agent_tokens {
             ensure!(
@@ -237,6 +222,11 @@ pub fn app(state: AppState) -> Router {
         .route("/api/v1/auth/logout", post(auth_logout))
         .route("/api/v1/auth/session", get(auth_session))
         .route("/api/v1/agents", get(list_agents))
+        .route(
+            "/api/v1/agents/pairing-codes",
+            post(create_pairing_code).delete(delete_pairing_code),
+        )
+        .route("/api/v1/agent/enroll", post(enroll_agent))
         .route("/api/v1/agents/heartbeat", post(agent_heartbeat))
         .route("/api/v1/agents/{agent_id}/probe", post(create_probe))
         .route("/api/v1/commands/{command_id}", get(command_status))
@@ -244,6 +234,8 @@ pub fn app(state: AppState) -> Router {
         .route("/api/v1/agent/commands/report", post(report_command))
         .route("/api/v1/agent/events", post(agent_events))
         .route("/api/v1/experiments", get(list_experiments))
+        .route("/api/v1/projects", get(list_projects))
+        .route("/api/v1/projects/import", post(import_projects))
         .route(
             "/api/v1/codex/sessions",
             get(list_codex_sessions).post(create_codex_session),
@@ -543,7 +535,11 @@ fn content_type(path: &str) -> &'static str {
 
 async fn authorize(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
     let path = request.uri().path();
-    if path == "/api/v1/health" || path == "/api/v1/auth/login" || !path.starts_with("/api/") {
+    if path == "/api/v1/health"
+        || path == "/api/v1/auth/login"
+        || path == "/api/v1/agent/enroll"
+        || !path.starts_with("/api/")
+    {
         return next.run(request).await;
     }
 
@@ -551,15 +547,16 @@ async fn authorize(State(state): State<AppState>, mut request: Request, next: Ne
         || path == "/api/v1/agent/events"
         || path.starts_with("/api/v1/agent/commands/")
     {
-        if let Some((agent_id, _)) = state
-            .config
-            .agent_tokens
-            .iter()
-            .find(|(_, token)| bearer_matches(request.headers(), token))
-        {
+        if let Some(agent_id) = bearer_token(request.headers()).and_then(|token| {
+            state
+                .events
+                .agent_for_token_hash(&secret_hash(token))
+                .ok()
+                .flatten()
+        }) {
             request
                 .extensions_mut()
-                .insert(AgentIdentity::Dedicated(agent_id.clone()));
+                .insert(AgentIdentity::Dedicated(agent_id));
             return next.run(request).await;
         }
         if !state.config.agent_token.is_empty()
@@ -588,16 +585,15 @@ async fn authorize(State(state): State<AppState>, mut request: Request, next: Ne
         }
         return next.run(request).await;
     }
-    if state.config.admin_totp_secret.is_none()
-        && basic_matches(
-            request.headers(),
-            &state.config.admin_user,
-            &state.config.admin_password,
-        )
-    {
-        return next.run(request).await;
-    }
     unauthorized(false)
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
 }
 
 fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
@@ -606,26 +602,6 @@ fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .is_some_and(|value| secure_eq(value, expected))
-}
-
-fn basic_matches(headers: &HeaderMap, expected_user: &str, expected_password: &str) -> bool {
-    let Some(encoded) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Basic "))
-    else {
-        return false;
-    };
-    let Ok(decoded) = STANDARD.decode(encoded) else {
-        return false;
-    };
-    let Ok(credentials) = std::str::from_utf8(&decoded) else {
-        return false;
-    };
-    let Some((user, password)) = credentials.split_once(':') else {
-        return false;
-    };
-    secure_eq(user, expected_user) & secure_eq(password, expected_password)
 }
 
 fn secure_eq(actual: &str, expected: &str) -> bool {
@@ -657,7 +633,8 @@ async fn health() -> Json<HealthResponse> {
 struct LoginRequest {
     username: String,
     password: String,
-    totp: String,
+    #[serde(default, rename = "totp")]
+    _totp: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -670,42 +647,41 @@ struct SessionResponse {
 
 async fn auth_login(State(state): State<AppState>, Json(request): Json<LoginRequest>) -> Response {
     let now = unix_time();
-    {
-        let mut failures = state.login_failures.lock().await;
-        failures.retain(|timestamp| now.saturating_sub(*timestamp) < 300);
-        if failures.len() >= 5 {
+    match state.events.login_failure_count(now, 300) {
+        Ok(count) if count >= 5 => {
             return api_error(StatusCode::TOO_MANY_REQUESTS, "login_rate_limited");
         }
+        Err(error) => {
+            tracing::error!(%error, "failed to read login rate limit");
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "auth_store_failed");
+        }
+        _ => {}
     }
     let password_ok = verify_secret(&request.password, &state.config.admin_password);
     let user_ok = secure_eq(&request.username, &state.config.admin_user);
-    let second_factor_ok = if password_ok && user_ok {
-        match &state.config.admin_totp_secret {
-            Some(secret) => {
-                verify_totp(secret, &state.config.admin_user, &request.totp)
-                    || consume_recovery_code(&state, &request.totp).await
-            }
-            None => true,
+    if !(password_ok && user_ok) {
+        if let Err(error) = state.events.record_login_failure(now) {
+            tracing::error!(%error, "failed to persist login failure");
         }
-    } else {
-        false
-    };
-    if !(password_ok && user_ok && second_factor_ok) {
-        state.login_failures.lock().await.push(now);
         return unauthorized(false);
     }
-    state.login_failures.lock().await.clear();
+    if let Err(error) = state.events.clear_login_failures() {
+        tracing::error!(%error, "failed to clear login failures");
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "auth_store_failed");
+    }
     let token = random_token();
     let csrf_token = random_token();
-    let expires_at_unix = now + 12 * 60 * 60;
-    state.sessions.write().await.insert(
-        token.clone(),
-        BrowserSession {
-            user: request.username.clone(),
-            csrf_token: csrf_token.clone(),
-            expires_at_unix,
-        },
-    );
+    let expires_at_unix = now + 30 * 24 * 60 * 60;
+    if let Err(error) = state.events.save_browser_session(
+        &secret_hash(&token),
+        &request.username,
+        &csrf_token,
+        now,
+        expires_at_unix,
+    ) {
+        tracing::error!(%error, "failed to persist browser session");
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "auth_store_failed");
+    }
     let mut response = Json(SessionResponse {
         authenticated: true,
         user: request.username,
@@ -716,7 +692,7 @@ async fn auth_login(State(state): State<AppState>, Json(request): Json<LoginRequ
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&format!(
-            "farhelm_session={token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=43200"
+            "farhelm_session={token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=2592000"
         ))
         .expect("session cookie is valid"),
     );
@@ -725,7 +701,7 @@ async fn auth_login(State(state): State<AppState>, Json(request): Json<LoginRequ
 
 async fn auth_logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Some(token) = cookie_value(&headers, "farhelm_session") {
-        state.sessions.write().await.remove(token);
+        let _ = state.events.delete_browser_session(&secret_hash(token));
     }
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().insert(
@@ -750,14 +726,13 @@ async fn auth_session(State(state): State<AppState>, headers: HeaderMap) -> Resp
     }
 }
 
-async fn browser_session(headers: &HeaderMap, state: &AppState) -> Option<BrowserSession> {
+async fn browser_session(headers: &HeaderMap, state: &AppState) -> Option<StoredBrowserSession> {
     let token = cookie_value(headers, "farhelm_session")?;
-    let session = state.sessions.read().await.get(token).cloned()?;
-    if session.expires_at_unix <= unix_time() {
-        state.sessions.write().await.remove(token);
-        return None;
-    }
-    Some(session)
+    state
+        .events
+        .browser_session(&secret_hash(token), unix_time())
+        .ok()
+        .flatten()
 }
 
 fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -786,43 +761,130 @@ fn verify_secret(secret: &str, encoded_or_plain: &str) -> bool {
     secure_eq(secret, encoded_or_plain)
 }
 
-fn verify_totp(secret: &str, account: &str, code: &str) -> bool {
-    let bytes = match totp_rs::Secret::Encoded(secret.to_owned()).to_bytes() {
-        Ok(bytes) => bytes,
-        Err(_) => return false,
-    };
-    totp_rs::TOTP::new(
-        totp_rs::Algorithm::SHA1,
-        6,
-        1,
-        30,
-        bytes,
-        Some("FarHelm".to_owned()),
-        account.to_owned(),
-    )
-    .ok()
-    .and_then(|totp| totp.check_current(code).ok())
-    .unwrap_or(false)
-}
-
-async fn consume_recovery_code(state: &AppState, code: &str) -> bool {
-    let mut codes = state.recovery_codes.lock().await;
-    if let Some(index) = codes.iter().position(|hash| verify_secret(code, hash)) {
-        let hash = codes.remove(index);
-        state.events.consume_recovery_code(&hash).unwrap_or(false)
-    } else {
-        false
-    }
-}
-
 fn random_token() -> String {
     let mut bytes = [0_u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+fn secret_hash(value: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(value.as_bytes()))
+}
+
 async fn api_not_found() -> (StatusCode, Json<ApiError>) {
     (StatusCode::NOT_FOUND, Json(ApiError { error: "not_found" }))
+}
+
+async fn create_pairing_code(
+    State(state): State<AppState>,
+    Json(request): Json<CreatePairingCodeRequest>,
+) -> Response {
+    if !valid_agent_id(&request.agent_id) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_agent_id");
+    }
+    let code = format!("{:08}", rand::random::<u32>() % 100_000_000);
+    let pairing_id = format!("pair_{}", &random_token()[..16]);
+    let now = unix_time();
+    let expires_at_unix = now + 10 * 60;
+    let _ = state.events.clear_pairing_failures();
+    if let Err(error) = state.events.create_pairing_code(
+        &pairing_id,
+        &request.agent_id,
+        &secret_hash(&code),
+        now,
+        expires_at_unix,
+    ) {
+        tracing::error!(%error, agent_id = %request.agent_id, "failed to create pairing code");
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "pairing_store_failed");
+    }
+    Json(PairingCodeResponse {
+        protocol: FARHELM_PROTOCOL.to_owned(),
+        pairing_id,
+        agent_id: request.agent_id,
+        code,
+        expires_at_unix,
+    })
+    .into_response()
+}
+
+async fn delete_pairing_code(
+    State(state): State<AppState>,
+    Json(request): Json<DeletePairingCodeRequest>,
+) -> Response {
+    match state.events.delete_pairing_code(&request.pairing_id) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "pairing_code_not_found"),
+        Err(error) => {
+            tracing::error!(%error, "failed to delete pairing code");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "pairing_store_failed")
+        }
+    }
+}
+
+async fn enroll_agent(
+    State(state): State<AppState>,
+    Json(request): Json<AgentEnrollRequest>,
+) -> Response {
+    let now = unix_time();
+    if request.protocol != FARHELM_PROTOCOL
+        || request.pairing_code.len() != 8
+        || !request
+            .pairing_code
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+        || request.hostname.is_empty()
+        || request.hostname.len() > 255
+        || request.agent_version.is_empty()
+        || request.agent_version.len() > 32
+    {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_enrollment");
+    }
+    if state
+        .events
+        .pairing_failure_count(now, 10 * 60)
+        .unwrap_or(5)
+        >= 5
+    {
+        return api_error(StatusCode::TOO_MANY_REQUESTS, "pairing_rate_limited");
+    }
+    let record = match state
+        .events
+        .pairing_by_hash(&secret_hash(&request.pairing_code))
+    {
+        Ok(Some(record))
+            if !record.consumed && record.attempts < 5 && record.expires_at_unix > now =>
+        {
+            record
+        }
+        _ => {
+            let _ = state.events.record_pairing_failure(now);
+            return unauthorized(false);
+        }
+    };
+    let token = random_token();
+    let transaction_result = state
+        .events
+        .consume_pairing_and_set_credential(
+            &record.pairing_id,
+            &record.agent_id,
+            &secret_hash(&token),
+            now,
+        )
+        .and_then(|consumed| {
+            ensure!(consumed, "pairing code was already consumed");
+            Ok(())
+        });
+    if let Err(error) = transaction_result {
+        tracing::warn!(%error, agent_id = %record.agent_id, "Agent enrollment rejected");
+        return api_error(StatusCode::CONFLICT, "pairing_code_unavailable");
+    }
+    let _ = state.events.clear_pairing_failures();
+    Json(AgentEnrollResponse {
+        protocol: FARHELM_PROTOCOL.to_owned(),
+        agent_id: record.agent_id,
+        token,
+    })
+    .into_response()
 }
 
 async fn agent_heartbeat(
@@ -840,12 +902,17 @@ async fn agent_heartbeat(
         ));
     }
     let now = unix_time();
+    let credential_state = match identity {
+        AgentIdentity::Dedicated(_) => AgentCredentialState::Paired,
+        AgentIdentity::Legacy => AgentCredentialState::NeedsPairing,
+    };
     state.agents.write().await.insert(
         heartbeat.agent_id,
         StoredAgent {
             hostname: heartbeat.hostname,
             agent_version: heartbeat.agent_version,
             last_seen_unix: now,
+            credential_state,
         },
     );
     Ok(Json(AgentHeartbeatAck {
@@ -894,6 +961,7 @@ async fn list_agents(State(state): State<AppState>) -> Json<AgentListResponse> {
             agent_version: stored.agent_version.clone(),
             last_seen_unix: stored.last_seen_unix,
             online: is_online(now, stored.last_seen_unix),
+            credential_state: stored.credential_state,
         })
         .collect();
     Json(AgentListResponse {
@@ -969,16 +1037,71 @@ async fn list_experiments(State(state): State<AppState>) -> Response {
     }
 }
 
+async fn list_projects(State(state): State<AppState>) -> Response {
+    match state.events.projects() {
+        Ok(projects) => Json(projects).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to list project candidates");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "event_store_failed")
+        }
+    }
+}
+
+async fn import_projects(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ImportProjectsRequest>,
+) -> Response {
+    if !valid_agent_id(&request.agent_id)
+        || request.candidate_ids.is_empty()
+        || request.candidate_ids.len() > 100
+        || request
+            .candidate_ids
+            .iter()
+            .any(|id| id.is_empty() || id.len() > 128)
+    {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_project_import");
+    }
+    for candidate_id in &request.candidate_ids {
+        match state.events.project_candidate_agent(candidate_id) {
+            Ok(Some(agent_id)) if agent_id == request.agent_id => {}
+            Ok(_) => return api_error(StatusCode::BAD_REQUEST, "invalid_project_candidate"),
+            Err(error) => {
+                tracing::error!(%error, "failed to validate project candidate");
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "event_store_failed");
+            }
+        }
+    }
+    let Some(key) = idempotency_header(&headers) else {
+        return api_error(StatusCode::BAD_REQUEST, "missing_idempotency_key");
+    };
+    create_typed_response(
+        &state,
+        &request.agent_id,
+        CommandAction::ProjectApprove,
+        serde_json::json!({"candidate_ids": request.candidate_ids}),
+        key,
+        24 * 60 * 60,
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct SessionQuery {
     project: Option<String>,
+    archived: Option<String>,
 }
 
 async fn list_codex_sessions(
     State(state): State<AppState>,
     Query(query): Query<SessionQuery>,
 ) -> Response {
-    match state.events.sessions(query.project.as_deref()) {
+    let archived = match query.archived.as_deref().unwrap_or("false") {
+        "false" => ArchiveFilter::Current,
+        "true" => ArchiveFilter::Archived,
+        "all" => ArchiveFilter::All,
+        _ => return api_error(StatusCode::BAD_REQUEST, "invalid_archive_filter"),
+    };
+    match state.events.sessions(query.project.as_deref(), archived) {
         Ok(sessions) => Json(sessions).into_response(),
         Err(error) => {
             tracing::error!(%error, "failed to list Codex sessions");
@@ -1504,7 +1627,7 @@ mod tests {
     use super::*;
 
     fn test_state() -> AppState {
-        AppState::new(HubConfig {
+        let state = AppState::new(HubConfig {
             admin_user: "admin".to_owned(),
             admin_password: "correct-horse".to_owned(),
             admin_totp_secret: None,
@@ -1515,29 +1638,38 @@ mod tests {
             console_dir: Some(PathBuf::from("missing-test-console")),
             database_path: PathBuf::from(":memory:"),
         })
-        .unwrap()
+        .unwrap();
+        state
+            .events
+            .save_browser_session(
+                &secret_hash("test-session"),
+                "admin",
+                "test-csrf",
+                1,
+                u64::MAX / 2,
+            )
+            .unwrap();
+        state
     }
 
     #[tokio::test]
-    async fn password_totp_cookie_and_csrf_form_one_session_boundary() {
-        let secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_owned();
-        let mut config = test_state().config.as_ref().clone();
-        config.admin_totp_secret = Some(secret.clone());
-        config.recovery_code_hashes = vec!["recovery-code".to_owned()];
-        let router = app(AppState::new(config).unwrap());
-        let code = totp_rs::TOTP::new(
-            totp_rs::Algorithm::SHA1,
-            6,
-            1,
-            30,
-            totp_rs::Secret::Encoded(secret).to_bytes().unwrap(),
-            Some("FarHelm".to_owned()),
-            "admin".to_owned(),
-        )
-        .unwrap()
-        .generate_current()
-        .unwrap();
-        let response = router.clone().oneshot(Request::builder().method("POST").uri("/api/v1/auth/login").header(header::CONTENT_TYPE,"application/json").body(Body::from(serde_json::json!({"username":"admin","password":"correct-horse","totp":code}).to_string())).unwrap()).await.unwrap();
+    async fn password_cookie_and_csrf_form_one_persistent_session_boundary() {
+        let router = app(test_state());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"username":"admin","password":"correct-horse"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let cookie = response
             .headers()
@@ -1593,13 +1725,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_session_survives_hub_state_recreation() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hub.db");
+        let config = HubConfig {
+            database_path: database,
+            ..test_state().config.as_ref().clone()
+        };
+        let first = app(AppState::new(config.clone()).unwrap());
+        let login = first
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"username":"admin","password":"correct-horse"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cookie = login
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let restored = app(AppState::new(config).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/session")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(restored.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn pairing_code_is_bound_one_time_and_returns_a_scoped_token() {
+        let state = test_state();
+        let router = app(state);
+        let created = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/agents/pairing-codes")
+                    .header(header::COOKIE, browser_cookie())
+                    .header("x-csrf-token", "test-csrf")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"agent_id":"titan"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let value: serde_json::Value =
+            serde_json::from_slice(&to_bytes(created.into_body(), 4096).await.unwrap()).unwrap();
+        let code = value["code"].as_str().unwrap();
+        assert_eq!(code.len(), 8);
+        let body = serde_json::json!({"protocol":FARHELM_PROTOCOL,"pairing_code":code,"hostname":"titan-rtx","agent_version":"0.5.0"}).to_string();
+        let enrolled = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/agent/enroll")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(enrolled.status(), StatusCode::OK);
+        let enrollment: AgentEnrollResponse =
+            serde_json::from_slice(&to_bytes(enrolled.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(enrollment.agent_id, "titan");
+        assert!(enrollment.token.len() >= 32);
+        let replay = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/agent/enroll")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+        let heartbeat = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/agents/heartbeat")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", enrollment.token),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&AgentHeartbeat::new("titan", "titan-rtx", "0.5.0"))
+                            .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(heartbeat.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn dedicated_agent_events_are_deduplicated_and_materialized() {
         let mut config = test_state().config.as_ref().clone();
         config.agent_tokens.insert(
             "gpu-a".to_owned(),
             "dedicated-agent-token-with-32-characters".to_owned(),
         );
-        let router = app(AppState::new(config).unwrap());
+        let state = AppState::new(config).unwrap();
+        state
+            .events
+            .save_browser_session(
+                &secret_hash("test-session"),
+                "admin",
+                "test-csrf",
+                1,
+                u64::MAX / 2,
+            )
+            .unwrap();
+        let router = app(state);
         let event = AgentEvent {
             protocol: FARHELM_PROTOCOL.to_owned(),
             event_id: "watch-1:succeeded".to_owned(),
@@ -1639,7 +1902,8 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/experiments")
-                    .header(header::AUTHORIZATION, basic_header())
+                    .header(header::COOKIE, browser_cookie())
+                    .header("x-csrf-token", "test-csrf")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1651,8 +1915,8 @@ mod tests {
         assert_eq!(value["experiments"][0]["state"], "succeeded");
     }
 
-    fn basic_header() -> String {
-        format!("Basic {}", STANDARD.encode("admin:correct-horse"))
+    fn browser_cookie() -> String {
+        "farhelm_session=test-session".to_owned()
     }
 
     #[tokio::test]
@@ -1733,7 +1997,8 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/agents")
-                    .header(header::AUTHORIZATION, basic_header())
+                    .header(header::COOKIE, browser_cookie())
+                    .header("x-csrf-token", "test-csrf")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1766,7 +2031,8 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/agents")
-                    .header(header::AUTHORIZATION, basic_header())
+                    .header(header::COOKIE, browser_cookie())
+                    .header("x-csrf-token", "test-csrf")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1784,7 +2050,8 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/missing")
-                    .header(header::AUTHORIZATION, basic_header())
+                    .header(header::COOKIE, browser_cookie())
+                    .header("x-csrf-token", "test-csrf")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1880,7 +2147,8 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/agents/gpu-a/probe")
-                    .header(header::AUTHORIZATION, basic_header())
+                    .header(header::COOKIE, browser_cookie())
+                    .header("x-csrf-token", "test-csrf")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&CreateProbeCommand {
@@ -1967,7 +2235,8 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!("/api/v1/commands/{}", accepted.command_id))
-                    .header(header::AUTHORIZATION, basic_header())
+                    .header(header::COOKIE, browser_cookie())
+                    .header("x-csrf-token", "test-csrf")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2007,7 +2276,8 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/agents/gpu-a/probe")
-                    .header(header::AUTHORIZATION, basic_header())
+                    .header(header::COOKIE, browser_cookie())
+                    .header("x-csrf-token", "test-csrf")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(create_body))
                     .unwrap(),
@@ -2076,7 +2346,8 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/agents/gpu-a/probe")
-                    .header(header::AUTHORIZATION, basic_header())
+                    .header(header::COOKIE, browser_cookie())
+                    .header("x-csrf-token", "test-csrf")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&CreateProbeCommand {
@@ -2101,7 +2372,8 @@ mod tests {
                     Request::builder()
                         .method("POST")
                         .uri(format!("/api/v1/agents/{agent_id}/probe"))
-                        .header(header::AUTHORIZATION, basic_header())
+                        .header(header::COOKIE, browser_cookie())
+                        .header("x-csrf-token", "test-csrf")
                         .header(header::CONTENT_TYPE, "application/json")
                         .body(Body::from(
                             serde_json::to_vec(&CreateProbeCommand {

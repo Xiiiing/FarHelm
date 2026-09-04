@@ -1,10 +1,15 @@
-use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command, time::Duration};
+use std::{
+    fs, io::IsTerminal, os::unix::fs::PermissionsExt, path::Path, process::Command, time::Duration,
+};
 
 use anyhow::{Context, Result, ensure};
 use farhelm_core::PRODUCT_VERSION;
 use farhelm_lifecycle::{
     ServiceScope, install_binary, is_root, remove_regular_file_if_exists, service_is_active,
     swap_with_previous, systemctl_checked, write_atomic,
+};
+use farhelm_protocol::{
+    AgentEnrollRequest, AgentEnrollResponse, AgentEventBatch, AgentHeartbeat, FARHELM_PROTOCOL,
 };
 use farhelm_updater::{Role, Updater};
 
@@ -24,8 +29,10 @@ pub async fn install(no_service: bool) -> Result<()> {
     let had_data = paths.data.is_dir();
     let mut config = if paths.config.is_file() {
         AgentFileConfig::load(&paths.config)?
-    } else {
+    } else if AgentFileConfig::has_legacy_credentials(&paths)? {
         AgentFileConfig::from_install_input(&paths)?
+    } else {
+        enroll_interactive(&paths, None).await?
     };
     let _ = farhelm_lifecycle::systemctl(ServiceScope::User, &["stop", UNIT_NAME]);
     migrate_legacy_database(&paths, &mut config)?;
@@ -43,6 +50,10 @@ pub async fn install(no_service: bool) -> Result<()> {
         .into_owned();
     let current = std::env::current_exe().context("failed to locate current Agent executable")?;
     let replaced_binary = install_binary(&current, &paths.binary, &paths.previous)?;
+    if let Some(parent) = paths.config.parent() {
+        fs::create_dir_all(parent)?;
+        set_mode(parent, 0o700)?;
+    }
     write_atomic(&paths.config, config.encode()?.as_bytes(), 0o600)?;
     set_mode(&paths.config, 0o600)?;
 
@@ -142,7 +153,7 @@ pub fn status() -> Result<()> {
     }
 }
 
-pub fn doctor(config_path: Option<&Path>) -> Result<(AgentFileConfig, AgentPaths)> {
+pub async fn doctor(config_path: Option<&Path>) -> Result<(AgentFileConfig, AgentPaths)> {
     require_user()?;
     let paths = AgentPaths::discover()?;
     let path = config_path.unwrap_or(&paths.config);
@@ -150,17 +161,206 @@ pub fn doctor(config_path: Option<&Path>) -> Result<(AgentFileConfig, AgentPaths
     let mode = fs::metadata(path)?.permissions().mode() & 0o777;
     ensure!(mode & 0o077 == 0, "Agent config must use mode 0600");
     let python_ok = Command::new(&config.worker.python)
-        .arg("--version")
+        .args(["-c", "import openai_codex"])
         .output()
         .is_ok_and(|output| output.status.success());
     ensure!(
         python_ok,
-        "Worker Python `{}` is unavailable",
+        "Codex Worker dependency is unavailable in `{}`; run `farhelm-agent install` to repair it",
         config.worker.python
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let heartbeat_url = format!(
+        "{}/api/v1/agents/heartbeat",
+        config.agent.hub_url.trim_end_matches('/')
+    );
+    let heartbeat = client
+        .post(&heartbeat_url)
+        .bearer_auth(&config.agent.token)
+        .json(&AgentHeartbeat::new(
+            &config.agent.id,
+            config.agent.hostname.clone().unwrap_or_else(local_hostname),
+            PRODUCT_VERSION,
+        ))
+        .send()
+        .await
+        .with_context(|| format!("Hub is unreachable at {heartbeat_url}"))?;
+    match heartbeat.status() {
+        reqwest::StatusCode::UNAUTHORIZED => anyhow::bail!(
+            "Agent token is invalid; create a pairing code in the Console and run `farhelm-agent pair`"
+        ),
+        reqwest::StatusCode::FORBIDDEN => {
+            anyhow::bail!("Agent token belongs to another Agent ID; run `farhelm-agent pair`")
+        }
+        status if !status.is_success() => {
+            anyhow::bail!("Hub heartbeat check failed with HTTP {status}")
+        }
+        _ => {}
+    }
+    let event_url = format!(
+        "{}/api/v1/agent/events",
+        config.agent.hub_url.trim_end_matches('/')
+    );
+    let event_response = client
+        .post(&event_url)
+        .bearer_auth(&config.agent.token)
+        .json(&AgentEventBatch {
+            protocol: FARHELM_PROTOCOL.to_owned(),
+            agent_id: config.agent.id.clone(),
+            events: Vec::new(),
+        })
+        .send()
+        .await
+        .context("Hub event authentication check failed")?;
+    if event_response.status() == reqwest::StatusCode::FORBIDDEN {
+        anyhow::bail!(
+            "Agent is using the old shared token; create a pairing code in the Console and run `farhelm-agent pair`"
+        );
+    }
+    ensure!(
+        event_response.status() == reqwest::StatusCode::BAD_REQUEST,
+        "Hub event check failed with HTTP {}",
+        event_response.status()
     );
     println!("FarHelm Agent {PRODUCT_VERSION} configuration is valid.");
     println!("Worker runtime: {}", paths.worker.display());
     Ok((config, paths))
+}
+
+pub async fn pair() -> Result<()> {
+    require_user()?;
+    let paths = AgentPaths::discover()?;
+    let existing = paths
+        .config
+        .is_file()
+        .then(|| AgentFileConfig::load(&paths.config))
+        .transpose()?;
+    let mut enrolled = enroll_interactive(
+        &paths,
+        existing
+            .as_ref()
+            .map(|config| config.agent.hub_url.as_str()),
+    )
+    .await?;
+    if let Some(existing) = existing {
+        enrolled.worker = existing.worker;
+        enrolled.projects = existing.projects;
+        enrolled.agent.database = existing.agent.database;
+        enrolled.agent.hostname = existing.agent.hostname;
+        enrolled.agent.heartbeat_seconds = existing.agent.heartbeat_seconds;
+        enrolled.agent.command_poll_seconds = existing.agent.command_poll_seconds;
+    }
+    if let Some(parent) = paths.config.parent() {
+        fs::create_dir_all(parent)?;
+        set_mode(parent, 0o700)?;
+    }
+    write_atomic(&paths.config, enrolled.encode()?.as_bytes(), 0o600)?;
+    set_mode(&paths.config, 0o600)?;
+    if service_is_active(ServiceScope::User, UNIT_NAME)? {
+        restart_and_check().await?;
+    }
+    println!(
+        "FarHelm Agent paired as {} and stored its credential privately.",
+        enrolled.agent.id
+    );
+    Ok(())
+}
+
+async fn enroll_interactive(
+    paths: &AgentPaths,
+    existing_hub: Option<&str>,
+) -> Result<AgentFileConfig> {
+    let hub_url = match std::env::var("FARHELM_HUB_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| existing_hub.map(str::to_owned))
+    {
+        Some(value) => value,
+        None => prompt_value("Hub HTTPS address: ", false)?,
+    };
+    let pairing_code = match std::env::var("FARHELM_PAIRING_CODE")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => value,
+        None => prompt_value("8-digit pairing code: ", true)?,
+    };
+    let parsed = reqwest::Url::parse(&hub_url).context("Hub address is not a valid URL")?;
+    let local_http = parsed.scheme() == "http"
+        && parsed
+            .host_str()
+            .is_some_and(|host| matches!(host, "127.0.0.1" | "::1" | "localhost"));
+    ensure!(
+        parsed.scheme() == "https" || local_http,
+        "Hub address must use HTTPS"
+    );
+    ensure!(
+        pairing_code.len() == 8 && pairing_code.bytes().all(|byte| byte.is_ascii_digit()),
+        "pairing code must contain exactly 8 digits"
+    );
+    let endpoint = format!("{}/api/v1/agent/enroll", hub_url.trim_end_matches('/'));
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()?
+        .post(&endpoint)
+        .json(&AgentEnrollRequest {
+            protocol: FARHELM_PROTOCOL.to_owned(),
+            pairing_code,
+            hostname: local_hostname(),
+            agent_version: PRODUCT_VERSION.to_owned(),
+        })
+        .send()
+        .await
+        .with_context(|| format!("failed to reach Hub enrollment endpoint {endpoint}"))?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        anyhow::bail!("pairing code is incorrect, expired, or already used")
+    }
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        anyhow::bail!("too many pairing attempts; create a new code in the Console")
+    }
+    let response = response
+        .error_for_status()
+        .context("Hub rejected Agent enrollment")?
+        .json::<AgentEnrollResponse>()
+        .await
+        .context("Hub returned an invalid enrollment response")?;
+    ensure!(
+        response.protocol == FARHELM_PROTOCOL,
+        "Hub enrollment protocol mismatch"
+    );
+    AgentFileConfig::from_enrollment(paths, hub_url, response.agent_id, response.token)
+}
+
+fn prompt_value(prompt: &str, hidden: bool) -> Result<String> {
+    ensure!(
+        std::io::stdin().is_terminal(),
+        "interactive pairing input is unavailable; set FARHELM_HUB_URL and FARHELM_PAIRING_CODE"
+    );
+    let value = if hidden {
+        rpassword::prompt_password(prompt)?
+    } else {
+        eprint!("{prompt}");
+        let mut value = String::new();
+        std::io::stdin().read_line(&mut value)?;
+        value.trim().to_owned()
+    };
+    ensure!(!value.is_empty(), "pairing input is empty");
+    Ok(value)
+}
+
+fn local_hostname() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "farhelm-agent".to_owned())
 }
 
 pub async fn update(check: bool, requested: Option<&str>, allow_major: bool) -> Result<()> {
@@ -406,7 +606,7 @@ mod tests {
             config: "/tmp/home/.config/farhelm/agent.toml".into(),
             data: "/tmp/home/.local/share/farhelm".into(),
             database: "/tmp/home/.local/share/farhelm/state/agent.db".into(),
-            worker: "/tmp/home/.local/share/farhelm/runtime/codex-worker/0.4.1".into(),
+            worker: "/tmp/home/.local/share/farhelm/runtime/codex-worker/0.5.0".into(),
             unit: "/tmp/home/.config/systemd/user/farhelm-agent.service".into(),
             legacy_root: "/tmp/home/.local/share/farhelm-agent".into(),
         };

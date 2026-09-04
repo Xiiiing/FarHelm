@@ -6,6 +6,7 @@ export type AgentSummary = {
   agent_version: string
   last_seen_unix: number
   online: boolean
+  credential_state: 'paired' | 'legacy' | 'needs_pairing'
 }
 
 export type AgentListResponse = {
@@ -23,8 +24,23 @@ function isAgentSummary(value: unknown): value is AgentSummary {
     typeof agent.last_seen_unix === 'number' &&
     Number.isSafeInteger(agent.last_seen_unix) &&
     agent.last_seen_unix >= 0 &&
-    typeof agent.online === 'boolean'
+    typeof agent.online === 'boolean' &&
+    ['paired', 'legacy', 'needs_pairing'].includes(agent.credential_state ?? 'paired')
   )
+}
+
+export type PairingCode = { protocol: string; pairing_id: string; agent_id: string; code: string; expires_at_unix: number }
+
+export async function createPairingCode(csrf: string, agentId: string): Promise<PairingCode> {
+  const response = await fetch('/api/v1/agents/pairing-codes', {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf },
+    body: JSON.stringify({ agent_id: agentId }),
+  })
+  if (!response.ok) throw new Error(`Hub 创建配对码失败（HTTP ${response.status}）`)
+  const value = await response.json() as PairingCode
+  if (value.protocol !== PROTOCOL_VERSION || !/^\d{8}$/.test(value.code)) throw new Error('Hub 返回了无效配对码')
+  return value
 }
 
 export async function fetchAgents(signal?: AbortSignal): Promise<AgentListResponse> {

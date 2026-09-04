@@ -16,12 +16,12 @@ export async function readSession(): Promise<BrowserSession | null> {
   return value as BrowserSession
 }
 
-export async function login(username: string, password: string, totp: string): Promise<BrowserSession> {
+export async function login(username: string, password: string): Promise<BrowserSession> {
   const response = await fetch('/api/v1/auth/login', {
     method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password, totp }),
+    body: JSON.stringify({ username, password }),
   })
-  if (!response.ok) throw new Error(response.status === 429 ? '登录尝试过多，请稍后再试' : '用户名、密码或验证码不正确')
+  if (!response.ok) throw new Error(response.status === 429 ? '登录尝试过多，请稍后再试' : '用户名或密码不正确')
   const session = (await response.json()) as BrowserSession
   if (session.authenticated !== true || typeof session.csrf_token !== 'string') throw new Error('Hub returned an invalid session')
   return session

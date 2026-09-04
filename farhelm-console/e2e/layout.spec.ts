@@ -27,6 +27,7 @@ test.beforeEach(async ({ page }) => {
             agent_version: '0.1.0',
             last_seen_unix: Math.floor(Date.now() / 1000),
             online: true,
+            credential_state: 'paired',
           },
         ],
       }),
@@ -36,7 +37,8 @@ test.beforeEach(async ({ page }) => {
     contentType: 'application/json',
     body: JSON.stringify({ protocol: 'farhelm/1', experiments: [{ watch_id: 'watch-a', agent_id: 'gpu-a', project_id: 'cc08', name: 'exp42', pid: 12345, state: 'succeeded', updated_at_unix: 2_000_000_000 }] }),
   }))
-  await page.route('**/api/v1/codex/sessions', (route) => route.fulfill({
+  await page.route('**/api/v1/projects', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ protocol: 'farhelm/1', projects: [] }) }))
+  await page.route('**/api/v1/codex/sessions?*', (route) => route.fulfill({
     contentType: 'application/json',
     body: JSON.stringify({ protocol: 'farhelm/1', sessions: [{ session_id: 'ses-a', agent_id: 'gpu-a', project_id: 'cc08', mode: 'inspect', state: 'idle', updated_at_unix: 2_000_000_000 }] }),
   }))
@@ -74,6 +76,19 @@ test('agent page renders validated Hub data', async ({ page }) => {
   await expect(page.getByText('trainer-a')).toBeVisible()
   await expect(page.getByText('gpu-a')).toBeVisible()
   await expect(page.getByText('在线', { exact: true })).toBeVisible()
+})
+
+test('server pairing and project import need no long token or path', async ({ page }) => {
+  await page.route('**/api/v1/agents/pairing-codes', async (route) => {
+    expect(route.request().postDataJSON()).toEqual({ agent_id: 'titan' })
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ protocol: 'farhelm/1', pairing_id: 'pair-a', agent_id: 'titan', code: '12345678', expires_at_unix: 2_000_000_000 }) })
+  })
+  await page.goto('/agents')
+  await page.getByRole('button', { name: '添加服务器' }).click()
+  await page.getByLabel('Agent 名称').fill('titan')
+  await page.getByRole('button', { name: '生成配对码' }).click()
+  await expect(page.getByLabel('配对码 12345678')).toContainText('1234 5678')
+  await expect(page.getByText(/长 Token 不会显示/)).toBeVisible()
 })
 
 test('experiment deep link and Codex manual queue use the mobile-safe workflow', async ({ page }) => {

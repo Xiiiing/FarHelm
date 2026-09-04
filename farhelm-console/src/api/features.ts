@@ -4,6 +4,7 @@ export type ExperimentState = 'watching' | 'succeeded' | 'failed' | 'unknown' | 
 export type Experiment = { watch_id: string; agent_id: string; project_id: string; name: string; pid: number; state: ExperimentState; session_id?: string; detail?: string; updated_at_unix: number }
 export type SessionState = 'creating' | 'idle' | 'queued' | 'running' | 'interrupting' | 'failed' | 'orphaned' | 'archived'
 export type CodexSession = { session_id: string; agent_id: string; project_id: string; mode: 'inspect' | 'edit'; state: SessionState; title?: string; active_turn_id?: string; updated_at_unix: number }
+export type ProjectCandidate = { candidate_id: string; agent_id: string; display_name: string; suggested_project_id: string; session_count: number; state: 'discovered' | 'approved'; updated_at_unix: number }
 
 async function json<T>(url: string): Promise<T> {
   const response = await fetch(url, { credentials: 'same-origin', headers: { Accept: 'application/json' } })
@@ -17,11 +18,18 @@ export async function fetchExperiments(): Promise<Experiment[]> {
   return value.experiments
 }
 
-export async function fetchSessions(project?: string): Promise<CodexSession[]> {
-  const query = project ? `?project=${encodeURIComponent(project)}` : ''
+export async function fetchSessions(project?: string, archived: 'false' | 'true' | 'all' = 'false'): Promise<CodexSession[]> {
+  const params = new URLSearchParams({ archived }); if (project) params.set('project', project)
+  const query = `?${params.toString()}`
   const value = await json<{ protocol: string; sessions: CodexSession[] }>(`/api/v1/codex/sessions${query}`)
   if (value.protocol !== PROTOCOL_VERSION || !Array.isArray(value.sessions)) throw new Error('Hub returned invalid sessions')
   return value.sessions
+}
+
+export async function fetchProjects(): Promise<ProjectCandidate[]> {
+  const value = await json<{ protocol: string; projects: ProjectCandidate[] }>('/api/v1/projects')
+  if (value.protocol !== PROTOCOL_VERSION || !Array.isArray(value.projects)) throw new Error('Hub returned invalid projects')
+  return value.projects
 }
 
 function idempotencyKey() { return `${Date.now()}-${crypto.randomUUID()}` }
@@ -43,6 +51,9 @@ export function sendMessage(csrf: string, sessionId: string, prompt: string, del
 }
 export function interruptSession(csrf: string, sessionId: string) {
   return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/interrupt`, csrf)
+}
+export function importProjects(csrf: string, agentId: string, candidateIds: string[]) {
+  return mutate('/api/v1/projects/import', csrf, { agent_id: agentId, candidate_ids: candidateIds })
 }
 
 function applicationServerKey(value: string): Uint8Array<ArrayBuffer> {

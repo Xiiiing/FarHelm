@@ -21,7 +21,7 @@ function mockApi(agentResponse: unknown = noAgents) {
     return Promise.resolve({
       ok: true,
       status: 200,
-      json: () => Promise.resolve(url.endsWith('/api/v1/auth/session') ? session : url.endsWith('/api/v1/agents') ? agentResponse : healthy),
+      json: () => Promise.resolve(url.endsWith('/api/v1/auth/session') ? session : url.endsWith('/api/v1/agents') ? agentResponse : url.endsWith('/api/v1/projects') ? { protocol: 'farhelm/1', projects: [] } : healthy),
     })
   })
 }
@@ -32,6 +32,14 @@ afterEach(() => {
 })
 
 describe('FarHelm Console', () => {
+  it('uses password-only login without a TOTP field', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 401 }))
+    render(<MemoryRouter><App /></MemoryRouter>)
+    expect(await screen.findByLabelText('用户名')).toBeInTheDocument()
+    expect(screen.getByLabelText('密码')).toBeInTheDocument()
+    expect(screen.queryByText(/TOTP|验证码|恢复码/)).not.toBeInTheDocument()
+  })
+
   it('shows only validated Hub health data', async () => {
     vi.stubGlobal('fetch', mockApi())
     render(<MemoryRouter><App /></MemoryRouter>)
@@ -68,6 +76,7 @@ describe('FarHelm Console', () => {
         agent_version: '0.1.0',
         last_seen_unix: 1_788_400_000,
         online: true,
+        credential_state: 'paired',
       }],
     }))
     render(<MemoryRouter initialEntries={['/agents']}><App /></MemoryRouter>)

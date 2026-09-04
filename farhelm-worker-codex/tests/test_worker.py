@@ -36,7 +36,7 @@ def test_worker_hello_advertises_implemented_capabilities() -> None:
     assert response["request_id"] == "req_test"
     assert response["result"] == {
         "worker": "farhelm-worker-codex",
-        "version": "0.4.1",
+        "version": "0.5.0",
         "capabilities": CAPABILITIES,
     }
 
@@ -108,7 +108,10 @@ def test_stdio_loop_can_interrupt_an_active_turn() -> None:
 
 
 class FakeBackend:
-    def sessions_list(self, project_path: str) -> Mapping[str, Any]:
+    def projects_discover(self) -> Mapping[str, Any]:
+        return {"projects": [{"cwd": "/srv/project", "session_count": 1}]}
+
+    def sessions_list(self, project_path: str, archived: str) -> Mapping[str, Any]:
         return {"sessions": [{"session_id": "ses_old", "cwd": project_path}]}
 
     def session_start(self, cwd: str, mode: str) -> Mapping[str, Any]:
@@ -172,7 +175,7 @@ def test_sdk_absolute_path_root_model_is_used_for_session_filtering() -> None:
     backend: Any = CodexBackend.__new__(CodexBackend)
     backend._client = FakeClient()
 
-    result = backend.sessions_list("/srv/project")
+    result = backend.sessions_list("/srv/project", "false")
 
     assert result == {
         "sessions": [
@@ -180,11 +183,41 @@ def test_sdk_absolute_path_root_model_is_used_for_session_filtering() -> None:
                 "session_id": "ses_sdk",
                 "title": "Existing task",
                 "cwd": "/srv/project",
+                "archived": False,
                 "created_at_unix": 10,
                 "updated_at_unix": 20,
             }
         ],
         "next_cursor": None,
+    }
+
+
+def test_project_discovery_deduplicates_current_and_archived_thread_cwds() -> None:
+    class FakeClient:
+        def thread_list(self, params: Mapping[str, Any]) -> SimpleNamespace:
+            thread = SimpleNamespace(
+                id="archived" if params["archived"] else "current",
+                name=None,
+                preview="Task",
+                cwd=AbsolutePathBuf(root="/srv/project"),
+                created_at=10,
+                updated_at=30 if params["archived"] else 20,
+            )
+            return SimpleNamespace(data=[thread], next_cursor=None)
+
+    backend: Any = CodexBackend.__new__(CodexBackend)
+    backend._client = FakeClient()
+    result = backend.projects_discover()
+    assert result == {
+        "projects": [
+            {
+                "cwd": "/srv/project",
+                "session_count": 2,
+                "active_session_count": 1,
+                "archived_session_count": 1,
+                "updated_at_unix": 30,
+            }
+        ]
     }
 
 

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs,
     os::unix::fs::MetadataExt,
     path::{Component, Path, PathBuf},
@@ -7,10 +7,11 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use farhelm_protocol::{
     AgentCommand, AgentEvent, CommandAction, ExperimentState, FARHELM_PROTOCOL,
 };
+use rand::RngCore;
 use regex::Regex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -94,6 +95,25 @@ pub struct SessionBinding {
     pub mode: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ApprovedProject {
+    pub project_id: String,
+    pub path: PathBuf,
+    pub success_patterns: Vec<String>,
+    pub failure_patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectCandidate {
+    pub candidate_id: String,
+    pub path: PathBuf,
+    pub display_name: String,
+    pub suggested_project_id: String,
+    pub session_count: u64,
+    pub state: String,
+    pub updated_at_unix: u64,
+}
+
 pub struct ExperimentStore {
     connection: Mutex<Connection>,
     path: PathBuf,
@@ -160,6 +180,22 @@ impl ExperimentStore {
                 cwd TEXT NOT NULL,
                 mode TEXT NOT NULL CHECK (mode IN ('inspect','edit')),
                 updated_at_unix INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS discovered_projects (
+                candidate_id TEXT PRIMARY KEY,
+                path TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                suggested_project_id TEXT NOT NULL,
+                session_count INTEGER NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('discovered','approved')),
+                updated_at_unix INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS approved_projects (
+                project_id TEXT PRIMARY KEY,
+                path TEXT NOT NULL UNIQUE,
+                success_patterns_json TEXT NOT NULL DEFAULT '[]',
+                failure_patterns_json TEXT NOT NULL DEFAULT '[]',
+                updated_at_unix INTEGER NOT NULL
             );",
         )?;
         ensure_remote_command_columns(&connection)?;
@@ -167,6 +203,178 @@ impl ExperimentStore {
             connection: Mutex::new(connection),
             path: path.to_owned(),
         })
+    }
+
+    pub fn import_config_projects(
+        &self,
+        projects: &BTreeMap<String, crate::config::ProjectSection>,
+        now: u64,
+    ) -> Result<()> {
+        let connection = self.lock()?;
+        let transaction = connection.unchecked_transaction()?;
+        for (project_id, project) in projects {
+            let path = fs::canonicalize(&project.path).unwrap_or_else(|_| project.path.clone());
+            transaction.execute(
+                "INSERT INTO approved_projects (project_id,path,success_patterns_json,failure_patterns_json,updated_at_unix) VALUES (?1,?2,?3,?4,?5)
+                 ON CONFLICT(project_id) DO UPDATE SET path=excluded.path,success_patterns_json=excluded.success_patterns_json,failure_patterns_json=excluded.failure_patterns_json,updated_at_unix=excluded.updated_at_unix",
+                params![project_id,path.to_string_lossy(),serde_json::to_string(&project.success_patterns)?,serde_json::to_string(&project.failure_patterns)?,as_i64(now)?],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn approved_projects(&self) -> Result<BTreeMap<String, ApprovedProject>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare("SELECT project_id,path,success_patterns_json,failure_patterns_json FROM approved_projects ORDER BY project_id")?;
+        let rows = statement.query_map([], |row| {
+            let success: String = row.get(2)?;
+            let failure: String = row.get(3)?;
+            Ok(ApprovedProject {
+                project_id: row.get(0)?,
+                path: PathBuf::from(row.get::<_, String>(1)?),
+                success_patterns: serde_json::from_str(&success).map_err(json_conversion(2))?,
+                failure_patterns: serde_json::from_str(&failure).map_err(json_conversion(3))?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| (row.project_id.clone(), row))
+                    .collect()
+            })
+            .map_err(Into::into)
+    }
+
+    pub fn set_project_matchers(
+        &self,
+        project_id: &str,
+        success: &[String],
+        failure: &[String],
+        now: u64,
+    ) -> Result<()> {
+        ensure!(
+            !success.is_empty() && !failure.is_empty(),
+            "both success and failure patterns are required"
+        );
+        for pattern in success.iter().chain(failure) {
+            Regex::new(pattern)
+                .with_context(|| format!("invalid experiment log regex {pattern:?}"))?;
+        }
+        ensure!(self.lock()?.execute(
+            "UPDATE approved_projects SET success_patterns_json=?1,failure_patterns_json=?2,updated_at_unix=?3 WHERE project_id=?4",
+            params![serde_json::to_string(success)?,serde_json::to_string(failure)?,as_i64(now)?,project_id],
+        )? == 1, "approved project does not exist");
+        Ok(())
+    }
+
+    pub fn upsert_discovered_project(
+        &self,
+        path: &Path,
+        display_name: &str,
+        suggested_project_id: &str,
+        session_count: u64,
+        now: u64,
+    ) -> Result<(ProjectCandidate, bool)> {
+        ensure!(
+            path.is_absolute(),
+            "discovered project path must be absolute"
+        );
+        let connection = self.lock()?;
+        let existing: Option<(String,String,u64,String)> = connection.query_row(
+            "SELECT candidate_id,suggested_project_id,session_count,state FROM discovered_projects WHERE path=?1",
+            [path.to_string_lossy().as_ref()],
+            |row| Ok((row.get(0)?,row.get(1)?,row_u64(row,2)?,row.get(3)?)),
+        ).optional()?;
+        let approved_id: Option<String> = connection
+            .query_row(
+                "SELECT project_id FROM approved_projects WHERE path=?1",
+                [path.to_string_lossy().as_ref()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let desired_state = if approved_id.is_some() {
+            "approved"
+        } else {
+            "discovered"
+        };
+        let (candidate_id, effective_id, changed) = match existing {
+            Some((candidate_id, effective_id, previous_count, state)) => {
+                let effective_id = approved_id.clone().unwrap_or(effective_id);
+                (
+                    candidate_id,
+                    effective_id,
+                    previous_count != session_count || state != desired_state,
+                )
+            }
+            None => {
+                let mut bytes = [0_u8; 16];
+                rand::rng().fill_bytes(&mut bytes);
+                let candidate_id = format!(
+                    "prj_{}",
+                    bytes
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                );
+                let effective_id = approved_id.clone().unwrap_or(available_project_id(
+                    &connection,
+                    suggested_project_id,
+                    path,
+                )?);
+                (candidate_id, effective_id, true)
+            }
+        };
+        connection.execute(
+            "INSERT INTO discovered_projects (candidate_id,path,display_name,suggested_project_id,session_count,state,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(path) DO UPDATE SET display_name=excluded.display_name,suggested_project_id=excluded.suggested_project_id,session_count=excluded.session_count,state=excluded.state,updated_at_unix=excluded.updated_at_unix",
+            params![candidate_id,path.to_string_lossy(),display_name,effective_id,as_i64(session_count)?,desired_state,as_i64(now)?],
+        )?;
+        Ok((
+            ProjectCandidate {
+                candidate_id,
+                path: path.to_owned(),
+                display_name: display_name.to_owned(),
+                suggested_project_id: effective_id,
+                session_count,
+                state: desired_state.to_owned(),
+                updated_at_unix: now,
+            },
+            changed,
+        ))
+    }
+
+    pub fn approve_candidates(
+        &self,
+        candidate_ids: &[String],
+        now: u64,
+    ) -> Result<Vec<ProjectCandidate>> {
+        ensure!(
+            !candidate_ids.is_empty() && candidate_ids.len() <= 100,
+            "invalid candidate list"
+        );
+        let connection = self.lock()?;
+        let transaction = connection.unchecked_transaction()?;
+        let mut approved = Vec::new();
+        for candidate_id in candidate_ids {
+            let candidate = transaction.query_row(
+                "SELECT candidate_id,path,display_name,suggested_project_id,session_count,state,updated_at_unix FROM discovered_projects WHERE candidate_id=?1",
+                [candidate_id], project_candidate_from_row,
+            ).optional()?.with_context(|| format!("unknown project candidate {candidate_id}"))?;
+            transaction.execute(
+                "INSERT INTO approved_projects (project_id,path,updated_at_unix) VALUES (?1,?2,?3)
+                 ON CONFLICT(project_id) DO UPDATE SET path=excluded.path,updated_at_unix=excluded.updated_at_unix",
+                params![candidate.suggested_project_id,candidate.path.to_string_lossy(),as_i64(now)?],
+            )?;
+            transaction.execute("UPDATE discovered_projects SET state='approved',updated_at_unix=?1 WHERE candidate_id=?2", params![as_i64(now)?,candidate_id])?;
+            approved.push(ProjectCandidate {
+                state: "approved".to_owned(),
+                updated_at_unix: now,
+                ..candidate
+            });
+        }
+        transaction.commit()?;
+        Ok(approved)
     }
 
     pub fn register(&self, registration: &WatchRegistration, now: u64) -> Result<WatchRecord> {
@@ -995,6 +1203,45 @@ fn json_conversion(index: usize) -> impl FnOnce(serde_json::Error) -> rusqlite::
     }
 }
 
+fn project_candidate_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectCandidate> {
+    Ok(ProjectCandidate {
+        candidate_id: row.get(0)?,
+        path: PathBuf::from(row.get::<_, String>(1)?),
+        display_name: row.get(2)?,
+        suggested_project_id: row.get(3)?,
+        session_count: row_u64(row, 4)?,
+        state: row.get(5)?,
+        updated_at_unix: row_u64(row, 6)?,
+    })
+}
+
+fn available_project_id(connection: &Connection, suggested: &str, path: &Path) -> Result<String> {
+    let base = if suggested.is_empty() {
+        "project"
+    } else {
+        suggested
+    };
+    for suffix in 1..=10_000_u32 {
+        let candidate = if suffix == 1 {
+            base.to_owned()
+        } else {
+            format!("{base}-{suffix}")
+        };
+        let collision: Option<String> = connection.query_row(
+            "SELECT path FROM approved_projects WHERE project_id=?1 UNION SELECT path FROM discovered_projects WHERE suggested_project_id=?1 LIMIT 1",
+            [&candidate],
+            |row| row.get(0),
+        ).optional()?;
+        if collision
+            .as_deref()
+            .is_none_or(|existing| existing == path.to_string_lossy())
+        {
+            return Ok(candidate);
+        }
+    }
+    bail!("could not allocate a unique project ID")
+}
+
 fn watch_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatchRecord> {
     Ok(WatchRecord {
         watch_id: row.get(0)?,
@@ -1051,6 +1298,7 @@ const fn action_name(action: CommandAction) -> &'static str {
         CommandAction::CodexTurnStart => "codex.turn.start",
         CommandAction::CodexTurnSteer => "codex.turn.steer",
         CommandAction::CodexTurnInterrupt => "codex.turn.interrupt",
+        CommandAction::ProjectApprove => "project.approve",
     }
 }
 
@@ -1061,6 +1309,7 @@ fn parse_action(value: &str) -> rusqlite::Result<CommandAction> {
         "codex.turn.start" => Ok(CommandAction::CodexTurnStart),
         "codex.turn.steer" => Ok(CommandAction::CodexTurnSteer),
         "codex.turn.interrupt" => Ok(CommandAction::CodexTurnInterrupt),
+        "project.approve" => Ok(CommandAction::ProjectApprove),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
 }
@@ -1298,5 +1547,25 @@ mod tests {
         assert_eq!(binding.project_id, "project-a");
         assert_eq!(binding.cwd, cwd);
         assert_eq!(binding.mode, "edit");
+    }
+
+    #[test]
+    fn discovered_projects_are_approved_without_exposing_paths_in_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Work 831");
+        fs::create_dir(&project).unwrap();
+        let store = ExperimentStore::open(Path::new(":memory:")).unwrap();
+        let (candidate, changed) = store
+            .upsert_discovered_project(&project, "Work 831", "work-831", 14, 10)
+            .unwrap();
+        assert!(changed);
+        assert_eq!(candidate.session_count, 14);
+        let approved = store
+            .approve_candidates(std::slice::from_ref(&candidate.candidate_id), 11)
+            .unwrap();
+        assert_eq!(approved[0].state, "approved");
+        let projects = store.approved_projects().unwrap();
+        assert_eq!(projects["work-831"].path, project);
+        assert!(projects["work-831"].success_patterns.is_empty());
     }
 }

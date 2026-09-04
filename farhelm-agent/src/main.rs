@@ -1,7 +1,8 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
-    io::Read,
+    io::{IsTerminal, Read},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -99,6 +100,8 @@ enum CommandKind {
         #[arg(long, env = "FARHELM_AGENT_CONFIG")]
         config: Option<PathBuf>,
     },
+    /// Pair this host with an Agent entry created in the Console.
+    Pair,
     /// Start the Python Worker and verify the framed protocol handshake.
     WorkerSmoke {
         #[arg(long, default_value = "python3")]
@@ -112,7 +115,7 @@ enum CommandKind {
         /// Only report whether an update is available.
         #[arg(long)]
         check: bool,
-        /// Install one exact formal version, such as V0.4.1.
+        /// Install one exact formal version, such as V0.5.0.
         #[arg(long)]
         version: Option<String>,
         /// Permit a user-approved first-number version change.
@@ -304,7 +307,8 @@ async fn main() -> Result<()> {
         CommandKind::Stop => management::service_action("stop"),
         CommandKind::Restart => management::restart().await,
         CommandKind::Status => management::status(),
-        CommandKind::Doctor { config } => management::doctor(config.as_deref()).map(|_| ()),
+        CommandKind::Doctor { config } => management::doctor(config.as_deref()).await.map(|_| ()),
+        CommandKind::Pair => management::pair().await,
         CommandKind::WorkerSmoke {
             python,
             worker_root,
@@ -406,6 +410,7 @@ async fn run(
     let (client, endpoint, heartbeat) = heartbeat_client(&hub)?;
     let command_store = CommandStore::open(database)?;
     let experiment_store = ExperimentStore::open(database)?;
+    experiment_store.import_config_projects(projects, unix_time())?;
     let worker_runtime = WorkerRuntime {
         python: worker_python.to_owned(),
         root: worker_root.to_owned(),
@@ -425,18 +430,6 @@ async fn run(
             "remote Codex commands interrupted by the previous Agent exit were marked orphaned"
         );
     }
-    let project_matchers = projects
-        .iter()
-        .map(|(id, project)| {
-            (
-                id.clone(),
-                ProjectMatchers {
-                    success: project.success_patterns.clone(),
-                    failure: project.failure_patterns.clone(),
-                },
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut command_ticker = tokio::time::interval(Duration::from_secs(command_interval_secs));
@@ -462,9 +455,11 @@ async fn run(
                 }
             }
             _ = command_ticker.tick() => {
-                if let Err(error) = process_command_cycle(&client, &hub, &command_store, &experiment_store, projects, &worker_runtime).await {
+                let live_projects = approved_project_sections(&experiment_store)?;
+                if let Err(error) = process_command_cycle(&client, &hub, &command_store, &experiment_store, &live_projects, &worker_runtime).await {
                     warn!(agent_id = %hub.agent_id, %error, "command cycle failed; retrying");
                 }
+                let project_matchers = live_projects.iter().map(|(id, project)| (id.clone(), ProjectMatchers { success: project.success_patterns.clone(), failure: project.failure_patterns.clone() })).collect::<BTreeMap<_, _>>();
                 match experiment_store.inspect(&project_matchers, unix_time()) {
                     Ok(completed) => for watch in completed {
                         info!(watch_id = %watch.watch_id, state = ?watch.state, "experiment finished");
@@ -489,7 +484,10 @@ async fn run(
                 }
             }
             _ = session_ticker.tick() => {
-                for (project_id, project) in projects {
+                if let Err(error) = discover_projects(database, &worker_runtime.python, &worker_runtime.root).await {
+                    warn!(%error, "Codex project discovery failed");
+                }
+                for (project_id, project) in approved_project_sections(&experiment_store)? {
                     let database = database.to_owned();
                     let python = worker_runtime.python.clone();
                     let worker_root = worker_runtime.root.clone();
@@ -517,6 +515,109 @@ async fn run(
     Ok(())
 }
 
+fn approved_project_sections(
+    store: &ExperimentStore,
+) -> Result<BTreeMap<String, config::ProjectSection>> {
+    Ok(store
+        .approved_projects()?
+        .into_iter()
+        .map(|(id, project)| {
+            (
+                id,
+                config::ProjectSection {
+                    path: project.path,
+                    success_patterns: project.success_patterns,
+                    failure_patterns: project.failure_patterns,
+                },
+            )
+        })
+        .collect())
+}
+
+async fn discover_projects(database: &Path, python: &str, worker_root: &Path) -> Result<()> {
+    let value = worker_call_once(
+        python,
+        worker_root,
+        "codex.projects.discover",
+        serde_json::json!({}),
+    )
+    .await?;
+    let projects = value
+        .get("projects")
+        .and_then(serde_json::Value::as_array)
+        .context("Worker project discovery omitted projects")?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is missing")?;
+    let home = fs::canonicalize(home).context("failed to resolve HOME")?;
+    let uid = unsafe { libc::geteuid() };
+    let store = ExperimentStore::open(database)?;
+    for project in projects {
+        let Some(raw_path) = project.get("cwd").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let path = match fs::canonicalize(raw_path) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if !metadata.is_dir() || metadata.uid() != uid || path == Path::new("/") || path == home {
+            continue;
+        }
+        let Some(display_name) = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let suggested = suggested_project_id(display_name);
+        let session_count = project
+            .get("session_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let now = unix_time();
+        let (candidate, changed) =
+            store.upsert_discovered_project(&path, display_name, &suggested, session_count, now)?;
+        if changed {
+            let event_type = if candidate.state == "approved" {
+                "project.updated"
+            } else {
+                "project.discovered"
+            };
+            store.enqueue_event(
+                &format!("project:{}:{}:{}",candidate.candidate_id,candidate.state,candidate.updated_at_unix),
+                event_type,
+                &serde_json::json!({"candidate_id":candidate.candidate_id,"display_name":candidate.display_name,"suggested_project_id":candidate.suggested_project_id,"session_count":candidate.session_count,"state":candidate.state,"updated_at_unix":candidate.updated_at_unix}),
+                now,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn suggested_project_id(name: &str) -> String {
+    let mut value = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    value = value.trim_matches('-').chars().take(64).collect();
+    if value.is_empty() {
+        "project".to_owned()
+    } else {
+        value
+    }
+}
+
 async fn sync_project_sessions(
     database: &Path,
     python: &str,
@@ -528,7 +629,7 @@ async fn sync_project_sessions(
         python,
         worker_root,
         "codex.sessions.list",
-        serde_json::json!({"project_path":project_path}),
+        serde_json::json!({"project_path":project_path,"archived":"all"}),
     )
     .await?;
     let sessions = value
@@ -548,7 +649,7 @@ async fn sync_project_sessions(
         store.bind_session(session_id, project_id, project_path, "inspect", updated)?;
         store.enqueue_event(
             &format!("session-sync:{session_id}:{updated}"),"codex.session.updated",
-            &serde_json::json!({"session_id":session_id,"project_id":project_id,"mode":"inspect","state":"idle","title":session.get("title"),"active_turn_id":null,"updated_at_unix":updated}),unix_time(),
+            &serde_json::json!({"session_id":session_id,"project_id":project_id,"mode":"inspect","state":if session.get("archived").and_then(serde_json::Value::as_bool).unwrap_or(false) { "archived" } else { "idle" },"title":session.get("title"),"active_turn_id":null,"updated_at_unix":updated}),unix_time(),
         )?;
     }
     Ok(())
@@ -575,15 +676,38 @@ fn experiment_command(command: ExperimentCommand) -> Result<()> {
             on_success_prompt_file,
         } => {
             let config = load_local_config(config)?;
-            let project_config = config
-                .projects
-                .get(&project)
-                .with_context(|| format!("project {project:?} is not approved in Agent config"))?;
+            let store = ExperimentStore::open(&config.agent.database)?;
+            store.import_config_projects(&config.projects, unix_time())?;
+            let approved = store.approved_projects()?;
+            let mut project_config = approved.get(&project).cloned().with_context(|| {
+                format!("project {project:?} is not approved; import it in the Console first")
+            })?;
+            if project_config.success_patterns.is_empty()
+                || project_config.failure_patterns.is_empty()
+            {
+                ensure!(
+                    std::io::stdin().is_terminal(),
+                    "project {project:?} has no experiment log rules; run this command interactively once to set them"
+                );
+                eprintln!(
+                    "Project {project:?} needs reliable log markers before experiment monitoring can be enabled."
+                );
+                let success = prompt_regex("Success log regex: ")?;
+                let failure = prompt_regex("Failure log regex: ")?;
+                store.set_project_matchers(
+                    &project,
+                    std::slice::from_ref(&success),
+                    std::slice::from_ref(&failure),
+                    unix_time(),
+                )?;
+                project_config.success_patterns = vec![success];
+                project_config.failure_patterns = vec![failure];
+                eprintln!("Saved project-specific experiment log rules locally.");
+            }
             let prompt = on_success_prompt_file
                 .as_deref()
                 .map(read_prompt)
                 .transpose()?;
-            let store = ExperimentStore::open(&config.agent.database)?;
             let watch = store.register(
                 &WatchRegistration {
                     project_id: project,
@@ -642,10 +766,12 @@ async fn codex_command(command: CodexCommand) -> Result<()> {
     match command {
         CodexCommand::Sessions { config, project } => {
             let config = load_local_config(config)?;
-            let project = config
-                .projects
+            let store = ExperimentStore::open(&config.agent.database)?;
+            store.import_config_projects(&config.projects, unix_time())?;
+            let projects = store.approved_projects()?;
+            let project = projects
                 .get(&project)
-                .context("project is not approved in Agent config")?;
+                .context("project is not approved; import it in the Console first")?;
             let project_path = fs::canonicalize(&project.path)
                 .context("failed to resolve approved project path")?;
             let worker_root = AgentPaths::discover()?.worker;
@@ -654,7 +780,7 @@ async fn codex_command(command: CodexCommand) -> Result<()> {
                 &config.worker.python,
                 &worker_root,
                 "codex.sessions.list",
-                serde_json::json!({"project_path":project_path}),
+                serde_json::json!({"project_path":project_path,"archived":"false"}),
             )
             .await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
@@ -676,6 +802,16 @@ fn read_prompt(path: &str) -> Result<String> {
     ensure!(prompt.len() <= 32 * 1024, "prompt exceeds 32 KiB");
     ensure!(!prompt.trim().is_empty(), "prompt is empty");
     Ok(prompt)
+}
+
+fn prompt_regex(prompt: &str) -> Result<String> {
+    eprint!("{prompt}");
+    let mut value = String::new();
+    std::io::stdin().read_line(&mut value)?;
+    let value = value.trim().to_owned();
+    ensure!(!value.is_empty(), "log regex is empty");
+    regex::Regex::new(&value).context("log regex is invalid")?;
+    Ok(value)
 }
 
 async fn upload_events(client: &Client, hub: &HubArgs, store: &ExperimentStore) -> Result<()> {
@@ -722,6 +858,8 @@ async fn command_poll_once(runtime: &RuntimeArgs) -> Result<()> {
     let (client, _, _) = heartbeat_client(&runtime.hub)?;
     let store = CommandStore::open(&runtime.database)?;
     let experiments = ExperimentStore::open(&runtime.database)?;
+    experiments.import_config_projects(&runtime.projects, unix_time())?;
+    let live_projects = approved_project_sections(&experiments)?;
     let worker_runtime = WorkerRuntime {
         python: runtime.worker_python.clone(),
         root: runtime.worker_root.clone(),
@@ -732,7 +870,7 @@ async fn command_poll_once(runtime: &RuntimeArgs) -> Result<()> {
         &runtime.hub,
         &store,
         &experiments,
-        &runtime.projects,
+        &live_projects,
         &worker_runtime,
     )
     .await?;
@@ -953,15 +1091,17 @@ async fn execute_remote_command(
                 "codex.turn.failed"
             };
             let error_detail: String = error.to_string().chars().take(512).collect();
-            store.enqueue_event(
-                &format!("{}:terminal", command.command_id),
-                event_type,
-                &serde_json::json!({
-                    "command_id":command.command_id,"project_id":command.payload.get("project_id"),
-                    "session_id":command.payload.get("session_id"),"detail":error_detail.clone()
-                }),
-                unix_time(),
-            )?;
+            if command.action != CommandAction::ProjectApprove {
+                store.enqueue_event(
+                    &format!("{}:terminal", command.command_id),
+                    event_type,
+                    &serde_json::json!({
+                        "command_id":command.command_id,"project_id":command.payload.get("project_id"),
+                        "session_id":command.payload.get("session_id"),"detail":error_detail.clone()
+                    }),
+                    unix_time(),
+                )?;
+            }
             (CommandState::Failed, None, Some(error_detail))
         }
     };
@@ -995,6 +1135,42 @@ async fn execute_remote_command_inner(
     worker_runtime: &WorkerRuntime,
     command: &RemoteCommand,
 ) -> Result<serde_json::Value> {
+    if command.action == CommandAction::ProjectApprove {
+        let candidate_ids = command
+            .payload
+            .get("candidate_ids")
+            .and_then(serde_json::Value::as_array)
+            .context("project approval omitted candidate_ids")?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .context("project candidate ID must be a string")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let now = unix_time();
+        let approved = store.approve_candidates(&candidate_ids, now)?;
+        for project in &approved {
+            store.enqueue_event(
+                &format!("project:{}:approved:{now}", project.candidate_id),
+                "project.updated",
+                &serde_json::json!({"candidate_id":project.candidate_id,"display_name":project.display_name,"suggested_project_id":project.suggested_project_id,"session_count":project.session_count,"state":"approved","updated_at_unix":now}),
+                now,
+            )?;
+            sync_project_sessions(
+                store.path(),
+                &worker_runtime.python,
+                &worker_runtime.root,
+                &project.suggested_project_id,
+                &project.path,
+            )
+            .await?;
+        }
+        return Ok(
+            serde_json::json!({"approved": approved.iter().map(|project| project.candidate_id.as_str()).collect::<Vec<_>>() }),
+        );
+    }
     let project_id = command
         .payload
         .get("project_id")
@@ -1111,6 +1287,7 @@ async fn execute_remote_command_inner(
             .await
         }
         CommandAction::AgentProbe => bail!("probe reached Codex executor"),
+        CommandAction::ProjectApprove => unreachable!("project approval returned above"),
     }
 }
 

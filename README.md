@@ -4,14 +4,14 @@
   <p><strong>面向个人科研与 GPU 训练环境的远程控制平面</strong></p>
   <p>从手机查看训练服务器状态，并在不开放训练机入站端口的前提下安全扩展远程控制能力。</p>
   <p>
-    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.4.1">V0.4.1</a> ·
+    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.5.0">V0.5.0</a> ·
     <a href="./deploy/README.md">部署文档</a> ·
     <a href="./README.en.md">English</a>
   </p>
 </div>
 
 > [!IMPORTANT]
-> 当前 `V0.4.1` 提供最小“实验结束 → Codex 下一步”闭环：本地登记 PID、可靠完成事件、按日志标记判断结果、成功时可幂等发送预设 prompt，以及手机端旧/新 Codex 会话与流式回复。它不提供远程训练启停、自动进程扫描、GPU/TensorBoard 图表或任意 shell。
+> 当前 `V0.5.0` 在“实验结束 → Codex 下一步”闭环上增加零配置引导：仅密码登录、30 天持久会话、网页短码配对 Agent，以及 Codex 历史项目自动发现与一键导入。它不提供远程训练启停、自动训练进程扫描、GPU/TensorBoard 图表或任意 shell。
 
 ## 快速安装
 
@@ -28,7 +28,7 @@ chmod +x farhelm-hub
 sudo ./farhelm-hub install
 ```
 
-程序会交互询问管理员用户名、管理员密码和迁移用 Agent token，并生成 TOTP 密钥与一次性恢复码。安装后的实际程序位于 `/usr/local/bin/farhelm-hub`；每台 Agent 的独立 256-bit token 在 `hub.toml` 的 `agents.tokens` 中配置。
+程序只询问管理员用户名和密码，不再要求 TOTP，也不会生成共享 Agent Token。安装后的实际程序位于 `/usr/local/bin/farhelm-hub`；登录网页后在“服务器 → 添加服务器”生成一次性 8 位配对码。
 
 ### Agent
 
@@ -42,7 +42,7 @@ chmod +x farhelm-agent
 ./farhelm-agent install
 ```
 
-程序会询问 Hub HTTPS 地址、Agent token 和 Agent ID。安装后的实际程序位于 `${XDG_BIN_HOME:-$HOME/.local/bin}/farhelm-agent`；成功后可以删除下载副本。
+程序只询问 Hub HTTPS 地址和网页生成的 8 位配对码，独立 256-bit Token 会自动领取并写入 `0600` 配置。安装后的实际程序位于 `${XDG_BIN_HOME:-$HOME/.local/bin}/farhelm-agent`；成功后可以删除下载副本。
 
 更完整的非交互安装、Caddy、systemd、迁移和卸载说明见[部署文档](deploy/README.md)。
 
@@ -65,6 +65,7 @@ sudo farhelm-hub restart
 sudo farhelm-hub update --check
 sudo farhelm-hub update
 sudo farhelm-hub rollback
+sudo farhelm-hub admin reset-password
 
 # Agent
 farhelm-agent doctor
@@ -73,6 +74,7 @@ farhelm-agent restart
 farhelm-agent update --check
 farhelm-agent update
 farhelm-agent rollback
+farhelm-agent pair
 
 # 查看旧 Codex 会话
 farhelm-agent codex sessions --project cc08
@@ -88,8 +90,8 @@ farhelm-agent experiment list
 
 ## 当前实现
 
-- `farhelm-hub`：Rust 控制平面、密码 + TOTP、Secure HttpOnly Cookie、CSRF、登录限速、SQLite 命令/事件事实源、SSE 补发，以及 VAPID Push 加密投递与有限退避重试。
-- `farhelm-agent`：普通用户出站连接、明确登记的 PID 监视、PID 复用防护、日志尾部判定、SQLite inbox/outbox、独立 Agent token 和隔离 worktree。
+- `farhelm-hub`：Rust 控制平面、密码登录、SQLite 30 天会话、短码配对、Secure HttpOnly Cookie、CSRF、登录限速、可靠事件、SSE 补发和 Web Push。
+- `farhelm-agent`：普通用户出站连接、自动发现 Codex 项目、本地项目授权表、明确登记的 PID 监视、PID 复用防护、SQLite inbox/outbox 和隔离 worktree。
 - `farhelm-console`：React、TypeScript、Ant Design、Vite PWA；提供实验与 Codex 手机/桌面界面、流式回复和通知深链处理。
 - `farhelm-worker-codex`：Agent 私有 Python stdio 适配层，固定 `openai-codex==0.147.0`，覆盖 thread list/start/resume 与 turn start/steer/interrupt。
 
@@ -132,7 +134,7 @@ make test-release
 ## 安全与版本规则
 
 - Agent 不需要 root，也不开放公网入站端口；Hub 只监听 loopback，由 Caddy 或等价 HTTPS 反向代理公开。
-- 管理员凭据与 Agent token 相互独立，并保存在受限权限的 TOML 配置中。
+- 管理员密码使用 Argon2id；浏览器 session 和 Agent Token 在 Hub 只保存哈希，原始 Agent Token 仅在配对响应中传输一次。
 - Hub 不保存 Codex 登录凭据、SSH 私钥、项目源码或完整本地日志。
 - Worker 只通过 stdin/stdout 与 Agent 通信；写操作必须经过白名单、TTL、幂等和审计。
 - 版本使用 `MAJOR.MINOR.PATCH`：第一段只能由用户决定，功能提升第二段，纯修复提升第三段。
@@ -140,7 +142,7 @@ make test-release
 
 ## 路线图
 
-1. 在 A6000/CC08、Titan/work831 与 3090/work832 完成 V0.4 canary。
+1. 在 A6000/CC08、Titan/work831 与 3090/work832 完成 V0.5 零配置 canary。
 2. 在 iPhone 主屏幕 PWA 上完成后台 Web Push 的生产验证。
 3. 按实际实验需求评估 GPU 指标与 TensorBoard；不加入远程训练控制。
 

@@ -2,7 +2,7 @@
 id = "gpu-a6000"
 hostname = "trainer-a6000"
 hub_url = "https://farhelm.example.com"
-token = "replace-with-a-random-token-of-at-least-32-characters"
+token = "managed-by-farhelm-agent-pairing-do-not-copy"
 heartbeat_seconds = 15
 command_poll_seconds = 2
 database = "/home/user/.local/share/farhelm/state/agent.db"
@@ -10,6 +10,7 @@ database = "/home/user/.local/share/farhelm/state/agent.db"
 [worker]
 python = "python3"
 
+# Existing TOML projects migrate into the local registry; new Codex projects are discovered automatically.
 [projects.cc08]
 path = "/srv/projects/cc08"
 success_patterns = ["TRAINING COMPLETE", "Finished training"]

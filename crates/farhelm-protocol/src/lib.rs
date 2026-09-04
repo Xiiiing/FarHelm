@@ -73,6 +73,17 @@ pub struct AgentSummary {
     pub agent_version: String,
     pub last_seen_unix: u64,
     pub online: bool,
+    #[serde(default)]
+    pub credential_state: AgentCredentialState,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCredentialState {
+    #[default]
+    Paired,
+    Legacy,
+    NeedsPairing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +106,8 @@ pub enum CommandAction {
     CodexTurnSteer,
     #[serde(rename = "codex.turn.interrupt")]
     CodexTurnInterrupt,
+    #[serde(rename = "project.approve")]
+    ProjectApprove,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,6 +270,70 @@ pub struct CodexSessionSummary {
 pub struct CodexSessionListResponse {
     pub protocol: String,
     pub sessions: Vec<CodexSessionSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatePairingCodeRequest {
+    pub agent_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletePairingCodeRequest {
+    pub pairing_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingCodeResponse {
+    pub protocol: String,
+    pub pairing_id: String,
+    pub agent_id: String,
+    pub code: String,
+    pub expires_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEnrollRequest {
+    pub protocol: String,
+    pub pairing_code: String,
+    pub hostname: String,
+    pub agent_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEnrollResponse {
+    pub protocol: String,
+    pub agent_id: String,
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectCandidateState {
+    Discovered,
+    Approved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectCandidateSummary {
+    pub candidate_id: String,
+    pub agent_id: String,
+    pub display_name: String,
+    pub suggested_project_id: String,
+    pub session_count: u64,
+    pub state: ProjectCandidateState,
+    pub updated_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectListResponse {
+    pub protocol: String,
+    pub projects: Vec<ProjectCandidateSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportProjectsRequest {
+    pub agent_id: String,
+    pub candidate_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

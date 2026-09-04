@@ -74,19 +74,37 @@ if [[ "$healthy" != true ]]; then
 fi
 
 "$agent_stable" heartbeat --config "$agent_config"
+cookie_jar="$test_dir/cookies.txt"
+login_response=$(curl --fail --silent --show-error --cookie-jar "$cookie_jar" \
+  --header 'Content-Type: application/json' \
+  --data '{"username":"package-admin","password":"package-password-1234"}' \
+  http://127.0.0.1:18787/api/v1/auth/login)
+csrf=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["csrf_token"])' <<<"$login_response")
 probe_response=$(curl --fail --silent --show-error \
-  --user 'package-admin:package-password-1234' \
+  --cookie "$cookie_jar" \
+  --header "X-CSRF-Token: $csrf" \
   --header 'Content-Type: application/json' \
   --data '{"idempotency_key":"package-probe-request-0001","ttl_secs":60}' \
   http://127.0.0.1:18787/api/v1/agents/package-gpu/probe)
 command_id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["command_id"])' <<<"$probe_response")
 "$agent_stable" command-poll --config "$agent_config"
 curl --fail --silent --show-error \
-  --user 'package-admin:package-password-1234' \
+  --cookie "$cookie_jar" \
   "http://127.0.0.1:18787/api/v1/commands/$command_id" | grep -q '"state":"completed"'
 curl --fail --silent --show-error \
-  --user 'package-admin:package-password-1234' \
+  --cookie "$cookie_jar" \
   http://127.0.0.1:18787/agents | grep -q '<title>FarHelm Console</title>'
+
+pairing_code() {
+  local agent_id=$1
+  curl --fail --silent --show-error --cookie "$cookie_jar" \
+    --header "X-CSRF-Token: $csrf" --header 'Content-Type: application/json' \
+    --data "{\"agent_id\":\"$agent_id\"}" \
+    http://127.0.0.1:18787/api/v1/agents/pairing-codes |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])'
+}
+
+package_installed_code=$(pairing_code package-installed)
 
 mock_bin="$test_dir/mock-bin"
 install -d -m 0755 "$mock_bin"
@@ -114,8 +132,7 @@ chmod 0755 "$mock_bin/systemctl" "$mock_bin/loginctl"
   export XDG_BIN_HOME="$test_dir/user-bin"
   export USER=package-user
   export FARHELM_HUB_URL=http://127.0.0.1:18787
-  export FARHELM_AGENT_TOKEN=package-agent-token-with-at-least-32-characters
-  export FARHELM_AGENT_ID=package-installed
+  export FARHELM_PAIRING_CODE="$package_installed_code"
   export FARHELM_AGENT_HOSTNAME=package-installed-host
   export FARHELM_CODEX_RUNTIME_ARCHIVE="$runtime_archive"
   export FARHELM_CODEX_RUNTIME_SIZE="$runtime_size"
@@ -163,6 +180,7 @@ chmod 0755 "$mock_bin/systemctl" "$mock_bin/loginctl"
   test ! -e "$unit_file"
 )
 
+failure_agent_code=$(pairing_code failure-agent)
 (
   export PATH="$mock_bin:$PATH"
   export HOME="$test_dir/failure-home"
@@ -171,8 +189,7 @@ chmod 0755 "$mock_bin/systemctl" "$mock_bin/loginctl"
   export XDG_BIN_HOME="$test_dir/failure-bin"
   export USER=failure-user
   export FARHELM_HUB_URL=http://127.0.0.1:18787
-  export FARHELM_AGENT_TOKEN=package-agent-token-with-at-least-32-characters
-  export FARHELM_AGENT_ID=failure-agent
+  export FARHELM_PAIRING_CODE="$failure_agent_code"
   export FARHELM_CODEX_RUNTIME_ARCHIVE="$runtime_archive"
   export FARHELM_CODEX_RUNTIME_SIZE="$runtime_size"
   export FARHELM_CODEX_RUNTIME_SHA256="$runtime_sha256"
@@ -202,6 +219,7 @@ chmod 0755 "$mock_bin/systemctl" "$mock_bin/loginctl"
   "$installed_binary" uninstall
 )
 
+fresh_failure_code=$(pairing_code fresh-failure-agent)
 (
   export PATH="$mock_bin:$PATH"
   export HOME="$test_dir/fresh-failure-home"
@@ -210,8 +228,7 @@ chmod 0755 "$mock_bin/systemctl" "$mock_bin/loginctl"
   export XDG_BIN_HOME="$test_dir/fresh-failure-bin"
   export USER=fresh-failure-user
   export FARHELM_HUB_URL=http://127.0.0.1:18787
-  export FARHELM_AGENT_TOKEN=package-agent-token-with-at-least-32-characters
-  export FARHELM_AGENT_ID=fresh-failure-agent
+  export FARHELM_PAIRING_CODE="$fresh_failure_code"
   export FARHELM_CODEX_RUNTIME_ARCHIVE="$runtime_archive"
   export FARHELM_CODEX_RUNTIME_SIZE="$runtime_size"
   export FARHELM_CODEX_RUNTIME_SHA256="$runtime_sha256"

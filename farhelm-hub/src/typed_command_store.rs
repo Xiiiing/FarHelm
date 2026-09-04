@@ -28,7 +28,7 @@ impl TypedCommandStore {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 command_id TEXT NOT NULL UNIQUE,
                 agent_id TEXT NOT NULL,
-                action TEXT NOT NULL CHECK (action IN ('codex.session.create','codex.session.resume','codex.turn.start','codex.turn.steer','codex.turn.interrupt')),
+                action TEXT NOT NULL CHECK (action IN ('codex.session.create','codex.session.resume','codex.turn.start','codex.turn.steer','codex.turn.interrupt','project.approve')),
                 payload_json TEXT NOT NULL,
                 state TEXT NOT NULL CHECK (state IN ('queued','delivered','accepted','completed','failed','expired')),
                 idempotency_key TEXT NOT NULL UNIQUE,
@@ -40,6 +40,7 @@ impl TypedCommandStore {
             );
             CREATE INDEX IF NOT EXISTS typed_commands_delivery ON typed_commands(agent_id,state,id);",
         )?;
+        ensure_project_action_schema(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -187,6 +188,7 @@ const fn action_name(action: CommandAction) -> &'static str {
         CommandAction::CodexTurnStart => "codex.turn.start",
         CommandAction::CodexTurnSteer => "codex.turn.steer",
         CommandAction::CodexTurnInterrupt => "codex.turn.interrupt",
+        CommandAction::ProjectApprove => "project.approve",
     }
 }
 fn parse_action(value: &str) -> rusqlite::Result<CommandAction> {
@@ -196,8 +198,41 @@ fn parse_action(value: &str) -> rusqlite::Result<CommandAction> {
         "codex.turn.start" => Ok(CommandAction::CodexTurnStart),
         "codex.turn.steer" => Ok(CommandAction::CodexTurnSteer),
         "codex.turn.interrupt" => Ok(CommandAction::CodexTurnInterrupt),
+        "project.approve" => Ok(CommandAction::ProjectApprove),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
+}
+
+fn ensure_project_action_schema(connection: &Connection) -> Result<()> {
+    let schema: String = connection.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='typed_commands'",
+        [],
+        |row| row.get(0),
+    )?;
+    if schema.contains("project.approve") {
+        return Ok(());
+    }
+    connection.execute_batch(
+        "ALTER TABLE typed_commands RENAME TO typed_commands_v041;
+         CREATE TABLE typed_commands (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            command_id TEXT NOT NULL UNIQUE,
+            agent_id TEXT NOT NULL,
+            action TEXT NOT NULL CHECK (action IN ('codex.session.create','codex.session.resume','codex.turn.start','codex.turn.steer','codex.turn.interrupt','project.approve')),
+            payload_json TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('queued','delivered','accepted','completed','failed','expired')),
+            idempotency_key TEXT NOT NULL UNIQUE,
+            created_at_unix INTEGER NOT NULL,
+            expires_at_unix INTEGER NOT NULL,
+            updated_at_unix INTEGER NOT NULL,
+            data_json TEXT,
+            detail TEXT
+         );
+         INSERT INTO typed_commands SELECT * FROM typed_commands_v041;
+         DROP TABLE typed_commands_v041;
+         CREATE INDEX IF NOT EXISTS typed_commands_delivery ON typed_commands(agent_id,state,id);",
+    )?;
+    Ok(())
 }
 const fn state_name(state: CommandState) -> &'static str {
     match state {
@@ -283,5 +318,34 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn v041_command_table_adds_project_approval_without_losing_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("hub.db");
+        let connection = Connection::open(&database).unwrap();
+        connection.execute_batch("CREATE TABLE typed_commands (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, command_id TEXT NOT NULL UNIQUE, agent_id TEXT NOT NULL,
+            action TEXT NOT NULL CHECK (action IN ('codex.session.create','codex.session.resume','codex.turn.start','codex.turn.steer','codex.turn.interrupt')),
+            payload_json TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('queued','delivered','accepted','completed','failed','expired')),
+            idempotency_key TEXT NOT NULL UNIQUE, created_at_unix INTEGER NOT NULL, expires_at_unix INTEGER NOT NULL,
+            updated_at_unix INTEGER NOT NULL, data_json TEXT, detail TEXT);
+            INSERT INTO typed_commands (command_id,agent_id,action,payload_json,state,idempotency_key,created_at_unix,expires_at_unix,updated_at_unix)
+            VALUES ('cmd_cdx_0000000000000001','titan','codex.turn.start','{}','completed','old-command-key',1,2,2);").unwrap();
+        drop(connection);
+        let store = TypedCommandStore::open(&database).unwrap();
+        assert!(store.get("cmd_cdx_0000000000000001").unwrap().is_some());
+        let approval = store
+            .create(
+                "titan",
+                CommandAction::ProjectApprove,
+                &serde_json::json!({"candidate_ids":["candidate-a"]}),
+                "project-import-key",
+                60,
+                10,
+            )
+            .unwrap();
+        assert_eq!(approval.action, CommandAction::ProjectApprove);
     }
 }

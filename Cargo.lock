@@ -207,12 +207,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c7f02d4ea65f2c1853089ffd8d2787bdbc63de2f0d29dedbcf8ccdfa0ccd4cf"
 
 [[package]]
-name = "base32"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "022dfe9eb35f19ebbcb51e0b40a5ab759f46ad60cadf7297e0bd085afb50e076"
-
-[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -375,12 +369,6 @@ name = "const-oid"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
-
-[[package]]
-name = "constant_time_eq"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
 
 [[package]]
 name = "constant_time_eq"
@@ -587,7 +575,7 @@ checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
 name = "farhelm-agent"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -597,6 +585,7 @@ dependencies = [
  "farhelm-updater",
  "flate2",
  "libc",
+ "rand 0.9.5",
  "regex",
  "reqwest",
  "rpassword",
@@ -614,14 +603,14 @@ dependencies = [
 
 [[package]]
 name = "farhelm-core"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "farhelm-hub"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -629,7 +618,7 @@ dependencies = [
  "axum",
  "base64",
  "clap",
- "constant_time_eq 0.4.2",
+ "constant_time_eq",
  "farhelm-core",
  "farhelm-lifecycle",
  "farhelm-protocol",
@@ -640,10 +629,11 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
  "thiserror",
  "tokio",
  "toml",
- "totp-rs",
  "tower",
  "tracing",
  "tracing-subscriber",
@@ -653,7 +643,7 @@ dependencies = [
 
 [[package]]
 name = "farhelm-lifecycle"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "tempfile",
@@ -661,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "farhelm-protocol"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -671,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "farhelm-test-support"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "farhelm-protocol",
  "serde_json",
@@ -679,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "farhelm-updater"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "reqwest",
@@ -1819,17 +1809,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sha1"
-version = "0.10.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.17",
- "digest 0.10.7",
-]
-
-[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2137,21 +2116,6 @@ name = "toml_writer"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
-
-[[package]]
-name = "totp-rs"
-version = "5.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50e69a15e21b2ff22c415446983978bded3244195f17d59cb113551c1e806f91"
-dependencies = [
- "base32",
- "constant_time_eq 0.3.1",
- "hmac 0.12.1",
- "sha1",
- "sha2 0.10.9",
- "url",
- "urlencoding",
-]
 
 [[package]]
 name = "tower"

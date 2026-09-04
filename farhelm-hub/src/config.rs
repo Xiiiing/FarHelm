@@ -89,11 +89,6 @@ impl HubFileConfig {
             legacy.get("FARHELM_ADMIN_PASSWORD"),
             true,
         )?;
-        let token = value_or_prompt(
-            "FARHELM_AGENT_TOKEN",
-            legacy.get("FARHELM_AGENT_TOKEN"),
-            true,
-        )?;
         let bind = std::env::var("FARHELM_HUB_BIND")
             .ok()
             .or_else(|| legacy.get("FARHELM_HUB_BIND").cloned())
@@ -103,29 +98,6 @@ impl HubFileConfig {
             .or_else(|| legacy.get("FARHELM_HUB_DATABASE").map(PathBuf::from))
             .unwrap_or_else(default_database);
         let password_hash = hash_secret(&password)?;
-        let mut secret_bytes = [0_u8; 20];
-        rand::rng().fill_bytes(&mut secret_bytes);
-        let totp_secret = match totp_rs::Secret::Raw(secret_bytes.to_vec()).to_encoded() {
-            totp_rs::Secret::Encoded(secret) => secret,
-            totp_rs::Secret::Raw(_) => unreachable!(),
-        };
-        eprintln!("FarHelm TOTP secret (add it to your authenticator): {totp_secret}");
-        let mut recovery_codes = Vec::new();
-        let mut recovery_code_hashes = Vec::new();
-        for _ in 0..8 {
-            let mut bytes = [0_u8; 10];
-            rand::rng().fill_bytes(&mut bytes);
-            let code = bytes
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
-            recovery_code_hashes.push(hash_secret(&code)?);
-            recovery_codes.push(code);
-        }
-        eprintln!(
-            "FarHelm one-time recovery codes (store offline): {}",
-            recovery_codes.join(" ")
-        );
         let config = Self {
             hub: HubSection {
                 bind,
@@ -136,11 +108,11 @@ impl HubFileConfig {
                 user,
                 password: None,
                 password_hash: Some(password_hash),
-                totp_secret: Some(totp_secret),
-                recovery_code_hashes,
+                totp_secret: None,
+                recovery_code_hashes: Vec::new(),
             },
             agents: AgentAuthSection {
-                token,
+                token: String::new(),
                 tokens: BTreeMap::new(),
             },
             push: Some(generate_push_section()?),
@@ -174,38 +146,6 @@ impl HubFileConfig {
                 .context("admin password is missing")?;
             self.admin.password_hash = Some(hash_secret(password)?);
             self.admin.password = None;
-            changed = true;
-        }
-        if self.admin.totp_secret.is_none() {
-            let mut bytes = [0_u8; 20];
-            rand::rng().fill_bytes(&mut bytes);
-            self.admin.totp_secret =
-                Some(match totp_rs::Secret::Raw(bytes.to_vec()).to_encoded() {
-                    totp_rs::Secret::Encoded(value) => value,
-                    totp_rs::Secret::Raw(_) => unreachable!(),
-                });
-            eprintln!(
-                "FarHelm TOTP secret (add it to your authenticator): {}",
-                self.admin.totp_secret.as_deref().unwrap_or_default()
-            );
-            changed = true;
-        }
-        if self.admin.recovery_code_hashes.is_empty() {
-            let mut recovery_codes = Vec::new();
-            for _ in 0..8 {
-                let mut bytes = [0_u8; 10];
-                rand::rng().fill_bytes(&mut bytes);
-                let code = bytes
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>();
-                self.admin.recovery_code_hashes.push(hash_secret(&code)?);
-                recovery_codes.push(code);
-            }
-            eprintln!(
-                "FarHelm one-time recovery codes (store offline): {}",
-                recovery_codes.join(" ")
-            );
             changed = true;
         }
         if self.push.is_none() {
@@ -257,7 +197,7 @@ fn generate_push_section() -> Result<PushSection> {
     Ok(section)
 }
 
-fn hash_secret(secret: &str) -> Result<String> {
+pub(crate) fn hash_secret(secret: &str) -> Result<String> {
     let mut salt = [0_u8; 16];
     rand::rng().fill_bytes(&mut salt);
     let salt = SaltString::encode_b64(&salt)

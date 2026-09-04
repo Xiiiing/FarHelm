@@ -4,14 +4,14 @@
   <p><strong>A remote control plane for personal research and GPU training environments</strong></p>
   <p>See training-host status from your phone and safely extend remote control without exposing inbound ports on training machines.</p>
   <p>
-    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.4.1">V0.4.1</a> ·
+    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.5.0">V0.5.0</a> ·
     <a href="./deploy/README.en.md">Deployment guide</a> ·
     <a href="./README.md">简体中文</a>
   </p>
 </div>
 
 > [!IMPORTANT]
-> The current `V0.4.1` release provides the minimum “experiment finished → next Codex step” loop: explicit local PID registration, reliable completion events, log-marker outcome classification, idempotent preset prompts on success, and mobile access to old/new Codex sessions with streamed replies. It does not provide remote training control, automatic process discovery, GPU/TensorBoard charts, or arbitrary shell execution.
+> The current `V0.5.0` release adds zero-configuration onboarding to the “experiment finished → next Codex step” loop: password-only login, 30-day persistent sessions, short-code Agent pairing, and automatic discovery plus one-click import of existing Codex projects. It does not provide remote training control, automatic training-process discovery, GPU/TensorBoard charts, or arbitrary shell execution.
 
 ## Quick install
 
@@ -28,7 +28,7 @@ chmod +x farhelm-hub
 sudo ./farhelm-hub install
 ```
 
-The program prompts for the administrator username, password, and migration Agent token, then generates a TOTP secret and one-time recovery codes. The installed program is `/usr/local/bin/farhelm-hub`; configure one 256-bit token per Agent under `agents.tokens` in `hub.toml`.
+The program asks only for the administrator username and password. TOTP and shared Agent tokens are no longer generated. The installed program is `/usr/local/bin/farhelm-hub`; after signing in, use “Servers → Add server” to create a one-time eight-digit pairing code.
 
 ### Agent
 
@@ -42,7 +42,7 @@ chmod +x farhelm-agent
 ./farhelm-agent install
 ```
 
-The program prompts for the Hub HTTPS URL, Agent token, and Agent ID. The installed program is `${XDG_BIN_HOME:-$HOME/.local/bin}/farhelm-agent`; the downloaded copy may be deleted after installation succeeds.
+The program asks only for the Hub HTTPS URL and the eight-digit code shown by the Console. It obtains a dedicated 256-bit token and stores it in a mode-`0600` configuration automatically. The installed program is `${XDG_BIN_HOME:-$HOME/.local/bin}/farhelm-agent`; the downloaded copy may be deleted after installation succeeds.
 
 See the [deployment guide](deploy/README.en.md) for non-interactive installation, Caddy, systemd, migration, and removal details.
 
@@ -65,6 +65,7 @@ sudo farhelm-hub restart
 sudo farhelm-hub update --check
 sudo farhelm-hub update
 sudo farhelm-hub rollback
+sudo farhelm-hub admin reset-password
 
 # Agent
 farhelm-agent doctor
@@ -73,6 +74,7 @@ farhelm-agent restart
 farhelm-agent update --check
 farhelm-agent update
 farhelm-agent rollback
+farhelm-agent pair
 
 # List old Codex sessions
 farhelm-agent codex sessions --project cc08
@@ -88,8 +90,8 @@ If the current shell does not yet include `~/.local/bin`, temporarily use the co
 
 ## What is implemented
 
-- `farhelm-hub`: Rust control plane with password + TOTP, Secure HttpOnly cookies, CSRF, login throttling, SQLite command/event truth, SSE replay, plus encrypted VAPID Push delivery with bounded backoff retries.
-- `farhelm-agent`: regular-user outbound operation, explicit PID watches, PID-reuse protection, log-tail classification, SQLite inbox/outbox, dedicated Agent tokens, and isolated worktrees.
+- `farhelm-hub`: Rust control plane with password login, SQLite-backed 30-day sessions, short-code pairing, Secure HttpOnly cookies, CSRF, login throttling, reliable events, SSE replay, and Web Push.
+- `farhelm-agent`: regular-user outbound operation, automatic Codex project discovery, a local approval registry, explicit PID watches, PID-reuse protection, SQLite inbox/outbox, and isolated worktrees.
 - `farhelm-console`: React, TypeScript, Ant Design, and Vite PWA with mobile/desktop experiment and Codex views, streamed replies, and notification deep-link handling.
 - `farhelm-worker-codex`: Agent-private Python stdio adapter pinned to `openai-codex==0.147.0`, covering thread list/start/resume and turn start/steer/interrupt.
 
@@ -132,7 +134,7 @@ make test-release
 ## Security and version policy
 
 - Agent needs no root access and opens no public inbound port. Hub binds only to loopback and is exposed through Caddy or an equivalent HTTPS reverse proxy.
-- Administrator credentials and Agent tokens are independent and stored in permission-restricted TOML configuration.
+- Administrator passwords use Argon2id. Hub stores only hashes of browser-session and Agent tokens; the raw Agent token crosses the network once in the pairing response.
 - Hub does not store Codex login credentials, SSH private keys, project source, or complete local logs.
 - Worker communicates with Agent only over stdin/stdout. Mutations require allowlists, TTLs, idempotency, and auditing.
 - Versions use `MAJOR.MINOR.PATCH`: only the user may decide the first number; features increase the second, and fixes increase the third.
@@ -140,7 +142,7 @@ make test-release
 
 ## Roadmap
 
-1. Complete the V0.4 canary on A6000/CC08, Titan/work831, and 3090/work832.
+1. Complete the V0.5 zero-configuration canary on A6000/CC08, Titan/work831, and 3090/work832.
 2. Production-validate background Web Push from the iPhone home-screen PWA.
 3. Evaluate GPU metrics and TensorBoard from real experiment needs, without adding remote training control.
 

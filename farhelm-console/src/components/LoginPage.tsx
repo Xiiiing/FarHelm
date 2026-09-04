@@ -1,4 +1,4 @@
-import { LockOutlined, SafetyCertificateOutlined, UserOutlined } from '@ant-design/icons'
+import { LockOutlined, UserOutlined } from '@ant-design/icons'
 import { Alert, Button, Card, Form, Input, Typography } from 'antd'
 import { useState } from 'react'
 
@@ -7,9 +7,9 @@ import { login, type BrowserSession } from '../api/auth'
 export function LoginPage({ onLogin }: { onLogin: (session: BrowserSession) => void }) {
   const [error, setError] = useState<string>()
   const [loading, setLoading] = useState(false)
-  const submit = async (values: { username: string; password: string; totp: string }) => {
+  const submit = async (values: { username: string; password: string }) => {
     setLoading(true); setError(undefined)
-    try { onLogin(await login(values.username, values.password, values.totp)) }
+    try { onLogin(await login(values.username, values.password)) }
     catch (reason) { setError(reason instanceof Error ? reason.message : '登录失败') }
     finally { setLoading(false) }
   }
@@ -20,8 +20,7 @@ export function LoginPage({ onLogin }: { onLogin: (session: BrowserSession) => v
       <Form layout="vertical" requiredMark={false} onFinish={submit}>
         <Form.Item label="用户名" name="username" rules={[{ required: true }]}><Input prefix={<UserOutlined />} autoComplete="username" /></Form.Item>
         <Form.Item label="密码" name="password" rules={[{ required: true }]}><Input.Password prefix={<LockOutlined />} autoComplete="current-password" /></Form.Item>
-        <Form.Item label="TOTP 或恢复码" name="totp" rules={[{ required: true }]}><Input prefix={<SafetyCertificateOutlined />} inputMode="numeric" autoComplete="one-time-code" /></Form.Item>
-        <Button type="primary" htmlType="submit" loading={loading} block>安全登录</Button>
+        <Button type="primary" htmlType="submit" loading={loading} block>登录</Button>
       </Form>
     </Card>
   </main>
