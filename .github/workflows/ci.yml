@@ -95,6 +95,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.9"
       - run: ./scripts/build-release.sh
       - run: ./tests/deployment-package.sh
       - uses: actions/upload-artifact@v4
