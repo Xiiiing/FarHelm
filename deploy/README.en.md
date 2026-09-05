@@ -1,4 +1,4 @@
-# FarHelm V0.5.0 deployment and lifecycle
+# FarHelm V0.6.0 deployment and lifecycle
 
 [简体中文](README.md) · [English](README.en.md)
 
@@ -21,7 +21,7 @@ sudo env \
   ./farhelm-hub install
 ```
 
-V0.4.1 upgrades directly with `update`; SQLite session, pairing, and project tables are created idempotently on restart. Old TOTP and token fields remain for local rollback, but V0.5.0 does not require TOTP. A backup is still recommended before the first V0.3.0 cross-generation install:
+V0.5.0 upgrades directly with `update`; SQLite session, pairing, project, and schedule tables are created idempotently on restart. Old TOTP and token fields remain for local rollback, but V0.6.0 does not require TOTP. A backup is still recommended before the first V0.3.0 cross-generation install:
 
 ```bash
 sudo cp /var/lib/farhelm/farhelm.db /var/lib/farhelm/farhelm.db.v0.3.bak
@@ -86,8 +86,8 @@ chmod +x farhelm-agent
 Agent downloads the independent Python 3.12/Codex runtime from the matching immutable Release and verifies its length and SHA-256. For an offline installation, transfer the matching runtime asset first and provide trusted verification metadata:
 
 ```bash
-FARHELM_CODEX_RUNTIME_ARCHIVE="$PWD/farhelm-codex-runtime-0.5.0-linux-x86_64.tar.gz" \
-FARHELM_CODEX_RUNTIME_SIZE="$(stat -c '%s' farhelm-codex-runtime-0.5.0-linux-x86_64.tar.gz)" \
+FARHELM_CODEX_RUNTIME_ARCHIVE="$PWD/farhelm-codex-runtime-0.6.0-linux-x86_64.tar.gz" \
+FARHELM_CODEX_RUNTIME_SIZE="$(stat -c '%s' farhelm-codex-runtime-0.6.0-linux-x86_64.tar.gz)" \
 FARHELM_CODEX_RUNTIME_SHA256="copy-from-trusted-SHA256SUMS" \
 ./farhelm-agent install
 ```
@@ -150,9 +150,9 @@ farhelm-agent uninstall --keep-data
 
 ## Migrating from V0.2.0
 
-Hosts already on `V0.3.0`, `V0.4.0`, or `V0.4.1` can run `farhelm-hub update` or `farhelm-agent update` directly. `V0.2.0` must first upgrade to `V0.3.0` to migrate the old layout, then upgrade to V0.5.0.
+Hosts already on `V0.3.0` through `V0.5.0` can run `farhelm-hub update` or `farhelm-agent update` directly. `V0.2.0` must first upgrade to `V0.3.0` to migrate the old layout, then upgrade to V0.6.0.
 
-Lowercase legacy `v0.1.0/v0.2.0` releases are outside the formal update sequence. Remove them with their matching old uninstaller before installing V0.5.0.
+Lowercase legacy `v0.1.0/v0.2.0` releases are outside the formal update sequence. Remove them with their matching old uninstaller before installing V0.6.0.
 
 ## Security notes
 

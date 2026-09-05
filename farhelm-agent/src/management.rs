@@ -606,7 +606,7 @@ mod tests {
             config: "/tmp/home/.config/farhelm/agent.toml".into(),
             data: "/tmp/home/.local/share/farhelm".into(),
             database: "/tmp/home/.local/share/farhelm/state/agent.db".into(),
-            worker: "/tmp/home/.local/share/farhelm/runtime/codex-worker/0.5.0".into(),
+            worker: "/tmp/home/.local/share/farhelm/runtime/codex-worker/0.6.0".into(),
             unit: "/tmp/home/.config/systemd/user/farhelm-agent.service".into(),
             legacy_root: "/tmp/home/.local/share/farhelm-agent".into(),
         };

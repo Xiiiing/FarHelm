@@ -6,7 +6,8 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, ensure};
 use farhelm_protocol::{
-    AgentEvent, CodexSessionListResponse, CodexSessionMode, CodexSessionState, CodexSessionSummary,
+    AgentEvent, CodexScheduleListResponse, CodexScheduleState, CodexScheduleSummary,
+    CodexSessionListResponse, CodexSessionMode, CodexSessionState, CodexSessionSummary,
     ExperimentListResponse, ExperimentState, ExperimentSummary, FARHELM_PROTOCOL,
     ProjectCandidateState, ProjectCandidateSummary, ProjectListResponse,
 };
@@ -99,6 +100,16 @@ impl EventStore {
                 state TEXT NOT NULL CHECK (state IN ('creating','idle','queued','running','interrupting','failed','orphaned','archived')),
                 title TEXT,
                 active_turn_id TEXT,
+                updated_at_unix INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS codex_schedules (
+                schedule_id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                trigger_json TEXT NOT NULL,
+                state TEXT NOT NULL,
+                created_at_unix INTEGER NOT NULL,
                 updated_at_unix INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS push_subscriptions (
@@ -493,6 +504,7 @@ impl EventStore {
         Ok(CodexSessionListResponse {
             protocol: FARHELM_PROTOCOL.to_owned(),
             sessions: rows.collect::<rusqlite::Result<Vec<_>>>()?,
+            next_cursor: None,
         })
     }
 
@@ -505,6 +517,42 @@ impl EventStore {
                 session_id: row.get(0)?, agent_id: row.get(1)?, project_id: row.get(2)?, mode: parse_mode(&row.get::<_,String>(3)?)?,
                 state: parse_session_state(&row.get::<_,String>(4)?)?, title: row.get(5)?, active_turn_id: row.get(6)?, updated_at_unix: row_u64(row,7)?,
             }),
+        ).optional().map_err(Into::into)
+    }
+
+    pub fn schedules(&self, session_id: Option<&str>) -> Result<CodexScheduleListResponse> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT schedule_id,agent_id,session_id,project_id,trigger_json,state,created_at_unix,updated_at_unix
+             FROM codex_schedules WHERE (?1 IS NULL OR session_id=?1) ORDER BY updated_at_unix DESC,schedule_id DESC",
+        )?;
+        let rows = statement.query_map([session_id], |row| {
+            let trigger: String = row.get(4)?;
+            Ok(CodexScheduleSummary {
+                schedule_id: row.get(0)?,
+                agent_id: row.get(1)?,
+                session_id: row.get(2)?,
+                project_id: row.get(3)?,
+                trigger: serde_json::from_str(&trigger).map_err(json_conversion(4))?,
+                state: parse_schedule_state(&row.get::<_, String>(5)?)?,
+                created_at_unix: row_u64(row, 6)?,
+                updated_at_unix: row_u64(row, 7)?,
+            })
+        })?;
+        Ok(CodexScheduleListResponse {
+            protocol: FARHELM_PROTOCOL.to_owned(),
+            schedules: rows.collect::<rusqlite::Result<Vec<_>>>()?,
+        })
+    }
+
+    pub fn schedule(&self, schedule_id: &str) -> Result<Option<CodexScheduleSummary>> {
+        use rusqlite::OptionalExtension;
+        self.lock()?.query_row(
+            "SELECT schedule_id,agent_id,session_id,project_id,trigger_json,state,created_at_unix,updated_at_unix FROM codex_schedules WHERE schedule_id=?1",
+            [schedule_id], |row| {
+                let trigger: String = row.get(4)?;
+                Ok(CodexScheduleSummary { schedule_id:row.get(0)?,agent_id:row.get(1)?,session_id:row.get(2)?,project_id:row.get(3)?,trigger:serde_json::from_str(&trigger).map_err(json_conversion(4))?,state:parse_schedule_state(&row.get::<_,String>(5)?)?,created_at_unix:row_u64(row,6)?,updated_at_unix:row_u64(row,7)? })
+            }
         ).optional().map_err(Into::into)
     }
 
@@ -693,6 +741,21 @@ fn apply_materialized_view(
                 params![session.session_id,agent_id,session.project_id,mode_name(session.mode),session_state_name(session.state),session.title,session.active_turn_id,as_i64(session.updated_at_unix)?],
             )?;
         }
+        "codex.schedule.updated" => {
+            let mut value = event.payload.clone();
+            if let Value::Object(ref mut map) = value {
+                map.insert("agent_id".to_owned(), Value::String(agent_id.to_owned()));
+            }
+            let schedule: CodexScheduleSummary =
+                serde_json::from_value(value).context("invalid Codex schedule event")?;
+            connection.execute(
+                "INSERT INTO codex_schedules (schedule_id,agent_id,session_id,project_id,trigger_json,state,created_at_unix,updated_at_unix)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                 ON CONFLICT(schedule_id) DO UPDATE SET state=excluded.state,updated_at_unix=excluded.updated_at_unix
+                 WHERE excluded.updated_at_unix>=codex_schedules.updated_at_unix",
+                params![schedule.schedule_id,agent_id,schedule.session_id,schedule.project_id,serde_json::to_string(&schedule.trigger)?,schedule_state_name(schedule.state),as_i64(schedule.created_at_unix)?,as_i64(schedule.updated_at_unix)?],
+            )?;
+        }
         "project.discovered" | "project.updated" => {
             let candidate_id = required_string(&event.payload, "candidate_id")?;
             let display_name = required_string(&event.payload, "display_name")?;
@@ -747,6 +810,35 @@ fn apply_materialized_view(
         _ => {}
     }
     Ok(())
+}
+
+fn schedule_state_name(state: CodexScheduleState) -> &'static str {
+    match state {
+        CodexScheduleState::Pending => "pending",
+        CodexScheduleState::Queued => "queued",
+        CodexScheduleState::Running => "running",
+        CodexScheduleState::Completed => "completed",
+        CodexScheduleState::Cancelled => "cancelled",
+        CodexScheduleState::Skipped => "skipped",
+        CodexScheduleState::Missed => "missed",
+        CodexScheduleState::Failed => "failed",
+        CodexScheduleState::Orphaned => "orphaned",
+    }
+}
+
+fn parse_schedule_state(value: &str) -> rusqlite::Result<CodexScheduleState> {
+    match value {
+        "pending" => Ok(CodexScheduleState::Pending),
+        "queued" => Ok(CodexScheduleState::Queued),
+        "running" => Ok(CodexScheduleState::Running),
+        "completed" => Ok(CodexScheduleState::Completed),
+        "cancelled" => Ok(CodexScheduleState::Cancelled),
+        "skipped" => Ok(CodexScheduleState::Skipped),
+        "missed" => Ok(CodexScheduleState::Missed),
+        "failed" => Ok(CodexScheduleState::Failed),
+        "orphaned" => Ok(CodexScheduleState::Orphaned),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
 }
 
 fn required_string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {

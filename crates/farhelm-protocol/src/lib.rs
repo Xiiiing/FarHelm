@@ -106,6 +106,10 @@ pub enum CommandAction {
     CodexTurnSteer,
     #[serde(rename = "codex.turn.interrupt")]
     CodexTurnInterrupt,
+    #[serde(rename = "codex.schedule.create")]
+    CodexScheduleCreate,
+    #[serde(rename = "codex.schedule.cancel")]
+    CodexScheduleCancel,
     #[serde(rename = "project.approve")]
     ProjectApprove,
 }
@@ -154,6 +158,8 @@ pub struct CommandAccepted {
 pub struct CommandClaimRequest {
     pub protocol: String,
     pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,6 +276,131 @@ pub struct CodexSessionSummary {
 pub struct CodexSessionListResponse {
     pub protocol: String,
     pub sessions: Vec<CodexSessionSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexTranscriptItemKind {
+    UserMessage,
+    AssistantMessage,
+    CommandSummary,
+    FileChangeSummary,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexTranscriptItem {
+    pub item_id: String,
+    pub kind: CodexTranscriptItemKind,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexTranscriptTurn {
+    pub turn_id: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_unix: Option<u64>,
+    pub items: Vec<CodexTranscriptItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexTranscriptPage {
+    pub protocol: String,
+    pub session_id: String,
+    pub turns: Vec<CodexTranscriptTurn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexScheduleState {
+    Pending,
+    Queued,
+    Running,
+    Completed,
+    Cancelled,
+    Skipped,
+    Missed,
+    Failed,
+    Orphaned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CodexScheduleTrigger {
+    AtTime { run_at_unix: u64 },
+    ExperimentSucceeded { watch_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateCodexScheduleRequest {
+    pub prompt: String,
+    pub trigger: CodexScheduleTrigger,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexScheduleSummary {
+    pub schedule_id: String,
+    pub agent_id: String,
+    pub session_id: String,
+    pub project_id: String,
+    pub trigger: CodexScheduleTrigger,
+    pub state: CodexScheduleState,
+    pub created_at_unix: u64,
+    pub updated_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexScheduleListResponse {
+    pub protocol: String,
+    pub schedules: Vec<CodexScheduleSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexScheduleDetail {
+    #[serde(flatten)]
+    pub summary: CodexScheduleSummary,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentReadClaimRequest {
+    pub protocol: String,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentReadRequest {
+    pub request_id: String,
+    pub method: String,
+    pub params: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentReadClaimResponse {
+    pub protocol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request: Option<AgentReadRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentReadReportRequest {
+    pub protocol: String,
+    pub agent_id: String,
+    pub request_id: String,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

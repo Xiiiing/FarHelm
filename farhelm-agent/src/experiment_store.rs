@@ -9,7 +9,8 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use farhelm_protocol::{
-    AgentCommand, AgentEvent, CommandAction, ExperimentState, FARHELM_PROTOCOL,
+    AgentCommand, AgentEvent, CodexScheduleState, CodexScheduleTrigger, CommandAction,
+    ExperimentState, FARHELM_PROTOCOL,
 };
 use rand::RngCore;
 use regex::Regex;
@@ -69,6 +70,14 @@ pub struct AutoPrompt {
     pub new_session_mode: Option<String>,
     pub prompt: String,
     pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScheduledPrompt {
+    pub schedule_id: String,
+    pub project_id: String,
+    pub session_id: String,
+    pub prompt: String,
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +205,17 @@ impl ExperimentStore {
                 success_patterns_json TEXT NOT NULL DEFAULT '[]',
                 failure_patterns_json TEXT NOT NULL DEFAULT '[]',
                 updated_at_unix INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS codex_prompt_schedules (
+                schedule_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                trigger_json TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('pending','queued','running','completed','cancelled','skipped','missed','failed','orphaned')),
+                grace_expires_at_unix INTEGER,
+                created_at_unix INTEGER NOT NULL,
+                updated_at_unix INTEGER NOT NULL
             );",
         )?;
         ensure_remote_command_columns(&connection)?;
@@ -222,6 +242,203 @@ impl ExperimentStore {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn create_schedule(&self, payload: &Value, now: u64) -> Result<String> {
+        let schedule_id = required_payload_string(payload, "schedule_id")?;
+        let project_id = required_payload_string(payload, "project_id")?;
+        let session_id = required_payload_string(payload, "session_id")?;
+        let prompt = required_payload_string(payload, "prompt")?;
+        ensure!(
+            prompt.len() <= PROMPT_LIMIT,
+            "scheduled prompt exceeds 32 KiB"
+        );
+        let trigger: CodexScheduleTrigger = serde_json::from_value(
+            payload
+                .get("trigger")
+                .cloned()
+                .context("schedule omitted trigger")?,
+        )?;
+        let grace = match &trigger {
+            CodexScheduleTrigger::AtTime { run_at_unix } => {
+                Some(run_at_unix.saturating_add(24 * 60 * 60))
+            }
+            CodexScheduleTrigger::ExperimentSucceeded { watch_id } => {
+                let valid: bool = self.lock()?.query_row("SELECT EXISTS(SELECT 1 FROM experiment_watches WHERE watch_id=?1 AND project_id=?2 AND state='watching')",params![watch_id,project_id],|row|row.get(0))?;
+                ensure!(valid, "scheduled experiment is not watching");
+                None
+            }
+        };
+        let connection = self.lock()?;
+        connection.execute(
+            "INSERT INTO codex_prompt_schedules (schedule_id,project_id,session_id,trigger_json,prompt,state,grace_expires_at_unix,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,?5,'pending',?6,?7,?7)",
+            params![schedule_id,project_id,session_id,serde_json::to_string(&trigger)?,prompt,grace.map(as_i64).transpose()?,as_i64(now)?],
+        )?;
+        drop(connection);
+        self.enqueue_schedule_event(
+            schedule_id,
+            project_id,
+            session_id,
+            &trigger,
+            CodexScheduleState::Pending,
+            (now, now),
+        )?;
+        Ok(schedule_id.to_owned())
+    }
+
+    pub fn cancel_schedule(&self, schedule_id: &str, now: u64) -> Result<()> {
+        let connection = self.lock()?;
+        let row: Option<(String,String,String,u64)> = connection.query_row(
+            "SELECT project_id,session_id,trigger_json,created_at_unix FROM codex_prompt_schedules WHERE schedule_id=?1 AND state IN ('pending','queued')",
+            [schedule_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row_u64(row,3)?))
+        ).optional()?;
+        let (project, session, encoded, created) = row.context("schedule is not cancellable")?;
+        connection.execute("UPDATE codex_prompt_schedules SET state='cancelled',updated_at_unix=?1 WHERE schedule_id=?2",params![as_i64(now)?,schedule_id])?;
+        drop(connection);
+        self.enqueue_schedule_event(
+            schedule_id,
+            &project,
+            &session,
+            &serde_json::from_str(&encoded)?,
+            CodexScheduleState::Cancelled,
+            (created, now),
+        )
+    }
+
+    pub fn schedule_detail(&self, schedule_id: &str) -> Result<Value> {
+        self.lock()?.query_row(
+            "SELECT schedule_id,project_id,session_id,trigger_json,prompt,state,created_at_unix,updated_at_unix FROM codex_prompt_schedules WHERE schedule_id=?1",
+            [schedule_id], |row| {
+                let trigger:String=row.get(3)?;
+                Ok(json!({"summary":{"schedule_id":row.get::<_,String>(0)?,"project_id":row.get::<_,String>(1)?,"session_id":row.get::<_,String>(2)?,"trigger":serde_json::from_str::<Value>(&trigger).map_err(json_conversion(3))?,"state":row.get::<_,String>(5)?,"created_at_unix":row_u64(row,6)?,"updated_at_unix":row_u64(row,7)?},"prompt":row.get::<_,String>(4)?}))
+            }
+        ).optional()?.context("schedule not found")
+    }
+
+    pub fn due_schedules(&self, now: u64) -> Result<Vec<ScheduledPrompt>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare("SELECT schedule_id,project_id,session_id,trigger_json,prompt,grace_expires_at_unix,created_at_unix FROM codex_prompt_schedules WHERE state='pending' ORDER BY created_at_unix")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row_u64(row, 6)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let mut due = Vec::new();
+        let mut terminal = Vec::new();
+        for (id, project, session, encoded, prompt, grace, created) in rows {
+            let trigger: CodexScheduleTrigger = serde_json::from_str(&encoded)?;
+            match &trigger {
+                CodexScheduleTrigger::AtTime { run_at_unix } if now >= *run_at_unix => {
+                    if grace.is_some_and(|value| now > value as u64) {
+                        terminal.push((
+                            id,
+                            project,
+                            session,
+                            trigger,
+                            created,
+                            CodexScheduleState::Missed,
+                        ));
+                    } else {
+                        due.push(ScheduledPrompt {
+                            schedule_id: id,
+                            project_id: project,
+                            session_id: session,
+                            prompt,
+                        });
+                    }
+                }
+                CodexScheduleTrigger::ExperimentSucceeded { watch_id } => {
+                    let state: Option<String> = connection
+                        .query_row(
+                            "SELECT state FROM experiment_watches WHERE watch_id=?1",
+                            [watch_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    match state.as_deref() {
+                        Some("succeeded") => due.push(ScheduledPrompt {
+                            schedule_id: id,
+                            project_id: project,
+                            session_id: session,
+                            prompt,
+                        }),
+                        Some("failed" | "unknown" | "cancelled") | None => terminal.push((
+                            id,
+                            project,
+                            session,
+                            trigger,
+                            created,
+                            CodexScheduleState::Skipped,
+                        )),
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (id, _, _, _, _, state) in &terminal {
+            connection.execute("UPDATE codex_prompt_schedules SET state=?1,updated_at_unix=?2 WHERE schedule_id=?3 AND state='pending'",params![schedule_state_name(*state),as_i64(now)?,id])?;
+        }
+        drop(connection);
+        for (id, project, session, trigger, created, state) in terminal {
+            self.enqueue_schedule_event(&id, &project, &session, &trigger, state, (created, now))?;
+        }
+        Ok(due)
+    }
+
+    pub fn claim_schedule(&self, schedule_id: &str, now: u64) -> Result<bool> {
+        Ok(self.lock()?.execute("UPDATE codex_prompt_schedules SET state='running',updated_at_unix=?1 WHERE schedule_id=?2 AND state='pending'",params![as_i64(now)?,schedule_id])? == 1)
+    }
+
+    pub fn finish_schedule(
+        &self,
+        schedule_id: &str,
+        state: CodexScheduleState,
+        now: u64,
+    ) -> Result<()> {
+        ensure!(
+            matches!(
+                state,
+                CodexScheduleState::Completed
+                    | CodexScheduleState::Failed
+                    | CodexScheduleState::Orphaned
+            ),
+            "invalid schedule terminal state"
+        );
+        let connection = self.lock()?;
+        let row:(String,String,String,u64)=connection.query_row("SELECT project_id,session_id,trigger_json,created_at_unix FROM codex_prompt_schedules WHERE schedule_id=?1",[schedule_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row_u64(row,3)?)))?;
+        connection.execute("UPDATE codex_prompt_schedules SET state=?1,prompt='',updated_at_unix=?2 WHERE schedule_id=?3 AND state='running'",params![schedule_state_name(state),as_i64(now)?,schedule_id])?;
+        drop(connection);
+        self.enqueue_schedule_event(
+            schedule_id,
+            &row.0,
+            &row.1,
+            &serde_json::from_str(&row.2)?,
+            state,
+            (row.3, now),
+        )
+    }
+
+    fn enqueue_schedule_event(
+        &self,
+        schedule_id: &str,
+        project_id: &str,
+        session_id: &str,
+        trigger: &CodexScheduleTrigger,
+        state: CodexScheduleState,
+        timestamps: (u64, u64),
+    ) -> Result<()> {
+        let (created, now) = timestamps;
+        self.enqueue_event(&format!("schedule:{schedule_id}:{now}"),"codex.schedule.updated",&json!({"schedule_id":schedule_id,"project_id":project_id,"session_id":session_id,"trigger":trigger,"state":state,"created_at_unix":created,"updated_at_unix":now}),now)
     }
 
     pub fn approved_projects(&self) -> Result<BTreeMap<String, ApprovedProject>> {
@@ -1298,6 +1515,8 @@ const fn action_name(action: CommandAction) -> &'static str {
         CommandAction::CodexTurnStart => "codex.turn.start",
         CommandAction::CodexTurnSteer => "codex.turn.steer",
         CommandAction::CodexTurnInterrupt => "codex.turn.interrupt",
+        CommandAction::CodexScheduleCreate => "codex.schedule.create",
+        CommandAction::CodexScheduleCancel => "codex.schedule.cancel",
         CommandAction::ProjectApprove => "project.approve",
     }
 }
@@ -1309,8 +1528,32 @@ fn parse_action(value: &str) -> rusqlite::Result<CommandAction> {
         "codex.turn.start" => Ok(CommandAction::CodexTurnStart),
         "codex.turn.steer" => Ok(CommandAction::CodexTurnSteer),
         "codex.turn.interrupt" => Ok(CommandAction::CodexTurnInterrupt),
+        "codex.schedule.create" => Ok(CommandAction::CodexScheduleCreate),
+        "codex.schedule.cancel" => Ok(CommandAction::CodexScheduleCancel),
         "project.approve" => Ok(CommandAction::ProjectApprove),
         _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+fn required_payload_string<'a>(payload: &'a Value, key: &str) -> Result<&'a str> {
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("command omitted {key}"))
+}
+
+const fn schedule_state_name(state: CodexScheduleState) -> &'static str {
+    match state {
+        CodexScheduleState::Pending => "pending",
+        CodexScheduleState::Queued => "queued",
+        CodexScheduleState::Running => "running",
+        CodexScheduleState::Completed => "completed",
+        CodexScheduleState::Cancelled => "cancelled",
+        CodexScheduleState::Skipped => "skipped",
+        CodexScheduleState::Missed => "missed",
+        CodexScheduleState::Failed => "failed",
+        CodexScheduleState::Orphaned => "orphaned",
     }
 }
 
@@ -1567,5 +1810,54 @@ mod tests {
         let projects = store.approved_projects().unwrap();
         assert_eq!(projects["work-831"].path, project);
         assert!(projects["work-831"].success_patterns.is_empty());
+    }
+
+    #[test]
+    fn scheduled_prompt_is_due_once_and_prompt_is_erased_at_terminal_state() {
+        let store = ExperimentStore::open(Path::new(":memory:")).unwrap();
+        let payload = json!({
+            "schedule_id":"sch_one","project_id":"project-a","session_id":"session-a",
+            "prompt":"continue", "trigger":{"type":"at_time","run_at_unix":100}
+        });
+        store.create_schedule(&payload, 10).unwrap();
+        assert!(store.due_schedules(99).unwrap().is_empty());
+        let due = store.due_schedules(100).unwrap();
+        assert_eq!(due.len(), 1);
+        assert!(store.claim_schedule("sch_one", 100).unwrap());
+        assert!(!store.claim_schedule("sch_one", 100).unwrap());
+        store
+            .finish_schedule("sch_one", CodexScheduleState::Completed, 101)
+            .unwrap();
+        assert_eq!(store.schedule_detail("sch_one").unwrap()["prompt"], "");
+        assert!(
+            store
+                .pending_events("agent-a", 20)
+                .unwrap()
+                .iter()
+                .any(|event| event.event_type == "codex.schedule.updated"
+                    && event.payload["state"] == "completed")
+        );
+    }
+
+    #[test]
+    fn expired_schedule_is_missed_and_pending_schedule_can_be_cancelled() {
+        let store = ExperimentStore::open(Path::new(":memory:")).unwrap();
+        store.create_schedule(&json!({"schedule_id":"sch_old","project_id":"p","session_id":"s","prompt":"x","trigger":{"type":"at_time","run_at_unix":100}}), 10).unwrap();
+        assert!(
+            store
+                .due_schedules(100 + 24 * 60 * 60 + 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.schedule_detail("sch_old").unwrap()["summary"]["state"],
+            "missed"
+        );
+        store.create_schedule(&json!({"schedule_id":"sch_cancel","project_id":"p","session_id":"s","prompt":"x","trigger":{"type":"at_time","run_at_unix":200}}), 10).unwrap();
+        store.cancel_schedule("sch_cancel", 11).unwrap();
+        assert_eq!(
+            store.schedule_detail("sch_cancel").unwrap()["summary"]["state"],
+            "cancelled"
+        );
     }
 }

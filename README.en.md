@@ -4,14 +4,14 @@
   <p><strong>A remote control plane for personal research and GPU training environments</strong></p>
   <p>See training-host status from your phone and safely extend remote control without exposing inbound ports on training machines.</p>
   <p>
-    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.5.0">V0.5.0</a> ·
+    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.6.0">V0.6.0</a> ·
     <a href="./deploy/README.en.md">Deployment guide</a> ·
     <a href="./README.md">简体中文</a>
   </p>
 </div>
 
 > [!IMPORTANT]
-> The current `V0.5.0` release adds zero-configuration onboarding to the “experiment finished → next Codex step” loop: password-only login, 30-day persistent sessions, short-code Agent pairing, and automatic discovery plus one-click import of existing Codex projects. It does not provide remote training control, automatic training-process discovery, GPU/TensorBoard charts, or arbitrary shell execution.
+> The current `V0.6.0` release adds an immersive Codex workspace, paginated complete conversations, one-time scheduling, experiment-success triggers, and shorter session-sync and streaming paths. Codex content remains on the Agent. It still does not provide remote training control, automatic training-process discovery, GPU/TensorBoard charts, or arbitrary shell execution.
 
 ## Quick install
 

@@ -15,6 +15,7 @@ from farhelm_worker_codex.worker import (
     WORKER_PROTOCOL,
     CodexBackend,
     Emit,
+    _normalise_turn,
     _snapshot_agent_text,
     handle_request,
 )
@@ -36,7 +37,7 @@ def test_worker_hello_advertises_implemented_capabilities() -> None:
     assert response["request_id"] == "req_test"
     assert response["result"] == {
         "worker": "farhelm-worker-codex",
-        "version": "0.5.0",
+        "version": "0.6.0",
         "capabilities": CAPABILITIES,
     }
 
@@ -119,6 +120,9 @@ class FakeBackend:
 
     def session_resume(self, session_id: str, cwd: str, mode: str) -> Mapping[str, Any]:
         return {"session_id": session_id, "cwd": cwd, "mode": mode}
+
+    def session_history(self, session_id: str, cursor: str | None, limit: int) -> Mapping[str, Any]:
+        return {"session_id": session_id, "turns": [], "next_cursor": cursor, "limit": limit}
 
     def turn_start(
         self, session_id: str, prompt: str, idempotency_key: str, emit: Emit
@@ -217,8 +221,68 @@ def test_project_discovery_deduplicates_current_and_archived_thread_cwds() -> No
                 "archived_session_count": 1,
                 "updated_at_unix": 30,
             }
-        ]
+        ],
+        "sessions": [
+            {
+                "session_id": "archived",
+                "title": "Task",
+                "cwd": "/srv/project",
+                "archived": True,
+                "updated_at_unix": 30,
+            },
+            {
+                "session_id": "current",
+                "title": "Task",
+                "cwd": "/srv/project",
+                "archived": False,
+                "updated_at_unix": 20,
+            },
+        ],
     }
+
+
+def test_history_is_bounded_and_exposes_only_normalised_items() -> None:
+    response = handle_request(
+        request("codex.session.history", {"session_id": "ses", "limit": 20}), FakeBackend()
+    )
+    assert response["ok"] is True
+    assert response["result"]["session_id"] == "ses"
+    oversized = handle_request(
+        request("codex.session.history", {"session_id": "ses", "limit": 51}), FakeBackend()
+    )
+    assert oversized["error"]["code"] == "invalid_request"
+
+
+def test_transcript_normalisation_drops_reasoning_output_and_absolute_paths() -> None:
+    turn = _normalise_turn(
+        {
+            "id": "turn-a",
+            "status": "completed",
+            "items": [
+                {"id": "u", "type": "userMessage", "content": [{"type": "text", "text": "hello"}]},
+                {"id": "r", "type": "reasoning", "summary": ["hidden"]},
+                {
+                    "id": "c",
+                    "type": "commandExecution",
+                    "command": "python /srv/private/train.py --token secret",
+                    "aggregatedOutput": "private output",
+                    "exitCode": 0,
+                },
+                {
+                    "id": "f",
+                    "type": "fileChange",
+                    "changes": [
+                        {"kind": "update", "path": "/srv/private/model.py", "diff": "secret diff"}
+                    ],
+                },
+            ],
+        }
+    )
+    assert turn["items"] == [
+        {"item_id": "u", "kind": "user_message", "text": "hello"},
+        {"item_id": "c", "kind": "command_summary", "text": "python … · exit 0"},
+        {"item_id": "f", "kind": "file_change_summary", "text": "update: model.py"},
+    ]
 
 
 def test_turn_streams_and_preserves_idempotency_key() -> None:

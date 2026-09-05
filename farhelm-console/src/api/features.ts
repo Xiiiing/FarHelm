@@ -4,6 +4,11 @@ export type ExperimentState = 'watching' | 'succeeded' | 'failed' | 'unknown' | 
 export type Experiment = { watch_id: string; agent_id: string; project_id: string; name: string; pid: number; state: ExperimentState; session_id?: string; detail?: string; updated_at_unix: number }
 export type SessionState = 'creating' | 'idle' | 'queued' | 'running' | 'interrupting' | 'failed' | 'orphaned' | 'archived'
 export type CodexSession = { session_id: string; agent_id: string; project_id: string; mode: 'inspect' | 'edit'; state: SessionState; title?: string; active_turn_id?: string; updated_at_unix: number }
+export type TranscriptItem = { item_id: string; kind: 'user_message' | 'assistant_message' | 'command_summary' | 'file_change_summary' | 'error'; text: string }
+export type TranscriptTurn = { turn_id: string; status: string; started_at_unix?: number; completed_at_unix?: number; items: TranscriptItem[] }
+export type TranscriptPage = { protocol?: string; session_id: string; turns: TranscriptTurn[]; next_cursor?: string }
+export type ScheduleTrigger = { type: 'at_time'; run_at_unix: number } | { type: 'experiment_succeeded'; watch_id: string }
+export type CodexSchedule = { schedule_id: string; agent_id: string; session_id: string; project_id: string; trigger: ScheduleTrigger; state: 'pending' | 'queued' | 'running' | 'completed' | 'cancelled' | 'skipped' | 'missed' | 'failed' | 'orphaned'; created_at_unix: number; updated_at_unix: number }
 export type ProjectCandidate = { candidate_id: string; agent_id: string; display_name: string; suggested_project_id: string; session_count: number; state: 'discovered' | 'approved'; updated_at_unix: number }
 
 async function json<T>(url: string): Promise<T> {
@@ -19,11 +24,28 @@ export async function fetchExperiments(): Promise<Experiment[]> {
 }
 
 export async function fetchSessions(project?: string, archived: 'false' | 'true' | 'all' = 'false'): Promise<CodexSession[]> {
-  const params = new URLSearchParams({ archived }); if (project) params.set('project', project)
-  const query = `?${params.toString()}`
-  const value = await json<{ protocol: string; sessions: CodexSession[] }>(`/api/v1/codex/sessions${query}`)
-  if (value.protocol !== PROTOCOL_VERSION || !Array.isArray(value.sessions)) throw new Error('Hub returned invalid sessions')
-  return value.sessions
+  const sessions: CodexSession[] = []; let cursor: string | undefined
+  do {
+    const params = new URLSearchParams({ archived, limit: '50' }); if (project) params.set('project', project); if (cursor) params.set('cursor', cursor)
+    const value = await json<{ protocol: string; sessions: CodexSession[]; next_cursor?: string }>(`/api/v1/codex/sessions?${params}`)
+    if (value.protocol !== PROTOCOL_VERSION || !Array.isArray(value.sessions)) throw new Error('Hub returned invalid sessions')
+    sessions.push(...value.sessions); cursor = value.next_cursor
+  } while (cursor && sessions.length < 1000)
+  return sessions
+}
+
+export async function fetchTranscript(sessionId: string, cursor?: string): Promise<TranscriptPage> {
+  const params = new URLSearchParams({ limit: '20' }); if (cursor) params.set('cursor', cursor)
+  const value = await json<TranscriptPage>(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/transcript?${params}`)
+  if (!Array.isArray(value.turns) || value.session_id !== sessionId) throw new Error('Hub returned invalid transcript')
+  return value
+}
+
+export async function fetchSchedules(sessionId?: string): Promise<CodexSchedule[]> {
+  const suffix = sessionId ? `?session=${encodeURIComponent(sessionId)}` : ''
+  const value = await json<{ protocol: string; schedules: CodexSchedule[] }>(`/api/v1/codex/schedules${suffix}`)
+  if (value.protocol !== PROTOCOL_VERSION || !Array.isArray(value.schedules)) throw new Error('Hub returned invalid schedules')
+  return value.schedules
 }
 
 export async function fetchProjects(): Promise<ProjectCandidate[]> {
@@ -51,6 +73,12 @@ export function sendMessage(csrf: string, sessionId: string, prompt: string, del
 }
 export function interruptSession(csrf: string, sessionId: string) {
   return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/interrupt`, csrf)
+}
+export function createSchedule(csrf: string, sessionId: string, prompt: string, trigger: ScheduleTrigger) {
+  return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/schedules`, csrf, { prompt, trigger })
+}
+export function cancelSchedule(csrf: string, scheduleId: string) {
+  return mutate(`/api/v1/codex/schedules/${encodeURIComponent(scheduleId)}/cancel`, csrf)
 }
 export function importProjects(csrf: string, agentId: string, candidateIds: string[]) {
   return mutate('/api/v1/projects/import', csrf, { agent_id: agentId, candidate_ids: candidateIds })

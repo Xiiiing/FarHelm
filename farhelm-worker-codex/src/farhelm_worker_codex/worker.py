@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import shlex
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from time import monotonic
@@ -18,6 +20,7 @@ CAPABILITIES = [
     "codex.sessions.list",
     "codex.session.start",
     "codex.session.resume",
+    "codex.session.history",
     "codex.turn.start",
     "codex.turn.steer",
     "codex.turn.interrupt",
@@ -30,6 +33,9 @@ class Backend(Protocol):
     def sessions_list(self, project_path: str, archived: str) -> Mapping[str, Any]: ...
     def session_start(self, cwd: str, mode: str) -> Mapping[str, Any]: ...
     def session_resume(self, session_id: str, cwd: str, mode: str) -> Mapping[str, Any]: ...
+    def session_history(
+        self, session_id: str, cursor: str | None, limit: int
+    ) -> Mapping[str, Any]: ...
     def turn_start(
         self, session_id: str, prompt: str, idempotency_key: str, emit: Emit
     ) -> Mapping[str, Any]: ...
@@ -70,9 +76,19 @@ class CodexBackend:
 
     def projects_discover(self) -> Mapping[str, Any]:
         projects: dict[str, dict[str, Any]] = {}
+        sessions: list[dict[str, Any]] = []
         for archived in (False, True):
             for thread in self._threads(archived=archived):
                 cwd = _absolute_path(thread.cwd)
+                sessions.append(
+                    {
+                        "session_id": thread.id,
+                        "title": thread.name or thread.preview,
+                        "cwd": cwd,
+                        "archived": archived,
+                        "updated_at_unix": thread.updated_at,
+                    }
+                )
                 project = projects.setdefault(
                     cwd,
                     {
@@ -93,7 +109,10 @@ class CodexBackend:
             "projects": sorted(
                 projects.values(),
                 key=lambda item: (-int(item["updated_at_unix"]), str(item["cwd"])),
-            )
+            ),
+            "sessions": sorted(
+                sessions, key=lambda item: (-int(item["updated_at_unix"]), str(item["session_id"]))
+            ),
         }
 
     def sessions_list(self, project_path: str, archived: str) -> Mapping[str, Any]:
@@ -132,6 +151,28 @@ class CodexBackend:
             raise ValueError("session cwd does not match approved project")
         return _thread_result(response.thread)
 
+    def session_history(self, session_id: str, cursor: str | None, limit: int) -> Mapping[str, Any]:
+        from pydantic import BaseModel, ConfigDict, Field
+
+        class TurnsPage(BaseModel):
+            model_config = ConfigDict(populate_by_name=True, extra="ignore")
+            data: list[dict[str, Any]]
+            next_cursor: str | None = Field(default=None, alias="nextCursor")
+
+        request: dict[str, Any] = {
+            "threadId": session_id,
+            "limit": limit,
+            "itemsView": "full",
+        }
+        if cursor is not None:
+            request["cursor"] = cursor
+        response = self._client.request("thread/turns/list", request, response_model=TurnsPage)
+        return {
+            "session_id": session_id,
+            "turns": [_normalise_turn(turn) for turn in response.data],
+            "next_cursor": response.next_cursor,
+        }
+
     def turn_start(
         self, session_id: str, prompt: str, idempotency_key: str, emit: Emit
     ) -> Mapping[str, Any]:
@@ -140,28 +181,6 @@ class CodexBackend:
         )
         turn_id = started.turn.id
         emit(_event("codex.turn.started", {"session_id": session_id, "turn_id": turn_id}))
-        snapshot = self._client.thread_read(session_id, include_turns=True).thread
-        for turn in snapshot.turns:
-            if turn.id != turn_id:
-                continue
-            turn_data = _model_json(turn)
-            status = str(turn_data.get("status", "inProgress"))
-            if status != "inProgress":
-                recovered_delta = _snapshot_agent_text(turn_data)
-                if recovered_delta:
-                    emit(
-                        _event(
-                            "codex.message.delta",
-                            {
-                                "session_id": session_id,
-                                "turn_id": turn_id,
-                                "delta": recovered_delta,
-                            },
-                        )
-                    )
-                emit(_event("codex.turn.completed", {"turn": turn_data}))
-                return {"session_id": session_id, "turn_id": turn_id, "status": status}
-            break
         delta_buffer = ""
         last_flush = monotonic()
         while True:
@@ -171,7 +190,7 @@ class CodexBackend:
                 delta = data.get("delta")
                 if isinstance(delta, str):
                     delta_buffer += delta
-                if len(delta_buffer.encode("utf-8")) >= 4096 or monotonic() - last_flush >= 0.2:
+                if len(delta_buffer.encode("utf-8")) >= 4096 or monotonic() - last_flush >= 0.1:
                     emit(
                         _event(
                             "codex.message.delta",
@@ -224,6 +243,86 @@ def _snapshot_agent_text(turn: Mapping[str, Any]) -> str:
         if isinstance(value, str) and value:
             messages.append(value)
     return "\n\n".join(messages)
+
+
+def _summary(value: Any, limit: int = 2048) -> str:
+    text = str(value or "").replace("\x00", "")
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text
+    return encoded[:limit].decode("utf-8", errors="ignore") + "…"
+
+
+def _normalise_turn(value: Mapping[str, Any]) -> Mapping[str, Any]:
+    items: list[dict[str, str]] = []
+    for index, item in enumerate(value.get("items", [])):
+        if not isinstance(item, Mapping):
+            continue
+        item_type = item.get("type")
+        text = ""
+        kind = ""
+        if item_type == "userMessage":
+            kind = "user_message"
+            text = "\n".join(
+                str(part.get("text"))
+                for part in item.get("content", [])
+                if isinstance(part, Mapping)
+                and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+            )
+        elif item_type == "agentMessage":
+            kind, text = "assistant_message", str(item.get("text", ""))
+        elif item_type == "commandExecution":
+            kind = "command_summary"
+            exit_code = item.get("exitCode")
+            duration = item.get("durationMs")
+            suffix = " · ".join(
+                part
+                for part in (
+                    f"exit {exit_code}" if exit_code is not None else "",
+                    f"{duration} ms" if duration is not None else "",
+                )
+                if part
+            )
+            try:
+                executable = Path(shlex.split(str(item.get("command", "command")))[0]).name
+            except (ValueError, IndexError):
+                executable = "command"
+            text = f"{executable} …" + (f" · {suffix}" if suffix else "")
+        elif item_type == "fileChange":
+            kind = "file_change_summary"
+            changes = item.get("changes", [])
+            text = "\n".join(
+                f"{change.get('kind', 'update')}: {Path(str(change.get('path', 'file'))).name}"
+                for change in changes
+                if isinstance(change, Mapping)
+            )
+        if kind and text:
+            items.append(
+                {
+                    "item_id": str(item.get("id") or f"item-{index}"),
+                    "kind": kind,
+                    "text": _summary(text),
+                }
+            )
+    error = value.get("error")
+    if error:
+        detail = error.get("message", "turn failed") if isinstance(error, Mapping) else error
+        detail = re.sub(r"(?<!\w)/(?:[^\s'\"]+)", "[local path]", str(detail))
+        items.append(
+            {
+                "item_id": f"{value.get('id', 'turn')}-error",
+                "kind": "error",
+                "text": _summary(detail),
+            }
+        )
+    return {
+        "turn_id": str(value.get("id", "")),
+        "status": str(value.get("status", "unknown")),
+        "started_at_unix": value.get("startedAt"),
+        "completed_at_unix": value.get("completedAt"),
+        "items": items,
+    }
 
 
 def _thread_result(thread: Any) -> Mapping[str, Any]:
@@ -354,6 +453,14 @@ def _dispatch(
         return backend.session_resume(
             _string(params, "session_id"), _absolute(params, "cwd"), _string(params, "mode")
         )
+    if method == "codex.session.history":
+        cursor = params.get("cursor")
+        if cursor is not None and (not isinstance(cursor, str) or not cursor):
+            raise ValueError("cursor must be a non-empty string")
+        limit = params.get("limit", 20)
+        if not isinstance(limit, int) or not 1 <= limit <= 50:
+            raise ValueError("limit must be between 1 and 50")
+        return backend.session_history(_string(params, "session_id"), cursor, limit)
     if method == "codex.turn.start":
         return backend.turn_start(
             _string(params, "session_id"),

@@ -35,13 +35,15 @@ test.beforeEach(async ({ page }) => {
   )
   await page.route('**/api/v1/experiments', (route) => route.fulfill({
     contentType: 'application/json',
-    body: JSON.stringify({ protocol: 'farhelm/1', experiments: [{ watch_id: 'watch-a', agent_id: 'gpu-a', project_id: 'cc08', name: 'exp42', pid: 12345, state: 'succeeded', updated_at_unix: 2_000_000_000 }] }),
+    body: JSON.stringify({ protocol: 'farhelm/1', experiments: [{ watch_id: 'watch-a', agent_id: 'gpu-a', project_id: 'cc08', name: 'exp42', pid: 12345, state: 'watching', updated_at_unix: 2_000_000_000 }] }),
   }))
   await page.route('**/api/v1/projects', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ protocol: 'farhelm/1', projects: [] }) }))
   await page.route('**/api/v1/codex/sessions?*', (route) => route.fulfill({
     contentType: 'application/json',
     body: JSON.stringify({ protocol: 'farhelm/1', sessions: [{ session_id: 'ses-a', agent_id: 'gpu-a', project_id: 'cc08', mode: 'inspect', state: 'idle', updated_at_unix: 2_000_000_000 }] }),
   }))
+  await page.route('**/api/v1/codex/sessions/ses-a/transcript?*', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ session_id: 'ses-a', turns: [{ turn_id: 'turn-a', status: 'completed', items: [{ item_id: 'user-a', kind: 'user_message', text: '检查训练结果' }, { item_id: 'agent-a', kind: 'assistant_message', text: '结果正常' }] }] }) }))
+  await page.route('**/api/v1/codex/schedules?*', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ protocol: 'farhelm/1', schedules: [] }) }))
   await page.route('**/api/v1/events/stream', (route) => route.fulfill({ status: 200, contentType: 'text/event-stream', body: '' }))
   await page.goto('/')
 })
@@ -105,9 +107,25 @@ test('experiment deep link and Codex manual queue use the mobile-safe workflow',
   })
   await page.goto('/codex?session=ses-a')
   await expect(page.getByText('ses-a').first()).toBeVisible()
-  await page.getByLabel('下一条指令').fill('继续分析结果')
-  await page.getByRole('button', { name: '发送' }).click()
+  await expect(page.getByText('结果正常')).toBeVisible()
+  await page.getByLabel('给 Codex 发送指令').fill('继续分析结果')
+  await page.getByRole('button', { name: '发送指令' }).click()
   await expect.poll(() => sent).toEqual({ prompt: '继续分析结果', delivery: 'queue' })
+  await expect(page.locator('.app-sider')).toHaveCount(0)
+
+  let scheduled: unknown
+  await page.route('**/api/v1/codex/sessions/ses-a/schedules', async (route) => {
+    scheduled = route.request().postDataJSON()
+    await route.fulfill({ status: 202, contentType: 'application/json', body: '{}' })
+  })
+  await page.getByRole('button', { name: /定时发送/ }).click()
+  await page.getByLabel('发送时间（本地时区）').fill('2030-01-01T12:00')
+  await page.getByLabel('指令', { exact: true }).fill('定时检查结果')
+  await page.getByRole('button', { name: '创建定时任务' }).click()
+  await expect.poll(() => scheduled).toMatchObject({ prompt: '定时检查结果', trigger: { type: 'at_time' } })
+
+  const results = await new AxeBuilder({ page }).analyze()
+  expect(results.violations.filter((violation) => violation.impact === 'critical' || violation.impact === 'serious')).toEqual([])
 })
 
 test('notification page exposes explicit device opt-in', async ({ page }) => {

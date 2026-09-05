@@ -355,7 +355,7 @@ mod tests {
             config: PathBuf::from("/tmp/config/farhelm/agent.toml"),
             data: PathBuf::from("/tmp/data/farhelm"),
             database: PathBuf::from("/tmp/data/farhelm/state/agent.db"),
-            worker: PathBuf::from("/tmp/data/farhelm/runtime/codex-worker/0.5.0"),
+            worker: PathBuf::from("/tmp/data/farhelm/runtime/codex-worker/0.6.0"),
             unit: PathBuf::from("/tmp/config/systemd/user/farhelm-agent.service"),
             legacy_root: PathBuf::from("/tmp/data/farhelm-agent"),
         };

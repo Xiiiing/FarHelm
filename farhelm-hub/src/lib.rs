@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, VecDeque},
     convert::Infallible,
     path::{Component, Path as FsPath, PathBuf},
     sync::Arc,
@@ -25,18 +25,20 @@ use constant_time_eq::constant_time_eq;
 use farhelm_core::PRODUCT_VERSION;
 use farhelm_protocol::{
     AgentCredentialState, AgentEnrollRequest, AgentEnrollResponse, AgentEventAck, AgentEventBatch,
-    AgentHeartbeat, AgentHeartbeatAck, AgentListResponse, AgentSummary, CommandAccepted,
-    CommandAction, CommandClaimRequest, CommandClaimResponse, CommandReportRequest,
-    CreateCodexSessionRequest, CreatePairingCodeRequest, CreateProbeCommand,
-    DeletePairingCodeRequest, FARHELM_PROTOCOL, HealthResponse, ImportProjectsRequest,
-    PairingCodeResponse, PromptDelivery, SendCodexMessageRequest,
+    AgentHeartbeat, AgentHeartbeatAck, AgentListResponse, AgentReadClaimRequest,
+    AgentReadClaimResponse, AgentReadReportRequest, AgentReadRequest, AgentSummary,
+    CommandAccepted, CommandAction, CommandClaimRequest, CommandClaimResponse,
+    CommandReportRequest, CreateCodexScheduleRequest, CreateCodexSessionRequest,
+    CreatePairingCodeRequest, CreateProbeCommand, DeletePairingCodeRequest, FARHELM_PROTOCOL,
+    HealthResponse, ImportProjectsRequest, PairingCodeResponse, PromptDelivery,
+    SendCodexMessageRequest,
 };
 use rand::RngCore;
 use reqwest::{Client, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, broadcast, oneshot};
 use web_push_native::{
     Auth, WebPushBuilder,
     p256::{
@@ -85,8 +87,18 @@ pub struct AppState {
     commands: Arc<CommandStore>,
     events: Arc<EventStore>,
     event_bus: broadcast::Sender<StoredEvent>,
+    transient_bus: broadcast::Sender<StoredEvent>,
     typed_commands: Arc<TypedCommandStore>,
     push_client: Client,
+    command_notify: Arc<Notify>,
+    read_broker: Arc<AsyncMutex<ReadBroker>>,
+}
+
+#[derive(Default)]
+struct ReadBroker {
+    queues: HashMap<String, VecDeque<AgentReadRequest>>,
+    notifies: HashMap<String, Arc<Notify>>,
+    waiters: HashMap<String, oneshot::Sender<AgentReadReportRequest>>,
 }
 
 #[derive(Clone)]
@@ -114,6 +126,7 @@ impl AppState {
         let events = EventStore::open(&config.database_path)?;
         let typed_commands = TypedCommandStore::open(&config.database_path)?;
         let (event_bus, _) = broadcast::channel(256);
+        let (transient_bus, _) = broadcast::channel(512);
         let now = unix_time();
         for (agent_id, token) in &config.agent_tokens {
             events.import_agent_credential(agent_id, &secret_hash(token), now)?;
@@ -130,8 +143,11 @@ impl AppState {
             commands: Arc::new(commands),
             events: Arc::new(events),
             event_bus,
+            transient_bus,
             typed_commands: Arc::new(typed_commands),
             push_client,
+            command_notify: Arc::new(Notify::new()),
+            read_broker: Arc::new(AsyncMutex::new(ReadBroker::default())),
         })
     }
 
@@ -232,6 +248,11 @@ pub fn app(state: AppState) -> Router {
         .route("/api/v1/commands/{command_id}", get(command_status))
         .route("/api/v1/agent/commands/claim", post(claim_command))
         .route("/api/v1/agent/commands/report", post(report_command))
+        .route("/api/v1/agent/reads/claim", post(claim_agent_read))
+        .route(
+            "/api/v1/agent/reads/{request_id}/report",
+            post(report_agent_read),
+        )
         .route("/api/v1/agent/events", post(agent_events))
         .route("/api/v1/experiments", get(list_experiments))
         .route("/api/v1/projects", get(list_projects))
@@ -251,6 +272,23 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/api/v1/codex/sessions/{session_id}/interrupt",
             post(interrupt_codex_session),
+        )
+        .route(
+            "/api/v1/codex/sessions/{session_id}/transcript",
+            get(get_codex_transcript),
+        )
+        .route("/api/v1/codex/schedules", get(list_codex_schedules))
+        .route(
+            "/api/v1/codex/schedules/{schedule_id}",
+            get(get_codex_schedule),
+        )
+        .route(
+            "/api/v1/codex/schedules/{schedule_id}/cancel",
+            post(cancel_codex_schedule),
+        )
+        .route(
+            "/api/v1/codex/sessions/{session_id}/schedules",
+            post(create_codex_schedule),
         )
         .route("/api/v1/events/stream", get(event_stream))
         .route(
@@ -546,6 +584,7 @@ async fn authorize(State(state): State<AppState>, mut request: Request, next: Ne
     if path == "/api/v1/agents/heartbeat"
         || path == "/api/v1/agent/events"
         || path.starts_with("/api/v1/agent/commands/")
+        || path.starts_with("/api/v1/agent/reads/")
     {
         if let Some(agent_id) = bearer_token(request.headers()).and_then(|token| {
             state
@@ -994,7 +1033,12 @@ async fn agent_events(
         )
             .into_response();
     }
-    let inserted = match state.events.ingest(&batch.agent_id, &batch.events) {
+    let (transient, durable): (Vec<_>, Vec<_>) = batch
+        .events
+        .iter()
+        .cloned()
+        .partition(|event| event.event_type == "codex.message.delta");
+    let inserted = match state.events.ingest(&batch.agent_id, &durable) {
         Ok(inserted) => inserted,
         Err(error) => {
             tracing::warn!(%error, agent_id = %batch.agent_id, "Agent event batch rejected");
@@ -1009,6 +1053,14 @@ async fn agent_events(
     };
     for event in inserted {
         let _ = state.event_bus.send(event);
+    }
+    for event in transient {
+        let _ = state.transient_bus.send(StoredEvent {
+            sequence: 0,
+            event_id: event.event_id,
+            event_type: event.event_type,
+            payload: event.payload,
+        });
     }
     Json(AgentEventAck {
         protocol: FARHELM_PROTOCOL.to_owned(),
@@ -1089,6 +1141,8 @@ async fn import_projects(
 struct SessionQuery {
     project: Option<String>,
     archived: Option<String>,
+    cursor: Option<String>,
+    limit: Option<usize>,
 }
 
 async fn list_codex_sessions(
@@ -1101,8 +1155,22 @@ async fn list_codex_sessions(
         "all" => ArchiveFilter::All,
         _ => return api_error(StatusCode::BAD_REQUEST, "invalid_archive_filter"),
     };
+    let offset = match query.cursor.as_deref().unwrap_or("0").parse::<usize>() {
+        Ok(value) => value,
+        Err(_) => return api_error(StatusCode::BAD_REQUEST, "invalid_session_cursor"),
+    };
+    let limit = query.limit.unwrap_or(50);
+    if !(1..=50).contains(&limit) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_session_limit");
+    }
     match state.events.sessions(query.project.as_deref(), archived) {
-        Ok(sessions) => Json(sessions).into_response(),
+        Ok(mut page) => {
+            let total = page.sessions.len();
+            page.sessions = page.sessions.into_iter().skip(offset).take(limit).collect();
+            page.next_cursor = (offset + page.sessions.len() < total)
+                .then(|| (offset + page.sessions.len()).to_string());
+            Json(page).into_response()
+        }
         Err(error) => {
             tracing::error!(%error, "failed to list Codex sessions");
             (
@@ -1217,6 +1285,332 @@ async fn interrupt_codex_session(
     )
 }
 
+#[derive(Debug, Deserialize)]
+struct ScheduleQuery {
+    session: Option<String>,
+}
+
+async fn list_codex_schedules(
+    State(state): State<AppState>,
+    Query(query): Query<ScheduleQuery>,
+) -> Response {
+    match state.events.schedules(query.session.as_deref()) {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to list Codex schedules");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "event_store_failed")
+        }
+    }
+}
+
+async fn create_codex_schedule(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<CreateCodexScheduleRequest>,
+) -> Response {
+    let now = unix_time();
+    if request.prompt.is_empty() || request.prompt.len() > 32 * 1024 {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_prompt");
+    }
+    match &request.trigger {
+        farhelm_protocol::CodexScheduleTrigger::AtTime { run_at_unix }
+            if *run_at_unix < now.saturating_add(60)
+                || *run_at_unix > now.saturating_add(365 * 24 * 60 * 60) =>
+        {
+            return api_error(StatusCode::BAD_REQUEST, "invalid_schedule_time");
+        }
+        farhelm_protocol::CodexScheduleTrigger::ExperimentSucceeded { watch_id }
+            if watch_id.is_empty() || watch_id.len() > 128 =>
+        {
+            return api_error(StatusCode::BAD_REQUEST, "invalid_watch_id");
+        }
+        _ => {}
+    }
+    let Some(key) = idempotency_header(&headers) else {
+        return api_error(StatusCode::BAD_REQUEST, "missing_idempotency_key");
+    };
+    let session = match state.events.session(&session_id) {
+        Ok(Some(value)) => value,
+        Ok(None) => return api_error(StatusCode::NOT_FOUND, "session_not_found"),
+        Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "event_store_failed"),
+    };
+    if let farhelm_protocol::CodexScheduleTrigger::ExperimentSucceeded { watch_id } =
+        &request.trigger
+    {
+        let valid = state.events.experiments().ok().is_some_and(|page| {
+            page.experiments.iter().any(|watch| {
+                watch.watch_id == *watch_id
+                    && watch.agent_id == session.agent_id
+                    && watch.project_id == session.project_id
+                    && watch.state == farhelm_protocol::ExperimentState::Watching
+            })
+        });
+        if !valid {
+            return api_error(StatusCode::CONFLICT, "experiment_not_watching");
+        }
+    }
+    let schedule_id = format!("sch_{}", &random_token()[..20]);
+    let ttl = match request.trigger {
+        farhelm_protocol::CodexScheduleTrigger::AtTime { run_at_unix } => {
+            run_at_unix.saturating_sub(now).saturating_add(24 * 60 * 60)
+        }
+        _ => 365 * 24 * 60 * 60,
+    };
+    create_typed_response(
+        &state,
+        &session.agent_id,
+        CommandAction::CodexScheduleCreate,
+        serde_json::json!({"schedule_id":schedule_id,"session_id":session_id,"project_id":session.project_id,"trigger":request.trigger,"prompt":request.prompt}),
+        key,
+        ttl,
+    )
+}
+
+async fn cancel_codex_schedule(
+    State(state): State<AppState>,
+    Path(schedule_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(key) = idempotency_header(&headers) else {
+        return api_error(StatusCode::BAD_REQUEST, "missing_idempotency_key");
+    };
+    let schedule = match state.events.schedule(&schedule_id) {
+        Ok(Some(value)) => value,
+        Ok(None) => return api_error(StatusCode::NOT_FOUND, "schedule_not_found"),
+        Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "event_store_failed"),
+    };
+    if !matches!(
+        schedule.state,
+        farhelm_protocol::CodexScheduleState::Pending
+            | farhelm_protocol::CodexScheduleState::Queued
+    ) {
+        return api_error(StatusCode::CONFLICT, "schedule_not_cancellable");
+    }
+    create_typed_response(
+        &state,
+        &schedule.agent_id,
+        CommandAction::CodexScheduleCancel,
+        serde_json::json!({"schedule_id":schedule_id,"project_id":schedule.project_id}),
+        key,
+        300,
+    )
+}
+
+async fn get_codex_schedule(
+    State(state): State<AppState>,
+    Path(schedule_id): Path<String>,
+) -> Response {
+    let schedule = match state.events.schedule(&schedule_id) {
+        Ok(Some(value)) => value,
+        Ok(None) => return api_error(StatusCode::NOT_FOUND, "schedule_not_found"),
+        Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "event_store_failed"),
+    };
+    let request_id = format!("read_{}", &random_token()[..20]);
+    let (sender, receiver) = oneshot::channel();
+    let notify = {
+        let mut broker = state.read_broker.lock().await;
+        broker.waiters.insert(request_id.clone(), sender);
+        broker
+            .queues
+            .entry(schedule.agent_id.clone())
+            .or_default()
+            .push_back(AgentReadRequest {
+                request_id: request_id.clone(),
+                method: "codex.schedule.detail".to_owned(),
+                params: serde_json::json!({"schedule_id":schedule_id}),
+            });
+        broker
+            .notifies
+            .entry(schedule.agent_id.clone())
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone()
+    };
+    notify.notify_one();
+    match tokio::time::timeout(Duration::from_secs(20), receiver).await {
+        Ok(Ok(report)) if report.ok => {
+            Json(report.data.unwrap_or_else(|| serde_json::json!({}))).into_response()
+        }
+        Ok(Ok(_)) => api_error(StatusCode::BAD_GATEWAY, "agent_read_failed"),
+        _ => {
+            let mut broker = state.read_broker.lock().await;
+            broker.waiters.remove(&request_id);
+            if let Some(queue) = broker.queues.get_mut(&schedule.agent_id) {
+                queue.retain(|item| item.request_id != request_id);
+            }
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "schedule_prompt_unavailable",
+            )
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TranscriptQuery {
+    cursor: Option<String>,
+    limit: Option<u64>,
+}
+
+async fn get_codex_transcript(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<TranscriptQuery>,
+) -> Response {
+    let limit = query.limit.unwrap_or(20);
+    if !(1..=50).contains(&limit)
+        || query
+            .cursor
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > 512)
+    {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_transcript_query");
+    }
+    let session = match state.events.session(&session_id) {
+        Ok(Some(session)) => session,
+        Ok(None) => return api_error(StatusCode::NOT_FOUND, "session_not_found"),
+        Err(error) => {
+            tracing::error!(%error, "failed to resolve transcript session");
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "event_store_failed");
+        }
+    };
+    if !state
+        .agents
+        .read()
+        .await
+        .get(&session.agent_id)
+        .is_some_and(|agent| is_online(unix_time(), agent.last_seen_unix))
+    {
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "agent_offline");
+    }
+    let request_id = format!("read_{}", &random_token()[..20]);
+    let request = AgentReadRequest {
+        request_id: request_id.clone(),
+        method: "codex.session.history".to_owned(),
+        params: serde_json::json!({
+            "session_id": session_id,
+            "cursor": query.cursor,
+            "limit": limit,
+        }),
+    };
+    let (sender, receiver) = oneshot::channel();
+    let notify = {
+        let mut broker = state.read_broker.lock().await;
+        broker.waiters.insert(request_id.clone(), sender);
+        broker
+            .queues
+            .entry(session.agent_id.clone())
+            .or_default()
+            .push_back(request);
+        broker
+            .notifies
+            .entry(session.agent_id.clone())
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone()
+    };
+    notify.notify_one();
+    match tokio::time::timeout(Duration::from_secs(20), receiver).await {
+        Ok(Ok(report)) if report.ok => match report.data {
+            Some(mut data) => {
+                if let serde_json::Value::Object(map) = &mut data {
+                    map.insert(
+                        "protocol".to_owned(),
+                        serde_json::Value::String(FARHELM_PROTOCOL.to_owned()),
+                    );
+                }
+                Json(data).into_response()
+            }
+            None => api_error(StatusCode::BAD_GATEWAY, "agent_read_empty"),
+        },
+        Ok(Ok(_)) => api_error(StatusCode::BAD_GATEWAY, "agent_read_failed"),
+        _ => {
+            let mut broker = state.read_broker.lock().await;
+            broker.waiters.remove(&request_id);
+            if let Some(queue) = broker.queues.get_mut(&session.agent_id) {
+                queue.retain(|item| item.request_id != request_id);
+            }
+            api_error(StatusCode::GATEWAY_TIMEOUT, "agent_read_timeout")
+        }
+    }
+}
+
+async fn claim_agent_read(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AgentIdentity>,
+    Json(request): Json<AgentReadClaimRequest>,
+) -> Response {
+    if request.protocol != FARHELM_PROTOCOL
+        || !valid_agent_id(&request.agent_id)
+        || !identity_allows(&identity, &request.agent_id)
+    {
+        return api_error(StatusCode::FORBIDDEN, "invalid_read_claim");
+    }
+    let wait = request.wait_secs.unwrap_or(0).min(25);
+    let notify = {
+        let mut broker = state.read_broker.lock().await;
+        if let Some(item) = broker
+            .queues
+            .entry(request.agent_id.clone())
+            .or_default()
+            .pop_front()
+        {
+            return Json(AgentReadClaimResponse {
+                protocol: FARHELM_PROTOCOL.to_owned(),
+                request: Some(item),
+            })
+            .into_response();
+        }
+        broker
+            .notifies
+            .entry(request.agent_id.clone())
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone()
+    };
+    if wait > 0 {
+        let _ = tokio::time::timeout(Duration::from_secs(wait), notify.notified()).await;
+    }
+    let item = state
+        .read_broker
+        .lock()
+        .await
+        .queues
+        .entry(request.agent_id)
+        .or_default()
+        .pop_front();
+    Json(AgentReadClaimResponse {
+        protocol: FARHELM_PROTOCOL.to_owned(),
+        request: item,
+    })
+    .into_response()
+}
+
+async fn report_agent_read(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AgentIdentity>,
+    Path(request_id): Path<String>,
+    Json(report): Json<AgentReadReportRequest>,
+) -> Response {
+    if report.protocol != FARHELM_PROTOCOL
+        || report.request_id != request_id
+        || !identity_allows(&identity, &report.agent_id)
+        || report
+            .detail
+            .as_ref()
+            .is_some_and(|value| value.len() > 512)
+        || report.data.as_ref().is_some_and(|value| {
+            serde_json::to_vec(value).map_or(true, |bytes| bytes.len() > 512 * 1024)
+        })
+    {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_read_report");
+    }
+    let sender = state.read_broker.lock().await.waiters.remove(&request_id);
+    let Some(sender) = sender else {
+        return api_error(StatusCode::NOT_FOUND, "read_request_not_found");
+    };
+    let _ = sender.send(report);
+    StatusCode::NO_CONTENT.into_response()
+}
+
 fn create_typed_response(
     state: &AppState,
     agent_id: &str,
@@ -1233,17 +1627,20 @@ fn create_typed_response(
         ttl,
         unix_time(),
     ) {
-        Ok(command) => (
-            StatusCode::ACCEPTED,
-            Json(CommandAccepted {
-                protocol: FARHELM_PROTOCOL.to_owned(),
-                command_id: command.command_id.clone(),
-                state: command.state,
-                expires_at_unix: command.expires_at_unix,
-                status_url: format!("/api/v1/commands/{}", command.command_id),
-            }),
-        )
-            .into_response(),
+        Ok(command) => {
+            state.command_notify.notify_waiters();
+            (
+                StatusCode::ACCEPTED,
+                Json(CommandAccepted {
+                    protocol: FARHELM_PROTOCOL.to_owned(),
+                    command_id: command.command_id.clone(),
+                    state: command.state,
+                    expires_at_unix: command.expires_at_unix,
+                    status_url: format!("/api/v1/commands/{}", command.command_id),
+                }),
+            )
+                .into_response()
+        }
         Err(error) => {
             tracing::warn!(%error, "failed to create typed command");
             api_error(StatusCode::CONFLICT, "idempotency_conflict")
@@ -1272,6 +1669,7 @@ async fn event_stream(State(state): State<AppState>, headers: HeaderMap) -> Resp
     // live delivery remains buffered in the receiver. Sequence filtering below
     // removes the resulting overlap.
     let mut receiver = state.event_bus.subscribe();
+    let mut transient_receiver = state.transient_bus.subscribe();
     let replay = match state.events.replay(after, 1000) {
         Ok(replay) => replay,
         Err(error) => {
@@ -1310,7 +1708,13 @@ async fn event_stream(State(state): State<AppState>, headers: HeaderMap) -> Resp
             }
         }
         loop {
-            match receiver.recv().await {
+            tokio::select! {
+            transient = transient_receiver.recv() => match transient {
+                Ok(event) => yield Ok::<Event, Infallible>(transient_sse_event(&event)),
+                Err(broadcast::error::RecvError::Lagged(_)) => yield Ok::<Event, Infallible>(Event::default().event("codex.stream.resync").data("{}")),
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            durable = receiver.recv() => match durable {
                 Ok(event) if event.sequence > cursor => {
                     cursor = event.sequence;
                     yield Ok::<Event, Infallible>(sse_event(&event));
@@ -1336,7 +1740,7 @@ async fn event_stream(State(state): State<AppState>, headers: HeaderMap) -> Resp
                     }
                 },
                 Err(broadcast::error::RecvError::Closed) => break,
-            }
+            }}
         }
     };
     Sse::new(stream)
@@ -1358,6 +1762,15 @@ fn sse_event(event: &StoredEvent) -> Event {
             )
             .unwrap_or_else(|_| "{}".to_owned()),
         )
+}
+
+fn transient_sse_event(event: &StoredEvent) -> Event {
+    Event::default().event(event.event_type.clone()).data(
+        serde_json::to_string(
+            &serde_json::json!({"event_id":event.event_id,"payload":event.payload}),
+        )
+        .unwrap_or_else(|_| "{}".to_owned()),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -1497,33 +1910,43 @@ async fn claim_command(
     if !identity_allows(&identity, &request.agent_id) {
         return api_error(StatusCode::FORBIDDEN, "agent_token_scope");
     }
-    if matches!(identity, AgentIdentity::Dedicated(_)) {
-        match state.typed_commands.claim(&request.agent_id, unix_time()) {
-            Ok(Some(command)) => {
-                return Json(CommandClaimResponse {
-                    protocol: FARHELM_PROTOCOL.to_owned(),
-                    command: Some(command),
-                })
-                .into_response();
-            }
-            Ok(None) => {}
+    let wait = request.wait_secs.unwrap_or(0).min(25);
+    let notified = state.command_notify.notified();
+    let mut command = match claim_command_now(&state, &identity, &request.agent_id) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(%error, agent_id=%request.agent_id, "failed to claim command");
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "command_store_failed");
+        }
+    };
+    if command.is_none() && wait > 0 {
+        let _ = tokio::time::timeout(Duration::from_secs(wait), notified).await;
+        command = match claim_command_now(&state, &identity, &request.agent_id) {
+            Ok(value) => value,
             Err(error) => {
-                tracing::error!(%error, agent_id=%request.agent_id, "failed to claim typed command");
+                tracing::error!(%error, agent_id=%request.agent_id, "failed to claim command after wake");
                 return api_error(StatusCode::INTERNAL_SERVER_ERROR, "command_store_failed");
             }
-        }
+        };
     }
-    match state.commands.claim(&request.agent_id, unix_time()) {
-        Ok(command) => Json(CommandClaimResponse {
-            protocol: FARHELM_PROTOCOL.to_owned(),
-            command,
-        })
-        .into_response(),
-        Err(error) => {
-            tracing::error!(%error, agent_id = %request.agent_id, "failed to claim command");
-            api_error(StatusCode::INTERNAL_SERVER_ERROR, "command_store_failed")
-        }
+    Json(CommandClaimResponse {
+        protocol: FARHELM_PROTOCOL.to_owned(),
+        command,
+    })
+    .into_response()
+}
+
+fn claim_command_now(
+    state: &AppState,
+    identity: &AgentIdentity,
+    agent_id: &str,
+) -> Result<Option<farhelm_protocol::AgentCommand>> {
+    if matches!(identity, AgentIdentity::Dedicated(_))
+        && let Some(command) = state.typed_commands.claim(agent_id, unix_time())?
+    {
+        return Ok(Some(command));
     }
+    state.commands.claim(agent_id, unix_time())
 }
 
 async fn report_command(
@@ -2180,6 +2603,7 @@ mod tests {
                         serde_json::to_vec(&CommandClaimRequest {
                             protocol: FARHELM_PROTOCOL.to_owned(),
                             agent_id: "gpu-a".to_owned(),
+                            wait_secs: None,
                         })
                         .unwrap(),
                     ))
@@ -2299,6 +2723,7 @@ mod tests {
                         serde_json::to_vec(&CommandClaimRequest {
                             protocol: FARHELM_PROTOCOL.to_owned(),
                             agent_id: "gpu-a".to_owned(),
+                            wait_secs: None,
                         })
                         .unwrap(),
                     ))
@@ -2388,5 +2813,67 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn schedule_endpoint_queues_validated_typed_command() {
+        let state = test_state();
+        state.events.ingest("gpu-a", &[AgentEvent { protocol:FARHELM_PROTOCOL.into(),event_id:"session-for-schedule".into(),agent_id:"gpu-a".into(),sequence:1,event_type:"codex.session.updated".into(),created_at_unix:unix_time(),payload:serde_json::json!({"session_id":"ses-a","project_id":"cc08","mode":"inspect","state":"idle","title":"Task","active_turn_id":null,"updated_at_unix":unix_time()}) }]).unwrap();
+        let response=app(state.clone()).oneshot(Request::builder().method("POST").uri("/api/v1/codex/sessions/ses-a/schedules").header(header::COOKIE,browser_cookie()).header("x-csrf-token","test-csrf").header("idempotency-key","schedule-test-key-0001").header(header::CONTENT_TYPE,"application/json").body(Body::from(serde_json::json!({"prompt":"continue","trigger":{"type":"at_time","run_at_unix":unix_time()+120}}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let accepted: CommandAccepted =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(
+            state
+                .typed_commands
+                .get(&accepted.command_id)
+                .unwrap()
+                .unwrap()
+                .action,
+            CommandAction::CodexScheduleCreate
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_deltas_are_broadcast_without_hub_persistence() {
+        let mut config = test_state().config.as_ref().clone();
+        config.agent_tokens.insert(
+            "gpu-a".into(),
+            "dedicated-agent-token-with-32-characters".into(),
+        );
+        let state = AppState::new(config).unwrap();
+        let event = AgentEvent {
+            protocol: FARHELM_PROTOCOL.into(),
+            event_id: "delta-one".into(),
+            agent_id: "gpu-a".into(),
+            sequence: 1,
+            event_type: "codex.message.delta".into(),
+            created_at_unix: 10,
+            payload: serde_json::json!({"session_id":"ses-a","data":{"delta":"private reply"}}),
+        };
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/agent/events")
+                    .header(
+                        header::AUTHORIZATION,
+                        "Bearer dedicated-agent-token-with-32-characters",
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&AgentEventBatch {
+                            protocol: FARHELM_PROTOCOL.into(),
+                            agent_id: "gpu-a".into(),
+                            events: vec![event],
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.events.replay(0, 10).unwrap().is_empty());
     }
 }

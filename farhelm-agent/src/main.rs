@@ -13,14 +13,14 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use farhelm_core::PRODUCT_VERSION;
 use farhelm_protocol::{
-    AgentEventAck, AgentEventBatch, AgentHeartbeat, AgentHeartbeatAck, CommandAction,
-    CommandClaimRequest, CommandClaimResponse, CommandState, CommandStatusResponse,
-    FARHELM_PROTOCOL, ProbeResult, WORKER_PROTOCOL, WorkerHelloResult, WorkerRequest,
-    WorkerResponse, read_frame, write_frame,
+    AgentEventAck, AgentEventBatch, AgentHeartbeat, AgentHeartbeatAck, AgentReadClaimRequest,
+    AgentReadClaimResponse, AgentReadReportRequest, CommandAction, CommandClaimRequest,
+    CommandClaimResponse, CommandState, CommandStatusResponse, FARHELM_PROTOCOL, ProbeResult,
+    WORKER_PROTOCOL, WorkerHelloResult, WorkerRequest, WorkerResponse, read_frame, write_frame,
 };
 use reqwest::{Client, Url};
 use tokio::{
-    process::{ChildStdin, Command},
+    process::{Child, ChildStdin, ChildStdout, Command},
     sync::{Mutex as AsyncMutex, oneshot},
     time::timeout,
 };
@@ -36,7 +36,7 @@ mod resources;
 use command_store::CommandStore;
 use config::{AgentFileConfig, AgentPaths};
 use experiment_store::{
-    AutoPrompt, ExperimentStore, ProjectMatchers, RemoteCommand, WatchRegistration,
+    AutoPrompt, ExperimentStore, ProjectMatchers, RemoteCommand, ScheduledPrompt, WatchRegistration,
 };
 
 #[derive(Parser)]
@@ -115,7 +115,7 @@ enum CommandKind {
         /// Only report whether an update is available.
         #[arg(long)]
         check: bool,
-        /// Install one exact formal version, such as V0.5.0.
+        /// Install one exact formal version, such as V0.6.0.
         #[arg(long)]
         version: Option<String>,
         /// Permit a user-approved first-number version change.
@@ -244,6 +244,13 @@ struct WorkerRuntime {
     python: String,
     root: PathBuf,
     registry: WorkerRegistry,
+    idle: Arc<AsyncMutex<HashMap<String, IdleWorker>>>,
+}
+
+struct IdleWorker {
+    child: Child,
+    stdout: ChildStdout,
+    active: ActiveWorker,
 }
 
 impl Drop for ActiveWorkerRegistration {
@@ -415,6 +422,7 @@ async fn run(
         python: worker_python.to_owned(),
         root: worker_root.to_owned(),
         registry: WorkerRegistry::default(),
+        idle: Arc::new(AsyncMutex::new(HashMap::new())),
     };
     let orphaned = experiment_store.orphan_running_prompts(unix_time())?;
     if orphaned > 0 {
@@ -434,7 +442,7 @@ async fn run(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut command_ticker = tokio::time::interval(Duration::from_secs(command_interval_secs));
     command_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut session_ticker = tokio::time::interval(Duration::from_secs(60));
+    let mut session_ticker = tokio::time::interval(Duration::from_secs(30));
     session_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -459,6 +467,9 @@ async fn run(
                 if let Err(error) = process_command_cycle(&client, &hub, &command_store, &experiment_store, &live_projects, &worker_runtime).await {
                     warn!(agent_id = %hub.agent_id, %error, "command cycle failed; retrying");
                 }
+                if let Err(error) = process_read_once(&client, &hub, &worker_runtime, &experiment_store).await {
+                    warn!(agent_id = %hub.agent_id, %error, "transient Codex read failed; retrying");
+                }
                 let project_matchers = live_projects.iter().map(|(id, project)| (id.clone(), ProjectMatchers { success: project.success_patterns.clone(), failure: project.failure_patterns.clone() })).collect::<BTreeMap<_, _>>();
                 match experiment_store.inspect(&project_matchers, unix_time()) {
                     Ok(completed) => for watch in completed {
@@ -479,6 +490,19 @@ async fn run(
                         });
                     }
                 }
+                for prompt in experiment_store.due_schedules(unix_time())? {
+                    if experiment_store.remote_session_busy(&prompt.session_id)? { continue; }
+                    if experiment_store.claim_schedule(&prompt.schedule_id, unix_time())? {
+                        let database = database.to_owned();
+                        let worker_runtime = worker_runtime.clone();
+                        let project = live_projects.get(&prompt.project_id).cloned();
+                        tokio::spawn(async move {
+                            if let Err(error) = run_scheduled_prompt(&database,&worker_runtime,project,prompt).await {
+                                warn!(%error, "scheduled Codex prompt failed");
+                            }
+                        });
+                    }
+                }
                 if let Err(error) = upload_events(&client, &hub, &experiment_store).await {
                     warn!(agent_id = %hub.agent_id, %error, "event outbox upload failed; retrying");
                 }
@@ -486,24 +510,6 @@ async fn run(
             _ = session_ticker.tick() => {
                 if let Err(error) = discover_projects(database, &worker_runtime.python, &worker_runtime.root).await {
                     warn!(%error, "Codex project discovery failed");
-                }
-                for (project_id, project) in approved_project_sections(&experiment_store)? {
-                    let database = database.to_owned();
-                    let python = worker_runtime.python.clone();
-                    let worker_root = worker_runtime.root.clone();
-                    let project_id = project_id.clone();
-                    let project_path = match fs::canonicalize(&project.path) {
-                        Ok(path) => path,
-                        Err(error) => {
-                            warn!(%error, project_id, "approved project path is unavailable");
-                            continue;
-                        }
-                    };
-                    tokio::spawn(async move {
-                        if let Err(error) = sync_project_sessions(&database,&python,&worker_root,&project_id,&project_path).await {
-                            warn!(%error, project_id, "Codex session sync failed");
-                        }
-                    });
                 }
             }
             () = &mut shutdown => {
@@ -595,6 +601,39 @@ async fn discover_projects(database: &Path, python: &str, worker_root: &Path) ->
                 now,
             )?;
         }
+    }
+    let approved = store
+        .approved_projects()?
+        .into_iter()
+        .filter_map(|(id, project)| fs::canonicalize(project.path).ok().map(|path| (path, id)))
+        .collect::<BTreeMap<_, _>>();
+    for session in value
+        .get("sessions")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(raw_path) = session.get("cwd").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Ok(path) = fs::canonicalize(raw_path) else {
+            continue;
+        };
+        let Some(project_id) = approved.get(&path) else {
+            continue;
+        };
+        let Some(session_id) = session
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let updated = session
+            .get("updated_at_unix")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_else(unix_time);
+        store.bind_session(session_id, project_id, &path, "inspect", updated)?;
+        store.enqueue_event(&format!("session-sync:{session_id}:{updated}"),"codex.session.updated",&serde_json::json!({"session_id":session_id,"project_id":project_id,"mode":"inspect","state":if session.get("archived").and_then(serde_json::Value::as_bool).unwrap_or(false){"archived"}else{"idle"},"title":session.get("title"),"active_turn_id":null,"updated_at_unix":updated}),unix_time())?;
     }
     Ok(())
 }
@@ -864,6 +903,7 @@ async fn command_poll_once(runtime: &RuntimeArgs) -> Result<()> {
         python: runtime.worker_python.clone(),
         root: runtime.worker_root.clone(),
         registry: WorkerRegistry::default(),
+        idle: Arc::new(AsyncMutex::new(HashMap::new())),
     };
     let processed = process_command_cycle(
         &client,
@@ -905,6 +945,7 @@ async fn process_command_cycle(
         .json(&CommandClaimRequest {
             protocol: FARHELM_PROTOCOL.to_owned(),
             agent_id: hub.agent_id.clone(),
+            wait_secs: Some(1),
         })
         .send()
         .await
@@ -945,6 +986,85 @@ async fn process_command_cycle(
         .await?;
     }
     Ok(processed)
+}
+
+async fn process_read_once(
+    client: &Client,
+    hub: &HubArgs,
+    worker: &WorkerRuntime,
+    store: &ExperimentStore,
+) -> Result<()> {
+    let url = hub_endpoint(&hub.hub, "/api/v1/agent/reads/claim")?;
+    let claim: AgentReadClaimResponse = client
+        .post(url)
+        .bearer_auth(&hub.token)
+        .json(&AgentReadClaimRequest {
+            protocol: FARHELM_PROTOCOL.to_owned(),
+            agent_id: hub.agent_id.clone(),
+            wait_secs: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let Some(request) = claim.request else {
+        return Ok(());
+    };
+    let outcome = if request.method == "codex.session.history" {
+        let session_id = request
+            .params
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .context("history read omitted session ID")?;
+        ensure!(
+            store.session_binding(session_id)?.is_some(),
+            "history read references an unapproved session"
+        );
+        worker_call_once(
+            &worker.python,
+            &worker.root,
+            &request.method,
+            request.params,
+        )
+        .await
+    } else if request.method == "codex.schedule.detail" {
+        let id = request
+            .params
+            .get("schedule_id")
+            .and_then(serde_json::Value::as_str)
+            .context("schedule detail omitted ID")?;
+        store.schedule_detail(id)
+    } else {
+        bail!("Hub requested unsupported transient read")
+    };
+    let report = match outcome {
+        Ok(data) => AgentReadReportRequest {
+            protocol: FARHELM_PROTOCOL.to_owned(),
+            agent_id: hub.agent_id.clone(),
+            request_id: request.request_id.clone(),
+            ok: true,
+            data: Some(data),
+            detail: None,
+        },
+        Err(error) => AgentReadReportRequest {
+            protocol: FARHELM_PROTOCOL.to_owned(),
+            agent_id: hub.agent_id.clone(),
+            request_id: request.request_id.clone(),
+            ok: false,
+            data: None,
+            detail: Some(error.to_string().chars().take(512).collect()),
+        },
+    };
+    let path = format!("/api/v1/agent/reads/{}/report", request.request_id);
+    client
+        .post(hub_endpoint(&hub.hub, &path)?)
+        .bearer_auth(&hub.token)
+        .json(&report)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
 }
 
 async fn drain_local_work(
@@ -1286,9 +1406,56 @@ async fn execute_remote_command_inner(
             )
             .await
         }
+        CommandAction::CodexScheduleCreate => {
+            let schedule_id = store.create_schedule(&command.payload, unix_time())?;
+            Ok(serde_json::json!({"schedule_id":schedule_id}))
+        }
+        CommandAction::CodexScheduleCancel => {
+            let schedule_id = command
+                .payload
+                .get("schedule_id")
+                .and_then(serde_json::Value::as_str)
+                .context("cancel command omitted schedule_id")?;
+            store.cancel_schedule(schedule_id, unix_time())?;
+            Ok(serde_json::json!({"schedule_id":schedule_id,"cancelled":true}))
+        }
         CommandAction::AgentProbe => bail!("probe reached Codex executor"),
         CommandAction::ProjectApprove => unreachable!("project approval returned above"),
     }
+}
+
+async fn run_scheduled_prompt(
+    database: &Path,
+    worker: &WorkerRuntime,
+    project: Option<config::ProjectSection>,
+    prompt: ScheduledPrompt,
+) -> Result<()> {
+    let store = ExperimentStore::open(database)?;
+    let result = async {
+        let project = project.context("scheduled project is no longer approved")?;
+        let root =
+            fs::canonicalize(project.path).context("scheduled project path is unavailable")?;
+        let job = AutoPrompt {
+            watch_id: prompt.schedule_id.clone(),
+            project_id: prompt.project_id.clone(),
+            project_root: root,
+            session_id: Some(prompt.session_id),
+            new_session_mode: None,
+            prompt: prompt.prompt,
+            idempotency_key: prompt.schedule_id.clone(),
+        };
+        run_auto_prompt_inner(&store, worker, &job).await
+    }
+    .await;
+    let state = match &result {
+        Ok(_) => farhelm_protocol::CodexScheduleState::Completed,
+        Err(error) if error.downcast_ref::<WorkerTurnOrphaned>().is_some() => {
+            farhelm_protocol::CodexScheduleState::Orphaned
+        }
+        Err(_) => farhelm_protocol::CodexScheduleState::Failed,
+    };
+    store.finish_schedule(&prompt.schedule_id, state, unix_time())?;
+    result.map(|_| ())
 }
 
 async fn send_command_report(
@@ -1524,51 +1691,71 @@ async fn run_auto_prompt_inner(
             Some(_) => bail!("invalid new-session mode"),
         }
     };
-    let mut child = Command::new(&worker_runtime.python)
-        .arg("-m")
-        .arg("farhelm_worker_codex")
-        .env("PYTHONPATH", source_root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("failed to start Worker with `{}`", worker_runtime.python))?;
-    let mut stdin = child.stdin.take().context("Worker stdin was not piped")?;
-    let mut stdout = child.stdout.take().context("Worker stdout was not piped")?;
-    let session_method = if job.session_id.is_some() {
-        "codex.session.resume"
+    let cached = if let Some(session_id) = job.session_id.as_deref() {
+        worker_runtime.idle.lock().await.remove(session_id)
     } else {
-        "codex.session.start"
+        None
     };
-    let session_request = WorkerRequest {
-        protocol: WORKER_PROTOCOL.to_owned(),
-        kind: "request".to_owned(),
-        request_id: format!("session:{}", job.watch_id),
-        method: session_method.to_owned(),
-        params: serde_json::json!({"session_id":job.session_id,"cwd":cwd.clone(),"mode":mode}),
+    let (child, mut stdout, active_worker, session_id, session_cwd) = if let Some(cached) = cached {
+        (
+            cached.child,
+            cached.stdout,
+            cached.active,
+            job.session_id.clone().expect("cached worker has session"),
+            cwd.clone(),
+        )
+    } else {
+        let mut child = Command::new(&worker_runtime.python)
+            .arg("-m")
+            .arg("farhelm_worker_codex")
+            .env("PYTHONPATH", source_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("failed to start Worker with `{}`", worker_runtime.python))?;
+        let mut stdin = child.stdin.take().context("Worker stdin was not piped")?;
+        let mut stdout = child.stdout.take().context("Worker stdout was not piped")?;
+        let session_request = WorkerRequest {
+            protocol: WORKER_PROTOCOL.to_owned(),
+            kind: "request".to_owned(),
+            request_id: format!("session:{}", job.watch_id),
+            method: if job.session_id.is_some() {
+                "codex.session.resume"
+            } else {
+                "codex.session.start"
+            }
+            .to_owned(),
+            params: serde_json::json!({"session_id":job.session_id,"cwd":cwd.clone(),"mode":mode}),
+        };
+        write_frame(&mut stdin, &session_request).await?;
+        let response: WorkerResponse = read_frame(&mut stdout).await?;
+        ensure!(
+            response.ok,
+            "Worker failed to prepare session: {:?}",
+            response.error
+        );
+        let session_id = response
+            .result
+            .as_ref()
+            .and_then(|value| value.get("session_id"))
+            .and_then(serde_json::Value::as_str)
+            .context("Worker session response omitted session_id")?
+            .to_owned();
+        let session_cwd = response
+            .result
+            .as_ref()
+            .and_then(|value| value.get("cwd"))
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from)
+            .unwrap_or(cwd);
+        let active = ActiveWorker {
+            stdin: Arc::new(AsyncMutex::new(stdin)),
+            waiters: Arc::new(Mutex::new(HashMap::new())),
+        };
+        (child, stdout, active, session_id, session_cwd)
     };
-    write_frame(&mut stdin, &session_request).await?;
-    let session_response: WorkerResponse = read_frame(&mut stdout).await?;
-    ensure!(
-        session_response.ok,
-        "Worker failed to prepare session: {:?}",
-        session_response.error
-    );
-    let session_id = session_response
-        .result
-        .as_ref()
-        .and_then(|value| value.get("session_id"))
-        .and_then(serde_json::Value::as_str)
-        .context("Worker session response omitted session_id")?
-        .to_owned();
-    let session_cwd = session_response
-        .result
-        .as_ref()
-        .and_then(|value| value.get("cwd"))
-        .and_then(serde_json::Value::as_str)
-        .map(PathBuf::from)
-        .unwrap_or(cwd);
     store.bind_session(
         &session_id,
         &job.project_id,
@@ -1579,11 +1766,7 @@ async fn run_auto_prompt_inner(
     if job.session_id.is_none() {
         store.link_watch_session(&job.watch_id, &session_id, unix_time())?;
     }
-    let active_worker = ActiveWorker {
-        stdin: Arc::new(AsyncMutex::new(stdin)),
-        waiters: Arc::new(Mutex::new(HashMap::new())),
-    };
-    let _registration =
+    let registration =
         register_active_worker(&worker_runtime.registry, &session_id, &active_worker)?;
     store.enqueue_event(
         &format!("{}:session-ready", job.watch_id), "codex.session.updated",
@@ -1655,6 +1838,22 @@ async fn run_auto_prompt_inner(
     match turn_result {
         Ok(turn_id) => {
             enqueue_session_state(store, job, &session_id, &mode, "idle", "session-idle")?;
+            drop(registration);
+            let mut idle = worker_runtime.idle.lock().await;
+            if idle.len() >= 4
+                && let Some(key) = idle.keys().next().cloned()
+                && let Some(mut evicted) = idle.remove(&key)
+            {
+                let _ = evicted.child.start_kill();
+            }
+            idle.insert(
+                session_id.clone(),
+                IdleWorker {
+                    child,
+                    stdout,
+                    active: active_worker,
+                },
+            );
             Ok((session_id, turn_id))
         }
         Err(error) => {

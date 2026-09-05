@@ -11,6 +11,7 @@ use farhelm_protocol::{
 };
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 pub struct TypedCommandStore {
     connection: Mutex<Connection>,
@@ -28,7 +29,7 @@ impl TypedCommandStore {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 command_id TEXT NOT NULL UNIQUE,
                 agent_id TEXT NOT NULL,
-                action TEXT NOT NULL CHECK (action IN ('codex.session.create','codex.session.resume','codex.turn.start','codex.turn.steer','codex.turn.interrupt','project.approve')),
+                action TEXT NOT NULL CHECK (action IN ('codex.session.create','codex.session.resume','codex.turn.start','codex.turn.steer','codex.turn.interrupt','codex.schedule.create','codex.schedule.cancel','project.approve')),
                 payload_json TEXT NOT NULL,
                 state TEXT NOT NULL CHECK (state IN ('queued','delivered','accepted','completed','failed','expired')),
                 idempotency_key TEXT NOT NULL UNIQUE,
@@ -40,7 +41,7 @@ impl TypedCommandStore {
             );
             CREATE INDEX IF NOT EXISTS typed_commands_delivery ON typed_commands(agent_id,state,id);",
         )?;
-        ensure_project_action_schema(&connection)?;
+        ensure_action_schema(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -71,7 +72,12 @@ impl TypedCommandStore {
             "SELECT command_id,agent_id,action,state,created_at_unix,expires_at_unix,updated_at_unix,data_json,detail,payload_json FROM typed_commands WHERE idempotency_key=?1",
             [idempotency_key], |row| Ok((status_from_row(row)?, row.get::<_, String>(9)?)),
         ).optional()? {
-            ensure!(existing.agent_id == agent_id && existing.action == action && existing_payload == payload_json, "idempotency key conflicts");
+            let payload_matches = existing_payload == payload_json || serde_json::from_str::<Value>(&existing_payload).ok().is_some_and(|redacted| {
+                redacted.get("redacted").and_then(Value::as_bool)==Some(true)
+                    && redacted.get("bytes").and_then(Value::as_u64)==Some(payload_json.len() as u64)
+                    && redacted.get("sha256").and_then(Value::as_str)==Some(hex_digest(&payload_json).as_str())
+            });
+            ensure!(existing.agent_id == agent_id && existing.action == action && payload_matches, "idempotency key conflicts");
             return Ok(existing);
         }
         transaction.execute(
@@ -138,11 +144,28 @@ impl TypedCommandStore {
         if same {
             return Ok(current);
         }
+        let payload_json = {
+            let connection = self.lock()?;
+            let raw: String = connection.query_row(
+                "SELECT payload_json FROM typed_commands WHERE command_id=?1",
+                [&report.command_id],
+                |row| row.get(0),
+            )?;
+            if matches!(
+                report.state,
+                CommandState::Completed | CommandState::Failed | CommandState::Expired
+            ) {
+                serde_json::to_string(
+                    &serde_json::json!({"redacted":true,"bytes":raw.len(),"sha256":hex_digest(&raw)}),
+                )?
+            } else {
+                raw
+            }
+        };
         self.lock()?.execute(
-            "UPDATE typed_commands SET state=?1,updated_at_unix=?2,data_json=?3,detail=?4,
-                    payload_json=CASE WHEN ?1 IN ('completed','failed','expired') THEN '{}' ELSE payload_json END
-              WHERE command_id=?5",
-            params![state_name(report.state),as_i64(now)?,report.data.as_ref().map(serde_json::to_string).transpose()?,report.detail,report.command_id],
+            "UPDATE typed_commands SET state=?1,updated_at_unix=?2,data_json=?3,detail=?4,payload_json=?5
+              WHERE command_id=?6",
+            params![state_name(report.state),as_i64(now)?,report.data.as_ref().map(serde_json::to_string).transpose()?,report.detail,payload_json,report.command_id],
         )?;
         self.get(&report.command_id)?
             .context("reported command disappeared")
@@ -160,6 +183,13 @@ impl TypedCommandStore {
             .lock()
             .map_err(|_| anyhow!("typed command database lock was poisoned"))
     }
+}
+
+fn hex_digest(value: &str) -> String {
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn status_from_row(row: &Row<'_>) -> rusqlite::Result<CommandStatusResponse> {
@@ -188,6 +218,8 @@ const fn action_name(action: CommandAction) -> &'static str {
         CommandAction::CodexTurnStart => "codex.turn.start",
         CommandAction::CodexTurnSteer => "codex.turn.steer",
         CommandAction::CodexTurnInterrupt => "codex.turn.interrupt",
+        CommandAction::CodexScheduleCreate => "codex.schedule.create",
+        CommandAction::CodexScheduleCancel => "codex.schedule.cancel",
         CommandAction::ProjectApprove => "project.approve",
     }
 }
@@ -198,18 +230,20 @@ fn parse_action(value: &str) -> rusqlite::Result<CommandAction> {
         "codex.turn.start" => Ok(CommandAction::CodexTurnStart),
         "codex.turn.steer" => Ok(CommandAction::CodexTurnSteer),
         "codex.turn.interrupt" => Ok(CommandAction::CodexTurnInterrupt),
+        "codex.schedule.create" => Ok(CommandAction::CodexScheduleCreate),
+        "codex.schedule.cancel" => Ok(CommandAction::CodexScheduleCancel),
         "project.approve" => Ok(CommandAction::ProjectApprove),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
 }
 
-fn ensure_project_action_schema(connection: &Connection) -> Result<()> {
+fn ensure_action_schema(connection: &Connection) -> Result<()> {
     let schema: String = connection.query_row(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='typed_commands'",
         [],
         |row| row.get(0),
     )?;
-    if schema.contains("project.approve") {
+    if schema.contains("codex.schedule.create") {
         return Ok(());
     }
     connection.execute_batch(
@@ -218,7 +252,7 @@ fn ensure_project_action_schema(connection: &Connection) -> Result<()> {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             command_id TEXT NOT NULL UNIQUE,
             agent_id TEXT NOT NULL,
-            action TEXT NOT NULL CHECK (action IN ('codex.session.create','codex.session.resume','codex.turn.start','codex.turn.steer','codex.turn.interrupt','project.approve')),
+            action TEXT NOT NULL CHECK (action IN ('codex.session.create','codex.session.resume','codex.turn.start','codex.turn.steer','codex.turn.interrupt','codex.schedule.create','codex.schedule.cancel','project.approve')),
             payload_json TEXT NOT NULL,
             state TEXT NOT NULL CHECK (state IN ('queued','delivered','accepted','completed','failed','expired')),
             idempotency_key TEXT NOT NULL UNIQUE,
@@ -306,6 +340,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(repeated.command_id, first.command_id);
+        let _ = store.claim("gpu-a", 102).unwrap().unwrap();
+        store
+            .report(
+                &CommandReportRequest {
+                    protocol: FARHELM_PROTOCOL.into(),
+                    agent_id: "gpu-a".into(),
+                    command_id: first.command_id.clone(),
+                    state: CommandState::Accepted,
+                    result: None,
+                    detail: None,
+                    data: None,
+                },
+                103,
+            )
+            .unwrap();
+        store
+            .report(
+                &CommandReportRequest {
+                    protocol: FARHELM_PROTOCOL.into(),
+                    agent_id: "gpu-a".into(),
+                    command_id: first.command_id.clone(),
+                    state: CommandState::Completed,
+                    result: None,
+                    detail: None,
+                    data: None,
+                },
+                104,
+            )
+            .unwrap();
+        let after_redaction = store
+            .create(
+                "gpu-a",
+                CommandAction::CodexTurnStart,
+                &serde_json::json!({"project_id":"p","session_id":"s","prompt":"one"}),
+                "request-1",
+                300,
+                105,
+            )
+            .unwrap();
+        assert_eq!(after_redaction.command_id, first.command_id);
         assert!(
             store
                 .create(

@@ -4,14 +4,14 @@
   <p><strong>面向个人科研与 GPU 训练环境的远程控制平面</strong></p>
   <p>从手机查看训练服务器状态，并在不开放训练机入站端口的前提下安全扩展远程控制能力。</p>
   <p>
-    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.5.0">V0.5.0</a> ·
+    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.6.0">V0.6.0</a> ·
     <a href="./deploy/README.md">部署文档</a> ·
     <a href="./README.en.md">English</a>
   </p>
 </div>
 
 > [!IMPORTANT]
-> 当前 `V0.5.0` 在“实验结束 → Codex 下一步”闭环上增加零配置引导：仅密码登录、30 天持久会话、网页短码配对 Agent，以及 Codex 历史项目自动发现与一键导入。它不提供远程训练启停、自动训练进程扫描、GPU/TensorBoard 图表或任意 shell。
+> 当前 `V0.6.0` 提供沉浸式 Codex 工作区、分页完整对话、一次性定时发送与训练成功后发送，并缩短会话同步和实时输出路径。Codex 正文只保留在 Agent，本项目仍不提供远程训练启停、自动训练进程扫描、GPU/TensorBoard 图表或任意 shell。
 
 ## 快速安装
 
