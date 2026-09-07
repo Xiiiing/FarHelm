@@ -54,6 +54,9 @@ pub const ONLINE_WINDOW_SECS: u64 = 45;
 
 mod command_store;
 mod event_store;
+mod live;
+#[cfg(test)]
+mod live_tests;
 mod migrations;
 mod notification_routes;
 mod session_display;
@@ -96,6 +99,8 @@ pub struct AppState {
     push_client: Client,
     push_notify: Arc<Notify>,
     command_notify: Arc<Notify>,
+    receipt_notify: Arc<Notify>,
+    live: Arc<RwLock<HashMap<String, live::LiveConnection>>>,
     read_broker: Arc<AsyncMutex<ReadBroker>>,
     db_permits: Arc<tokio::sync::Semaphore>,
 }
@@ -122,6 +127,7 @@ enum AgentIdentity {
 
 #[derive(Clone)]
 struct StoredAgent {
+    codex: Option<farhelm_protocol::live::CodexReadiness>,
     capabilities: Vec<String>,
     hostname: String,
     agent_version: String,
@@ -160,6 +166,8 @@ impl AppState {
             push_client,
             push_notify: Arc::new(Notify::new()),
             command_notify: Arc::new(Notify::new()),
+            receipt_notify: Arc::new(Notify::new()),
+            live: Arc::default(),
             read_broker: Arc::new(AsyncMutex::new(ReadBroker::default())),
             db_permits: Arc::new(tokio::sync::Semaphore::new(8)),
         })
@@ -293,6 +301,7 @@ pub fn app(state: AppState) -> Router {
         .route("/api/v1/agents/heartbeat", post(agent_heartbeat))
         .route("/api/v1/agents/{agent_id}/probe", post(create_probe))
         .route("/api/v1/commands/{command_id}", get(command_status))
+        .route("/api/v1/agent/connect", get(live::connect))
         .route("/api/v1/agent/commands/claim", post(claim_command))
         .route("/api/v1/agent/commands/report", post(report_command))
         .route("/api/v1/agent/reads/claim", post(claim_agent_read))
@@ -724,7 +733,8 @@ async fn authorize(State(state): State<AppState>, mut request: Request, next: Ne
         return next.run(request).await;
     }
 
-    if path == "/api/v1/agents/heartbeat"
+    if path == "/api/v1/agent/connect"
+        || path == "/api/v1/agents/heartbeat"
         || path == "/api/v1/agent/events"
         || path.starts_with("/api/v1/agent/commands/")
         || path.starts_with("/api/v1/agent/reads/")
@@ -1106,9 +1116,15 @@ async fn agent_heartbeat(
         AgentIdentity::Dedicated(_) => AgentCredentialState::Paired,
         AgentIdentity::Legacy => AgentCredentialState::NeedsPairing,
     };
-    state.agents.write().await.insert(
+    let mut agents = state.agents.write().await;
+    let codex = agents
+        .get(&heartbeat.agent_id)
+        .filter(|stored| stored.agent_version == heartbeat.agent_version)
+        .and_then(|stored| stored.codex.clone());
+    agents.insert(
         heartbeat.agent_id,
         StoredAgent {
+            codex,
             capabilities: heartbeat.capabilities,
             hostname: heartbeat.hostname,
             agent_version: heartbeat.agent_version,
@@ -1163,6 +1179,7 @@ async fn list_agents(State(state): State<AppState>) -> Json<AgentListResponse> {
             last_seen_unix: stored.last_seen_unix,
             online: is_online(now, stored.last_seen_unix),
             credential_state: stored.credential_state,
+            codex: stored.codex.clone(),
         })
         .collect();
     Json(AgentListResponse {
@@ -1215,11 +1232,31 @@ async fn agent_events(
                 .into_response();
         }
     };
+    let ids: Vec<_> = inserted
+        .iter()
+        .map(|event| event.event_id.clone())
+        .collect();
+    let notices = database(&state, move |s| s.events.notifications_for_events(&ids))
+        .await
+        .unwrap_or_default();
     state.push_notify.notify_one();
     let mut inserted: HashMap<_, _> = inserted
         .into_iter()
         .map(|event| (event.event_id.clone(), event))
         .collect();
+    let session_ids: std::collections::HashSet<String> = inserted
+        .values()
+        .filter(|event| event.event_type == "codex.session.updated")
+        .filter_map(|event| event.payload["session_id"].as_str().map(str::to_owned))
+        .collect();
+    let projections = database(&state, move |s| {
+        session_ids
+            .into_iter()
+            .map(|id| s.events.session(&id).map(|row| (id, row)))
+            .collect::<Result<HashMap<_, _>>>()
+    })
+    .await
+    .unwrap_or_default();
     for event in &batch.events {
         let outgoing = if event.event_type == "codex.message.delta" {
             Some(StoredEvent {
@@ -1231,9 +1268,25 @@ async fn agent_events(
         } else {
             inserted.remove(&event.event_id)
         };
-        if let Some(event) = outgoing {
+        if let Some(mut event) = outgoing {
+            if event.event_type == "codex.session.updated"
+                && let Some(id) = event.payload["session_id"].as_str()
+                && let Some(Some(session)) = projections.get(id)
+            {
+                event.payload = serde_json::to_value(session).expect("session metadata");
+                event.payload["active_turn_id"] = serde_json::json!(session.active_turn_id);
+                event.payload["update_kind"] = serde_json::json!("projection");
+            }
             let _ = state.event_bus.send(event);
         }
+    }
+    for notice in notices {
+        let _ = state.event_bus.send(StoredEvent {
+            sequence: 0,
+            event_id: format!("notification:{}", notice.id),
+            event_type: "notification.created".into(),
+            payload: serde_json::to_value(notice).expect("notification metadata"),
+        });
     }
     Json(AgentEventAck {
         protocol: FARHELM_PROTOCOL.to_owned(),
@@ -1791,6 +1844,9 @@ async fn claim_agent_read(
     {
         return api_error(StatusCode::FORBIDDEN, "invalid_read_claim");
     }
+    if state.live.read().await.contains_key(&request.agent_id) {
+        return api_error(StatusCode::CONFLICT, "agent_live_connection_active");
+    }
     let wait = request.wait_secs.unwrap_or(0).min(25);
     let notify = {
         let mut broker = state.read_broker.lock().await;
@@ -1929,7 +1985,9 @@ async fn create_typed_response(
                         | farhelm_protocol::CommandState::Delivered
                 ) && tokio::time::Instant::now() < deadline
                 {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let notified = state.receipt_notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
                     if let Ok(Some(latest)) = database(state, {
                         let id = command.command_id.clone();
                         move |s| s.typed_commands.get(&id)
@@ -1937,6 +1995,13 @@ async fn create_typed_response(
                     .await
                     {
                         command = latest;
+                    }
+                    if matches!(
+                        command.state,
+                        farhelm_protocol::CommandState::Queued
+                            | farhelm_protocol::CommandState::Delivered
+                    ) {
+                        let _ = tokio::time::timeout_at(deadline, notified).await;
                     }
                 }
                 state.typed_commands.forget_body(&command.command_id);
@@ -2237,6 +2302,9 @@ async fn claim_command(
     if !identity_allows(&identity, &request.agent_id) {
         return api_error(StatusCode::FORBIDDEN, "agent_token_scope");
     }
+    if state.live.read().await.contains_key(&request.agent_id) {
+        return api_error(StatusCode::CONFLICT, "agent_live_connection_active");
+    }
     let wait = request.wait_secs.unwrap_or(0).min(25);
     let notified = state.command_notify.notified();
     let mut command = match claim_command_now(&state, &identity, &request.agent_id).await {
@@ -2303,7 +2371,10 @@ async fn report_command(
         })
         .await
         {
-            Ok(command) => Json(command).into_response(),
+            Ok(command) => {
+                live::broadcast_command(&state, &command);
+                Json(command).into_response()
+            }
             Err(error) => {
                 tracing::warn!(%error, command_id=%report.command_id, "typed command report rejected");
                 api_error(StatusCode::CONFLICT, "invalid_command_transition")
@@ -2311,7 +2382,10 @@ async fn report_command(
         };
     }
     match state.commands.report(&report, unix_time()) {
-        Ok(command) => Json(command).into_response(),
+        Ok(command) => {
+            live::broadcast_command(&state, &command);
+            Json(command).into_response()
+        }
         Err(ReportCommandError::NotFound) => api_error(StatusCode::NOT_FOUND, "command_not_found"),
         Err(ReportCommandError::Conflict) => {
             api_error(StatusCode::CONFLICT, "invalid_command_transition")
@@ -3174,6 +3248,7 @@ mod tests {
         state.agents.write().await.insert(
             "gpu-a".into(),
             StoredAgent {
+                codex: None,
                 capabilities: vec!["codex.ephemeral_submit".into()],
                 hostname: "gpu-a".into(),
                 agent_version: PRODUCT_VERSION.into(),
@@ -3205,6 +3280,7 @@ mod tests {
                             unix_time(),
                         )
                         .unwrap();
+                    agent_state.receipt_notify.notify_waiters();
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;

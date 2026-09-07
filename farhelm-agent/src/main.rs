@@ -1,11 +1,11 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     fs,
     io::{IsTerminal, Read},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -13,26 +13,22 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use farhelm_core::PRODUCT_VERSION;
 use farhelm_protocol::{
-    AgentEventAck, AgentEventBatch, AgentHeartbeat, AgentHeartbeatAck, AgentReadClaimRequest,
-    AgentReadClaimResponse, AgentReadReportRequest, CommandAction, CommandClaimRequest,
-    CommandClaimResponse, CommandState, CommandStatusResponse, FARHELM_PROTOCOL, ProbeResult,
-    WORKER_PROTOCOL, WorkerHelloResult, WorkerRequest, WorkerResponse, read_frame, write_frame,
+    AgentEventAck, AgentEventBatch, AgentHeartbeat, AgentHeartbeatAck, AgentReadReportRequest,
+    CommandAction, CommandClaimRequest, CommandClaimResponse, CommandState, CommandStatusResponse,
+    FARHELM_PROTOCOL, ProbeResult,
 };
 use reqwest::{Client, Url};
-use tokio::{
-    process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{Mutex as AsyncMutex, oneshot},
-    time::timeout,
-};
+use tokio::process::Command;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+mod codex;
 mod command_store;
 mod config;
 mod experiment_store;
+mod live;
 mod management;
 mod migrations;
-mod resources;
 mod runtime_tasks;
 
 use command_store::CommandStore;
@@ -50,7 +46,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum CommandKind {
-    /// Send heartbeats until interrupted.
+    /// Run the outbound Hub connection and local execution queues.
     Run {
         #[command(flatten)]
         connection: ConnectionArgs,
@@ -83,7 +79,7 @@ enum CommandKind {
         #[command(subcommand)]
         command: CodexCommand,
     },
-    /// Install this executable, configuration, Worker resources, and user service.
+    /// Install this executable, configuration, native Codex selection, and user service.
     Install {
         /// Install files without creating or starting a systemd user service.
         #[arg(long)]
@@ -95,7 +91,7 @@ enum CommandKind {
     Stop,
     /// Restart the installed user service.
     Restart,
-    /// Confirm that the installed user service is active.
+    /// Report service, Hub connectivity, and native Codex readiness.
     Status,
     /// Check the installed configuration and local prerequisites.
     Doctor {
@@ -104,12 +100,11 @@ enum CommandKind {
     },
     /// Pair this host with an Agent entry created in the Console.
     Pair,
-    /// Start the Python Worker and verify the framed protocol handshake.
-    WorkerSmoke {
-        #[arg(long, default_value = "python3")]
-        python: String,
-        #[arg(long, default_value = "farhelm-worker-codex")]
-        worker_root: PathBuf,
+    /// Verify the local native Codex app-server protocol handshake.
+    #[command(visible_alias = "worker-smoke")]
+    CodexSmoke {
+        #[arg(long)]
+        bin: Option<PathBuf>,
     },
     /// Check for or install an immutable official Agent release.
     #[command(visible_alias = "upgrade")]
@@ -117,7 +112,7 @@ enum CommandKind {
         /// Only report whether an update is available.
         #[arg(long)]
         check: bool,
-        /// Install one exact formal version, such as V0.7.1.
+        /// Install one exact formal version, such as V0.8.0.
         #[arg(long)]
         version: Option<String>,
         /// Permit a user-approved first-number version change.
@@ -197,6 +192,13 @@ enum ExperimentCommand {
 
 #[derive(Subcommand)]
 enum CodexCommand {
+    /// Select an existing Codex installation without changing its login or settings.
+    Configure {
+        #[arg(long, env = "FARHELM_AGENT_CONFIG")]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        bin: Option<PathBuf>,
+    },
     /// List resumable Codex threads whose cwd belongs to this project.
     Sessions {
         #[arg(long, env = "FARHELM_AGENT_CONFIG")]
@@ -222,6 +224,8 @@ struct ConnectionArgs {
 
 #[derive(Clone)]
 struct HubArgs {
+    link: live::Link,
+    live_required: bool,
     hub: String,
     token: String,
     agent_id: String,
@@ -234,56 +238,24 @@ struct RuntimeArgs {
     command_interval: u64,
     database: PathBuf,
     projects: BTreeMap<String, config::ProjectSection>,
-    worker_python: String,
-    worker_root: PathBuf,
-}
-
-type WorkerRegistry = Arc<Mutex<HashMap<String, ActiveWorker>>>;
-type WorkerResult = std::result::Result<serde_json::Value, String>;
-
-#[derive(Clone)]
-struct ActiveWorker {
-    stdin: Arc<AsyncMutex<ChildStdin>>,
-    waiters: Arc<Mutex<HashMap<String, oneshot::Sender<WorkerResult>>>>,
-}
-
-struct ActiveWorkerRegistration {
-    registry: WorkerRegistry,
-    session_id: String,
+    codex_bin: Option<PathBuf>,
 }
 
 #[derive(Debug)]
-struct WorkerTurnOrphaned(String);
-
-impl std::fmt::Display for WorkerTurnOrphaned {
+struct CodexTurnOrphaned(String);
+impl std::fmt::Display for CodexTurnOrphaned {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.0)
     }
 }
-
-impl std::error::Error for WorkerTurnOrphaned {}
-
+impl std::error::Error for CodexTurnOrphaned {}
 #[derive(Clone)]
-struct WorkerRuntime {
+struct CodexRuntime {
     tasks: runtime_tasks::RuntimeTasks,
-    python: String,
-    root: PathBuf,
-    registry: WorkerRegistry,
-    idle: Arc<AsyncMutex<HashMap<String, IdleWorker>>>,
-}
-
-struct IdleWorker {
-    child: Child,
-    stdout: ChildStdout,
-    active: ActiveWorker,
-}
-
-impl Drop for ActiveWorkerRegistration {
-    fn drop(&mut self) {
-        if let Ok(mut registry) = self.registry.lock() {
-            registry.remove(&self.session_id);
-        }
-    }
+    codex: codex::Codex,
+    link: live::Link,
+    agent_id: String,
+    wake: Arc<tokio::sync::Notify>,
 }
 
 #[tokio::main]
@@ -302,22 +274,14 @@ async fn main() -> Result<()> {
             command_interval,
             database,
         } => {
-            let mut runtime = resolve_runtime(connection, interval, command_interval, database)?;
-            if let Ok(paths) = AgentPaths::discover() {
-                runtime.worker_python =
-                    resources::ensure_worker_environment(&paths.worker, &runtime.worker_python)
-                        .await?
-                        .to_string_lossy()
-                        .into_owned();
-            }
+            let runtime = resolve_runtime(connection, interval, command_interval, database)?;
             run(
                 runtime.hub,
                 runtime.interval,
                 runtime.command_interval,
                 &runtime.database,
                 &runtime.projects,
-                &runtime.worker_python,
-                &runtime.worker_root,
+                runtime.codex_bin,
             )
             .await
         }
@@ -341,10 +305,17 @@ async fn main() -> Result<()> {
         CommandKind::Status => management::status(),
         CommandKind::Doctor { config } => management::doctor(config.as_deref()).await.map(|_| ()),
         CommandKind::Pair => management::pair().await,
-        CommandKind::WorkerSmoke {
-            python,
-            worker_root,
-        } => worker_smoke(&python, &worker_root).await,
+        CommandKind::CodexSmoke { bin } => {
+            let codex = codex::Codex::new(bin);
+            codex.warm().await?;
+            println!(
+                "Codex handshake ok: {} ({})",
+                codex.status().version.as_deref().unwrap_or("unknown"),
+                codex.status().state
+            );
+            codex.shutdown().await;
+            Ok(())
+        }
         CommandKind::Update {
             check,
             version,
@@ -389,15 +360,11 @@ fn resolve_runtime(
             .as_ref()
             .and_then(|value| value.agent.hostname.clone())
     });
-    let worker_python = config
-        .as_ref()
-        .map_or_else(|| "python3".to_owned(), |value| value.worker.python.clone());
-    let worker_root = paths.map_or_else(
-        || PathBuf::from("farhelm-worker-codex"),
-        |value| value.worker,
-    );
+    let codex_bin = config.as_ref().and_then(|value| value.codex.bin.clone());
     Ok(RuntimeArgs {
         hub: HubArgs {
+            link: live::Link::default(),
+            live_required: false,
             hub,
             token,
             agent_id,
@@ -417,19 +384,17 @@ fn resolve_runtime(
             .or_else(|| config.as_ref().map(|value| value.agent.database.clone()))
             .unwrap_or_else(|| PathBuf::from("farhelm-agent.db")),
         projects: config.map(|value| value.projects).unwrap_or_default(),
-        worker_python,
-        worker_root,
+        codex_bin,
     })
 }
 
 async fn run(
-    hub: HubArgs,
+    mut hub: HubArgs,
     interval_secs: u64,
     command_interval_secs: u64,
     database: &Path,
     projects: &BTreeMap<String, config::ProjectSection>,
-    worker_python: &str,
-    worker_root: &Path,
+    codex_bin: Option<PathBuf>,
 ) -> Result<()> {
     ensure!(
         interval_secs >= 5,
@@ -439,16 +404,29 @@ async fn run(
         command_interval_secs >= 1,
         "command poll interval must be at least 1 second"
     );
-    let (client, endpoint, heartbeat) = heartbeat_client(&hub)?;
+    hub.live_required = true;
+    let (client, _, heartbeat) = heartbeat_client(&hub)?;
     let command_store = CommandStore::open(database)?;
     let experiment_store = ExperimentStore::open(database)?;
     experiment_store.import_config_projects(projects, unix_time())?;
-    let worker_runtime = WorkerRuntime {
+    // Explicitly configured approvals remain visible even before Codex is ready.
+    for (id, project) in experiment_store.approved_projects()? {
+        let name = project
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&id);
+        let (candidate, _) =
+            experiment_store.upsert_discovered_project(&project.path, name, &id, 0, unix_time())?;
+        experiment_store.enqueue_event(&format!("project:{}:configured:{}", candidate.candidate_id, unix_time()), "project.updated", &serde_json::json!({"candidate_id":candidate.candidate_id,"display_name":candidate.display_name,"suggested_project_id":candidate.suggested_project_id,"session_count":candidate.session_count,"state":candidate.state,"updated_at_unix":candidate.updated_at_unix}), unix_time())?;
+    }
+
+    let worker_runtime = CodexRuntime {
         tasks: runtime_tasks::RuntimeTasks::new(),
-        python: worker_python.to_owned(),
-        root: worker_root.to_owned(),
-        registry: WorkerRegistry::default(),
-        idle: Arc::new(AsyncMutex::new(HashMap::new())),
+        codex: codex::Codex::new(codex_bin),
+        link: hub.link.clone(),
+        agent_id: hub.agent_id.clone(),
+        wake: Arc::new(tokio::sync::Notify::new()),
     };
     experiment_store.recover_recorded_turns(unix_time())?;
     let orphaned = experiment_store.orphan_running_prompts(unix_time())?;
@@ -468,77 +446,214 @@ async fn run(
     experiment_store.orphan_running_schedules(unix_time())?;
     let command_store = Arc::new(command_store);
     let experiment_store = Arc::new(experiment_store);
-    for lane in 0..7 {
-        let client = client.clone();
-        let hub = hub.clone();
-        let endpoint = endpoint.clone();
-        let heartbeat = heartbeat.clone();
+    let (incoming_commands, mut commands_rx) = tokio::sync::mpsc::channel(32);
+    let (incoming_reads, mut reads_rx) = tokio::sync::mpsc::channel(16);
+    worker_runtime.tasks.spawn(live::run(
+        hub.clone(),
+        heartbeat,
+        worker_runtime.codex.clone(),
+        incoming_commands,
+        incoming_reads,
+        worker_runtime.wake.clone(),
+    ));
+    {
+        let store = experiment_store.clone();
         let commands = command_store.clone();
+        let wake = worker_runtime.wake.clone();
+        let agent_id = hub.agent_id.clone();
+        let receipt_hub = hub.clone();
+        let receipt_client = client.clone();
+        worker_runtime.tasks.spawn(async move {
+            while let Some(command) = commands_rx.recv().await {
+                if command.agent_id != agent_id || command.protocol != FARHELM_PROTOCOL {
+                    receipt_hub.link.reset();
+                    continue;
+                }
+                let incoming = command.clone();
+                let store = store.clone();
+                let receipts = store.clone();
+                let commands = commands.clone();
+                let result = runtime_tasks::blocking(move || {
+                    if command.action == CommandAction::AgentProbe {
+                        commands.receive(&command, unix_time()).map(|_| ())
+                    } else {
+                        store.receive_remote_command(&command, unix_time())
+                    }
+                })
+                .await;
+                match result {
+                    Err(error) => {
+                        warn!(%error, "Agent rejected an incoming command");
+                        receipt_hub.link.reset();
+                    }
+                    Ok(()) if incoming.action != CommandAction::AgentProbe => {
+                        let id = incoming.command_id.clone();
+                        let Ok(saved) = receipts.background(move |s| s.remote_receipt(&id)).await
+                        else {
+                            receipt_hub.link.reset();
+                            continue;
+                        };
+                        let state = saved.state;
+                        let report = farhelm_protocol::CommandReportRequest {
+                            protocol: FARHELM_PROTOCOL.into(),
+                            agent_id: agent_id.clone(),
+                            command_id: incoming.command_id.clone(),
+                            state,
+                            result: None,
+                            data: saved.data,
+                            detail: saved.detail,
+                        };
+                        if send_command_report(&receipt_client, &receipt_hub, &report)
+                            .await
+                            .is_ok()
+                            && state == CommandState::Accepted
+                        {
+                            let id = incoming.command_id;
+                            let _ = receipts
+                                .background(move |s| {
+                                    s.mark_remote_accepted_reported(&id, unix_time())
+                                })
+                                .await;
+                        }
+                    }
+                    Ok(()) => {}
+                }
+                wake.notify_one();
+            }
+        });
+    }
+    {
+        let store = experiment_store.clone();
+        let native = worker_runtime.clone();
+        let hub = hub.clone();
+        worker_runtime.tasks.spawn(async move {
+            let permits = Arc::new(tokio::sync::Semaphore::new(4));
+            while let Some((request, expires)) = reads_rx.recv().await {
+                let Ok(permit) = permits.clone().acquire_owned().await else {
+                    break;
+                };
+                let store = store.clone();
+                let worker = native.clone();
+                let hub = hub.clone();
+                native.tasks.spawn(async move {
+                    let _permit = permit;
+                    if expires <= unix_time() {
+                        return;
+                    }
+                    let id = request.request_id.clone();
+                    let outcome = tokio::time::timeout(
+                        Duration::from_secs(expires.saturating_sub(unix_time()).min(20)),
+                        read_request(&hub, &worker, &store, request),
+                    )
+                    .await;
+                    let report = match outcome {
+                        Ok(Ok(report)) => report,
+                        _ => farhelm_protocol::AgentReadReportRequest {
+                            protocol: FARHELM_PROTOCOL.to_owned(),
+                            agent_id: hub.agent_id.clone(),
+                            request_id: id,
+                            ok: false,
+                            data: None,
+                            detail: Some("codex_read_failed".into()),
+                        },
+                    };
+                    let _ = hub
+                        .link
+                        .request(
+                            |request_id| farhelm_protocol::live::AgentFrame::ReadReport {
+                                request_id,
+                                report,
+                            },
+                        )
+                        .await;
+                });
+            }
+        });
+    }
+    {
+        let mut link = hub.link.connected.subscribe();
+        let mut native = worker_runtime.codex.subscribe_status();
+        let status_path = database.with_extension("status.json");
+        worker_runtime.tasks.spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                let status = serde_json::json!({"agent_version":PRODUCT_VERSION,"pid":std::process::id(),"updated_at_unix":unix_time(),"hub_connected":*link.borrow(),"codex":native.borrow().clone()});
+                let path = status_path.clone();
+                let _ = runtime_tasks::blocking(move || farhelm_lifecycle::write_atomic(&path, &serde_json::to_vec(&status)?, 0o600)).await;
+                tokio::select! { _ = link.changed() => {}, _ = native.changed() => {}, _ = tick.tick() => {} }
+            }
+        });
+    }
+    // A filesystem wake observes CLI commits as well as this service's outbox.
+    worker_runtime.tasks.spawn(runtime_tasks::watch_database(
+        database.to_owned(),
+        worker_runtime.wake.clone(),
+    ));
+    let report_wake = Arc::new(tokio::sync::Notify::new());
+    {
+        let wake = report_wake.clone();
+        let hub = hub.clone();
+        let client = client.clone();
+        let commands = command_store.clone();
+        let experiments = experiment_store.clone();
+        let runtime = worker_runtime.clone();
+        worker_runtime.tasks.spawn(async move {
+            loop {
+                wake.notified().await;
+                if !*hub.link.connected.borrow() {
+                    continue;
+                }
+                let mut processed = 0;
+                let _ = drain_local_work(&client, &hub, &commands, &mut processed).await;
+                let _ = drain_remote_work(
+                    &client,
+                    &hub,
+                    &experiments,
+                    &BTreeMap::new(),
+                    &runtime,
+                    &mut processed,
+                )
+                .await;
+                let _ = upload_events(&client, &hub, &experiments).await;
+            }
+        });
+    }
+    for lane in 0..4 {
+        let report_wake = report_wake.clone();
         let experiments = experiment_store.clone();
         let worker = worker_runtime.clone();
         let database = database.to_owned();
         worker_runtime.tasks.spawn(async move {
-            let period = match lane {
-                0 => interval_secs,
-                6 => 30,
-                _ => command_interval_secs,
-            };
-            let mut ticker = tokio::time::interval(Duration::from_secs(period));
+            let mut ticker = tokio::time::interval(Duration::from_secs(match lane {0=>10,1=>2,2=>30,_=>15}));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                ticker.tick().await;
-                let result: Result<()> = async {
+                if lane == 0 {tokio::select! {_=ticker.tick()=>{},_=worker.wake.notified()=>{}}} else {ticker.tick().await;}
+                let result:Result<()> = async {
                     match lane {
                         0 => {
-                            send_heartbeat(&client, endpoint.clone(), &hub.token, &heartbeat).await
-                        }
+                            report_wake.notify_one();
+                            dispatch_work(&experiments,&worker).await
+                        },
                         1 => {
-                            let projects = approved_project_sections(&experiments)?;
-                            process_command_cycle(
-                                &client,
-                                &hub,
-                                &commands,
-                                &experiments,
-                                &projects,
-                                &worker,
-                            )
-                            .await
-                            .map(|_| ())
-                        }
-                        2 => process_read_once(&client, &hub, &worker, &experiments).await,
-                        3 => {
-                            let projects = approved_project_sections(&experiments)?;
-                            let matchers = projects
-                                .into_iter()
-                                .map(|(id, p)| {
-                                    (
-                                        id,
-                                        ProjectMatchers {
-                                            success: p.success_patterns,
-                                            failure: p.failure_patterns,
-                                        },
-                                    )
-                                })
-                                .collect();
-                            for watch in experiments.inspect(&matchers, unix_time())? { info!(watch_id=%watch.watch_id,state=?watch.state,"experiment finished"); }
-                            Ok(())
-                        }
-                        4 => dispatch_work(&client, &hub, &experiments, &worker).await,
-                        5 => upload_events(&client, &hub, &experiments).await,
-                        _ => discover_projects(&database, &worker.python, &worker.root).await,
+                            let store=experiments.clone();
+                            runtime_tasks::blocking(move|| {
+                                let matchers=approved_project_sections(&store)?.into_iter().map(|(id,p)|(id,ProjectMatchers {success:p.success_patterns,failure:p.failure_patterns})).collect();
+                                store.inspect(&matchers,unix_time()).map(|watches| {for watch in watches {info!(watch_id=%watch.watch_id,state=?watch.state,"experiment finished");}})
+                            }).await?;
+                            worker.wake.notify_one();Ok(())
+                        },
+                        2 => {discover_projects(&database,&worker.codex).await?;worker.wake.notify_one();Ok(())},
+                        _ => worker.codex.warm().await,
                     }
-                }
-                .await;
-                if let Err(error) = result {
-                    warn!(lane, %error, "Agent service cycle failed; retrying");
-                }
+                }.await;
+                if let Err(error)=result {warn!(lane,%error,"Agent service cycle failed; retrying");}
             }
         });
     }
     info!(version=PRODUCT_VERSION,agent_id=%hub.agent_id,"FarHelm Agent is running");
     shutdown_signal().await;
     worker_runtime.tasks.shutdown().await;
-    worker_runtime.idle.lock().await.clear();
+    worker_runtime.codex.shutdown().await;
     info!("FarHelm Agent stopped");
     Ok(())
 }
@@ -562,14 +677,12 @@ fn approved_project_sections(
         .collect())
 }
 
-async fn discover_projects(database: &Path, python: &str, worker_root: &Path) -> Result<()> {
-    let value = worker_call_once(
-        python,
-        worker_root,
-        "codex.projects.discover",
-        serde_json::json!({}),
-    )
-    .await?;
+async fn discover_projects(database: &Path, codex: &codex::Codex) -> Result<()> {
+    let value = codex
+        .call("codex.projects.discover", serde_json::json!({}))
+        .await?;
+    let database = database.to_owned();
+    runtime_tasks::blocking(move || {
     let projects = value
         .get("projects")
         .and_then(serde_json::Value::as_array)
@@ -579,7 +692,7 @@ async fn discover_projects(database: &Path, python: &str, worker_root: &Path) ->
         .context("HOME is missing")?;
     let home = fs::canonicalize(home).context("failed to resolve HOME")?;
     let uid = unsafe { libc::geteuid() };
-    let store = ExperimentStore::open(database)?;
+    let store = ExperimentStore::open(&database)?;
     for project in projects {
         let Some(raw_path) = project.get("cwd").and_then(serde_json::Value::as_str) else {
             continue;
@@ -664,6 +777,7 @@ async fn discover_projects(database: &Path, python: &str, worker_root: &Path) ->
         )?;
     }
     Ok(())
+    }).await
 }
 
 fn suggested_project_id(name: &str) -> String {
@@ -687,42 +801,46 @@ fn suggested_project_id(name: &str) -> String {
 
 async fn sync_project_sessions(
     database: &Path,
-    python: &str,
-    worker_root: &Path,
+    codex: &codex::Codex,
     project_id: &str,
     project_path: &Path,
 ) -> Result<()> {
-    let value = worker_call_once(
-        python,
-        worker_root,
-        "codex.sessions.list",
-        serde_json::json!({"project_path":project_path,"archived":"all"}),
-    )
-    .await?;
-    let sessions = value
-        .get("sessions")
-        .and_then(serde_json::Value::as_array)
-        .context("Worker session list omitted sessions")?;
-    let store = ExperimentStore::open(database)?;
-    for session in sessions {
-        let session_id = session
-            .get("session_id")
-            .and_then(serde_json::Value::as_str)
-            .context("Worker returned a session without ID")?;
-        let updated = session
-            .get("updated_at_unix")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or_else(unix_time);
-        store.discover_session(
-            session_id,
-            project_id,
-            project_path,
-            &session["title"],
-            session["archived"].as_bool().unwrap_or(false),
-            updated,
-        )?;
-    }
-    Ok(())
+    let value = codex
+        .call(
+            "codex.sessions.list",
+            serde_json::json!({"project_path":project_path,"archived":"all"}),
+        )
+        .await?;
+    let database = database.to_owned();
+    let project_id = project_id.to_owned();
+    let project_path = project_path.to_owned();
+    runtime_tasks::blocking(move || {
+        let sessions = value
+            .get("sessions")
+            .and_then(serde_json::Value::as_array)
+            .context("Worker session list omitted sessions")?;
+        let store = ExperimentStore::open(&database)?;
+        for session in sessions {
+            let session_id = session
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .context("Worker returned a session without ID")?;
+            let updated = session
+                .get("updated_at_unix")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_else(unix_time);
+            store.discover_session(
+                session_id,
+                &project_id,
+                &project_path,
+                &session["title"],
+                session["archived"].as_bool().unwrap_or(false),
+                updated,
+            )?;
+        }
+        Ok(())
+    })
+    .await
 }
 
 fn load_local_config(path: Option<PathBuf>) -> Result<AgentFileConfig> {
@@ -882,26 +1000,39 @@ fn experiment_command(command: ExperimentCommand) -> Result<()> {
 
 async fn codex_command(command: CodexCommand) -> Result<()> {
     match command {
+        CodexCommand::Configure { config, bin } => {
+            let path = config.unwrap_or(AgentPaths::discover()?.config);
+            let mut config = AgentFileConfig::load(&path)?;
+            let bin = codex::transport::discover(bin.as_deref())?;
+            let version = codex::transport::version(&bin).await?;
+            let native = codex::Codex::new(Some(bin.clone()));
+            native.warm().await?;
+            let state = native.status().state;
+            native.shutdown().await;
+            config.codex.bin = Some(bin.clone());
+            farhelm_lifecycle::write_atomic(&path, config.encode()?.as_bytes(), 0o600)?;
+            println!(
+                "Codex configured: {} ({version}, {state}). Restart the Agent service to apply.",
+                bin.display()
+            );
+            Ok(())
+        }
         CodexCommand::Sessions { config, project } => {
             let config = load_local_config(config)?;
             let store = ExperimentStore::open(&config.agent.database)?;
             store.import_config_projects(&config.projects, unix_time())?;
-            let projects = store.approved_projects()?;
-            let project = projects
-                .get(&project)
-                .context("project is not approved; import it in the Console first")?;
-            let project_path = fs::canonicalize(&project.path)
-                .context("failed to resolve approved project path")?;
-            let worker_root = AgentPaths::discover()?.worker;
-            resources::materialize_worker(&worker_root)?;
-            let value = worker_call_once(
-                &config.worker.python,
-                &worker_root,
-                "codex.sessions.list",
-                serde_json::json!({"project_path":project_path,"archived":"false"}),
-            )
-            .await?;
-            println!("{}", serde_json::to_string_pretty(&value)?);
+            let projects = approved_project_sections(&store)?;
+            let path =
+                fs::canonicalize(&projects.get(&project).context("unapproved project")?.path)?;
+            let native = codex::Codex::new(config.codex.bin);
+            let result = native
+                .call(
+                    "codex.sessions.list",
+                    serde_json::json!({"project_path":path,"archived":"all"}),
+                )
+                .await;
+            native.shutdown().await;
+            println!("{}", serde_json::to_string_pretty(&result?)?);
             Ok(())
         }
     }
@@ -933,9 +1064,33 @@ fn prompt_regex(prompt: &str) -> Result<String> {
 }
 
 async fn upload_events(client: &Client, hub: &HubArgs, store: &ExperimentStore) -> Result<()> {
-    let events = store.pending_events(&hub.agent_id, 100)?;
+    let agent = hub.agent_id.clone();
+    let events = store
+        .background(move |s| s.pending_events(&agent, 100))
+        .await?;
     if events.is_empty() {
         return Ok(());
+    }
+    if hub.live_required {
+        let value = hub
+            .link
+            .request(|request_id| farhelm_protocol::live::AgentFrame::Events {
+                request_id,
+                batch: AgentEventBatch {
+                    protocol: FARHELM_PROTOCOL.into(),
+                    agent_id: hub.agent_id.clone(),
+                    events,
+                },
+            })
+            .await?;
+        let ack: AgentEventAck = serde_json::from_value(value)?;
+        ensure!(
+            ack.protocol == FARHELM_PROTOCOL,
+            "Hub event protocol mismatch"
+        );
+        return store
+            .background(move |s| s.acknowledge_events(&ack.accepted_event_ids))
+            .await;
     }
     let response = client
         .post(hub_endpoint(&hub.hub, "/api/v1/agent/events")?)
@@ -958,7 +1113,9 @@ async fn upload_events(client: &Client, hub: &HubArgs, store: &ExperimentStore) 
         ack.protocol == FARHELM_PROTOCOL,
         "Hub event protocol mismatch"
     );
-    store.acknowledge_events(&ack.accepted_event_ids)
+    store
+        .background(move |s| s.acknowledge_events(&ack.accepted_event_ids))
+        .await
 }
 
 const fn state_label(state: farhelm_protocol::ExperimentState) -> &'static str {
@@ -978,12 +1135,12 @@ async fn command_poll_once(runtime: &RuntimeArgs) -> Result<()> {
     let experiments = ExperimentStore::open(&runtime.database)?;
     experiments.import_config_projects(&runtime.projects, unix_time())?;
     let live_projects = approved_project_sections(&experiments)?;
-    let worker_runtime = WorkerRuntime {
+    let worker_runtime = CodexRuntime {
         tasks: runtime_tasks::RuntimeTasks::new(),
-        python: runtime.worker_python.clone(),
-        root: runtime.worker_root.clone(),
-        registry: WorkerRegistry::default(),
-        idle: Arc::new(AsyncMutex::new(HashMap::new())),
+        codex: codex::Codex::new(runtime.codex_bin.clone()),
+        link: runtime.hub.link.clone(),
+        agent_id: runtime.hub.agent_id.clone(),
+        wake: Arc::new(tokio::sync::Notify::new()),
     };
     let processed = process_command_cycle(
         &client,
@@ -1004,7 +1161,7 @@ async fn process_command_cycle(
     store: &CommandStore,
     experiments: &ExperimentStore,
     projects: &BTreeMap<String, config::ProjectSection>,
-    worker_runtime: &WorkerRuntime,
+    worker_runtime: &CodexRuntime,
 ) -> Result<u64> {
     let mut processed = 0;
     drain_local_work(client, hub, store, &mut processed).await?;
@@ -1068,109 +1225,6 @@ async fn process_command_cycle(
     Ok(processed)
 }
 
-async fn process_read_once(
-    client: &Client,
-    hub: &HubArgs,
-    worker: &WorkerRuntime,
-    store: &ExperimentStore,
-) -> Result<()> {
-    let url = hub_endpoint(&hub.hub, "/api/v1/agent/reads/claim")?;
-    let claim: AgentReadClaimResponse = client
-        .post(url)
-        .bearer_auth(&hub.token)
-        .json(&AgentReadClaimRequest {
-            protocol: FARHELM_PROTOCOL.to_owned(),
-            agent_id: hub.agent_id.clone(),
-            wait_secs: None,
-        })
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    let Some(request) = claim.request else {
-        return Ok(());
-    };
-    let outcome = if request.method == "codex.session.history" {
-        let session_id = request
-            .params
-            .get("session_id")
-            .and_then(serde_json::Value::as_str)
-            .context("history read omitted session ID")?;
-        ensure!(
-            store.session_binding(session_id)?.is_some(),
-            "history read references an unapproved session"
-        );
-        worker_call_once(
-            &worker.python,
-            &worker.root,
-            &request.method,
-            request.params,
-        )
-        .await
-        .and_then(|value| {
-            let page: farhelm_protocol::CodexTranscriptPage = serde_json::from_value(value)?;
-            Ok(serde_json::to_value(page)?)
-        })
-    } else if request.method == "codex.session.display" {
-        let ids: Option<Vec<String>> = request
-            .params
-            .get("session_ids")
-            .map(|value| serde_json::from_value(value.clone()))
-            .transpose()?;
-        let project = request
-            .params
-            .get("project_id")
-            .and_then(serde_json::Value::as_str);
-        let bindings = store.display_bindings(project, ids.as_deref())?;
-        let mut params = request.params;
-        params["bindings"] = bindings;
-        params["agent_id"] = serde_json::json!(hub.agent_id);
-        tokio::time::timeout(
-            Duration::from_secs(18),
-            worker_call_once(&worker.python, &worker.root, &request.method, params),
-        )
-        .await
-        .context("display read timed out")?
-    } else if request.method == "codex.schedule.detail" {
-        let id = request
-            .params
-            .get("schedule_id")
-            .and_then(serde_json::Value::as_str)
-            .context("schedule detail omitted ID")?;
-        store.schedule_detail(id)
-    } else {
-        bail!("Hub requested unsupported transient read")
-    };
-    let report = match outcome {
-        Ok(data) => AgentReadReportRequest {
-            protocol: FARHELM_PROTOCOL.to_owned(),
-            agent_id: hub.agent_id.clone(),
-            request_id: request.request_id.clone(),
-            ok: true,
-            data: Some(data),
-            detail: None,
-        },
-        Err(error) => AgentReadReportRequest {
-            protocol: FARHELM_PROTOCOL.to_owned(),
-            agent_id: hub.agent_id.clone(),
-            request_id: request.request_id.clone(),
-            ok: false,
-            data: None,
-            detail: Some(error.to_string().chars().take(512).collect()),
-        },
-    };
-    let path = format!("/api/v1/agent/reads/{}/report", request.request_id);
-    client
-        .post(hub_endpoint(&hub.hub, &path)?)
-        .bearer_auth(&hub.token)
-        .json(&report)
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(())
-}
-
 async fn drain_local_work(
     client: &Client,
     hub: &HubArgs,
@@ -1178,28 +1232,35 @@ async fn drain_local_work(
     processed: &mut u64,
 ) -> Result<()> {
     for _ in 0..8 {
-        let Some(pending) = store.next_work()? else {
+        let Some(pending) = store.background(|s| s.next_work()).await? else {
             return Ok(());
         };
         if pending.state == CommandState::Accepted && unix_time() >= pending.expires_at_unix {
-            store.expire(&pending.command_id, unix_time())?;
+            {
+                let id = pending.command_id.clone();
+                store
+                    .background(move |s| s.expire(&id, unix_time()))
+                    .await?
+            };
             continue;
         }
         if pending.state == CommandState::Accepted && pending.reported {
-            store.complete_probe(
-                &pending.command_id,
-                &ProbeResult {
-                    agent_version: PRODUCT_VERSION.to_owned(),
-                    hostname: resolve_hostname(hub.hostname.as_deref(), &hub.agent_id),
-                },
-                unix_time(),
-            )?;
+            let id = pending.command_id.clone();
+            let result = ProbeResult {
+                agent_version: PRODUCT_VERSION.to_owned(),
+                hostname: resolve_hostname(hub.hostname.as_deref(), &hub.agent_id),
+            };
+            store
+                .background(move |s| s.complete_probe(&id, &result, unix_time()))
+                .await?;
             *processed += 1;
             continue;
         }
         let report = store.report(&pending, &hub.agent_id);
         send_command_report(client, hub, &report).await?;
-        store.mark_reported(&pending.command_id, pending.state, unix_time())?;
+        store
+            .background(move |s| s.mark_reported(&pending.command_id, pending.state, unix_time()))
+            .await?;
     }
     bail!("local command work exceeded the bounded cycle limit")
 }
@@ -1209,13 +1270,18 @@ async fn drain_remote_work(
     hub: &HubArgs,
     store: &ExperimentStore,
     projects: &BTreeMap<String, config::ProjectSection>,
-    worker_runtime: &WorkerRuntime,
+    worker_runtime: &CodexRuntime,
     processed: &mut u64,
 ) -> Result<()> {
     let _ = (projects, worker_runtime, processed);
-    for command in store.pending_remote_commands()? {
+    for command in store.background(|s| s.pending_remote_commands()).await? {
         if unix_time() >= command.expires_at_unix {
-            store.expire_remote_command(&command.command_id, unix_time())?;
+            {
+                let id = command.command_id.clone();
+                store
+                    .background(move |s| s.expire_remote_command(&id, unix_time()))
+                    .await?
+            };
             continue;
         }
         if !command.accepted_reported {
@@ -1229,10 +1295,14 @@ async fn drain_remote_work(
                 data: None,
             };
             send_command_report(client, hub, &report).await?;
-            store.mark_remote_accepted_reported(&command.command_id, unix_time())?;
+            store
+                .background(move |s| {
+                    s.mark_remote_accepted_reported(&command.command_id, unix_time())
+                })
+                .await?;
         }
     }
-    for terminal in store.pending_remote_reports()? {
+    for terminal in store.background(|s| s.pending_remote_reports()).await? {
         send_command_report(
             client,
             hub,
@@ -1247,21 +1317,26 @@ async fn drain_remote_work(
             },
         )
         .await?;
-        store.mark_remote_terminal_reported(&terminal.command_id, unix_time())?;
+        store
+            .background(move |s| s.mark_remote_terminal_reported(&terminal.command_id, unix_time()))
+            .await?;
     }
     Ok(())
 }
 
-async fn dispatch_work(
-    client: &Client,
-    hub: &HubArgs,
-    store: &ExperimentStore,
-    worker: &WorkerRuntime,
-) -> Result<()> {
-    let projects = approved_project_sections(store)?;
-    for command in store.runnable_remote_commands(unix_time())? {
+async fn dispatch_work(store: &ExperimentStore, worker: &CodexRuntime) -> Result<()> {
+    let projects = store.background(approved_project_sections).await?;
+    for command in store
+        .background(|s| s.runnable_remote_commands(unix_time()))
+        .await?
+    {
         if unix_time() >= command.expires_at_unix {
-            store.expire_remote_command(&command.command_id, unix_time())?;
+            {
+                let id = command.command_id.clone();
+                store
+                    .background(move |s| s.expire_remote_command(&id, unix_time()))
+                    .await?
+            };
             continue;
         }
         let control = command.action != CommandAction::CodexTurnStart;
@@ -1270,35 +1345,45 @@ async fn dispatch_work(
                 .payload
                 .get("session_id")
                 .and_then(serde_json::Value::as_str)
-            && store.remote_session_busy(session)?
+            && {
+                let session = session.to_owned();
+                store
+                    .background(move |s| s.remote_session_busy(&session))
+                    .await?
+            }
         {
             continue;
         }
         let Some(permit) = worker.tasks.permit(control) else {
             continue;
         };
-        if store.claim_remote_command(&command.command_id, unix_time())? {
+        let id = command.command_id.clone();
+        if store
+            .background(move |s| s.claim_remote_command(&id, unix_time()))
+            .await?
+        {
             let database = store.path().to_owned();
             let projects = projects.clone();
             let runtime = worker.clone();
-            let client = client.clone();
-            let hub = hub.clone();
             worker.tasks.spawn(async move {
                 let _permit = permit;
                 if let Err(error) =
-                    execute_remote_command(&client, &hub, &database, &projects, &runtime, command)
-                        .await
+                    execute_remote_command(&database, &projects, &runtime, command).await
                 {
                     warn!(%error,"Codex command failed");
                 }
             });
         }
     }
-    for prompt in store.pending_auto_prompts(unix_time())? {
+    for prompt in store
+        .background(|s| s.pending_auto_prompts(unix_time()))
+        .await?
+    {
         let Some(permit) = worker.tasks.permit(false) else {
             break;
         };
-        if store.claim_auto_prompt(&prompt.watch_id)? {
+        let id = prompt.watch_id.clone();
+        if store.background(move |s| s.claim_auto_prompt(&id)).await? {
             let database = store.path().to_owned();
             let runtime = worker.clone();
             worker.tasks.spawn(async move {
@@ -1309,11 +1394,15 @@ async fn dispatch_work(
             });
         }
     }
-    for prompt in store.due_schedules(unix_time())? {
+    for prompt in store.background(|s| s.due_schedules(unix_time())).await? {
         let Some(permit) = worker.tasks.permit(false) else {
             break;
         };
-        if store.claim_schedule(&prompt.schedule_id, unix_time())? {
+        let id = prompt.schedule_id.clone();
+        if store
+            .background(move |s| s.claim_schedule(&id, unix_time()))
+            .await?
+        {
             let database = store.path().to_owned();
             let runtime = worker.clone();
             let project = projects.get(&prompt.project_id).cloned();
@@ -1330,20 +1419,18 @@ async fn dispatch_work(
 }
 
 async fn execute_remote_command(
-    client: &Client,
-    hub: &HubArgs,
     database: &Path,
     projects: &BTreeMap<String, config::ProjectSection>,
-    worker_runtime: &WorkerRuntime,
+    worker_runtime: &CodexRuntime,
     command: RemoteCommand,
 ) -> Result<()> {
-    let store = ExperimentStore::open(database)?;
+    let store = ExperimentStore::open_async(database).await?;
     let outcome = execute_remote_command_inner(&store, projects, worker_runtime, &command).await;
     let (state, data, detail) = match outcome {
         Ok(data) => (CommandState::Completed, Some(data), None),
         Err(error) => {
             warn!(command_id = %command.command_id, %error, "local Codex operation failed");
-            let event_type = if error.downcast_ref::<WorkerTurnOrphaned>().is_some() {
+            let event_type = if error.downcast_ref::<CodexTurnOrphaned>().is_some() {
                 "codex.turn.orphaned"
             } else {
                 "codex.turn.failed"
@@ -1376,34 +1463,20 @@ async fn execute_remote_command(
             )
         }
     };
-    store.finish_remote_command(
-        &command.command_id,
-        state,
-        data.as_ref(),
-        detail.as_deref(),
-        unix_time(),
-    )?;
-    send_command_report(
-        client,
-        hub,
-        &farhelm_protocol::CommandReportRequest {
-            protocol: FARHELM_PROTOCOL.to_owned(),
-            agent_id: hub.agent_id.clone(),
-            command_id: command.command_id.clone(),
-            state,
-            result: None,
-            detail,
-            data,
-        },
-    )
-    .await?;
-    store.mark_remote_terminal_reported(&command.command_id, unix_time())
+    let id = command.command_id.clone();
+    store
+        .background(move |s| {
+            s.finish_remote_command(&id, state, data.as_ref(), detail.as_deref(), unix_time())
+        })
+        .await?;
+    worker_runtime.wake.notify_one();
+    Ok(())
 }
 
 async fn execute_remote_command_inner(
     store: &ExperimentStore,
     projects: &BTreeMap<String, config::ProjectSection>,
-    worker_runtime: &WorkerRuntime,
+    worker_runtime: &CodexRuntime,
     command: &RemoteCommand,
 ) -> Result<serde_json::Value> {
     if command.action == CommandAction::ProjectApprove {
@@ -1431,8 +1504,7 @@ async fn execute_remote_command_inner(
             )?;
             sync_project_sessions(
                 store.path(),
-                &worker_runtime.python,
-                &worker_runtime.root,
+                &worker_runtime.codex,
                 &project.suggested_project_id,
                 &project.path,
             )
@@ -1499,7 +1571,7 @@ async fn execute_remote_command_inner(
             } else {
                 project_root.clone()
             };
-            let value = worker_call_once(&worker_runtime.python, &worker_runtime.root, method, serde_json::json!({"session_id":command.payload.get("session_id"),"cwd":cwd.clone(),"mode":mode})).await?;
+            let value = worker_runtime.codex.call(method, serde_json::json!({"session_id":command.payload.get("session_id"),"cwd":cwd.clone(),"mode":mode})).await?;
             let session_id = value
                 .get("session_id")
                 .and_then(serde_json::Value::as_str)
@@ -1544,18 +1616,10 @@ async fn execute_remote_command_inner(
             } else {
                 "codex.turn.interrupt"
             };
-            active_worker_request(
-                &worker_runtime.registry,
-                command
-                    .payload
-                    .get("session_id")
-                    .and_then(serde_json::Value::as_str)
-                    .context("control command omitted session_id")?,
-                &command.command_id,
-                method,
-                command.payload.clone(),
-            )
-            .await
+            worker_runtime
+                .codex
+                .call(method, command.payload.clone())
+                .await
         }
         CommandAction::CodexScheduleCreate => {
             let schedule_id = store.create_schedule(&command.payload, unix_time())?;
@@ -1577,11 +1641,11 @@ async fn execute_remote_command_inner(
 
 async fn run_scheduled_prompt(
     database: &Path,
-    worker: &WorkerRuntime,
+    worker: &CodexRuntime,
     project: Option<config::ProjectSection>,
     prompt: ScheduledPrompt,
 ) -> Result<()> {
-    let store = ExperimentStore::open(database)?;
+    let store = ExperimentStore::open_async(database).await?;
     let result = async {
         let project = project.context("scheduled project is no longer approved")?;
         let root =
@@ -1600,7 +1664,7 @@ async fn run_scheduled_prompt(
     .await;
     let state = match &result {
         Ok(_) => farhelm_protocol::CodexScheduleState::Completed,
-        Err(error) if error.downcast_ref::<WorkerTurnOrphaned>().is_some() => {
+        Err(error) if error.downcast_ref::<CodexTurnOrphaned>().is_some() => {
             farhelm_protocol::CodexScheduleState::Orphaned
         }
         Err(_) => farhelm_protocol::CodexScheduleState::Failed,
@@ -1614,6 +1678,24 @@ async fn send_command_report(
     hub: &HubArgs,
     report: &farhelm_protocol::CommandReportRequest,
 ) -> Result<()> {
+    if hub.live_required {
+        let frame = report.clone();
+        let value = hub
+            .link
+            .request(
+                |request_id| farhelm_protocol::live::AgentFrame::CommandReport {
+                    request_id,
+                    report: frame,
+                },
+            )
+            .await?;
+        let status: CommandStatusResponse = serde_json::from_value(value)?;
+        ensure!(
+            status.command_id == report.command_id && status.state == report.state,
+            "Hub command receipt mismatch"
+        );
+        return Ok(());
+    }
     let report_url = hub_endpoint(&hub.hub, "/api/v1/agent/commands/report")?;
     let response = client
         .post(report_url)
@@ -1758,10 +1840,10 @@ async fn send_heartbeat(
 
 async fn run_auto_prompt(
     database: &Path,
-    worker_runtime: &WorkerRuntime,
+    worker_runtime: &CodexRuntime,
     job: AutoPrompt,
 ) -> Result<()> {
-    let store = ExperimentStore::open(database)?;
+    let store = ExperimentStore::open_async(database).await?;
     let result = run_auto_prompt_inner(&store, worker_runtime, &job).await;
     let now = unix_time();
     match result {
@@ -1776,7 +1858,7 @@ async fn run_auto_prompt(
         ),
         Err(error) => {
             let detail = error.to_string();
-            let event_type = if error.downcast_ref::<WorkerTurnOrphaned>().is_some() {
+            let event_type = if error.downcast_ref::<CodexTurnOrphaned>().is_some() {
                 "codex.turn.orphaned"
             } else {
                 "codex.turn.failed"
@@ -1797,19 +1879,9 @@ async fn run_auto_prompt(
 
 async fn run_auto_prompt_inner(
     store: &ExperimentStore,
-    worker_runtime: &WorkerRuntime,
+    worker_runtime: &CodexRuntime,
     job: &AutoPrompt,
 ) -> Result<(String, String)> {
-    let source_root = worker_runtime
-        .root
-        .join("src")
-        .canonicalize()
-        .with_context(|| {
-            format!(
-                "worker source not found below {}",
-                worker_runtime.root.display()
-            )
-        })?;
     let (cwd, mode) = if let Some(session_id) = &job.session_id {
         if let Some(binding) = store.session_binding(session_id)? {
             ensure!(
@@ -1842,71 +1914,22 @@ async fn run_auto_prompt_inner(
             Some(_) => bail!("invalid new-session mode"),
         }
     };
-    let cached = if let Some(session_id) = job.session_id.as_deref() {
-        worker_runtime.idle.lock().await.remove(session_id)
-    } else {
-        None
-    };
-    let (child, mut stdout, active_worker, session_id, session_cwd) = if let Some(cached) = cached {
-        (
-            cached.child,
-            cached.stdout,
-            cached.active,
-            job.session_id.clone().expect("cached worker has session"),
-            cwd.clone(),
-        )
-    } else {
-        let mut child = Command::new(&worker_runtime.python)
-            .arg("-m")
-            .arg("farhelm_worker_codex")
-            .env("PYTHONPATH", source_root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("failed to start Worker with `{}`", worker_runtime.python))?;
-        let mut stdin = child.stdin.take().context("Worker stdin was not piped")?;
-        let mut stdout = child.stdout.take().context("Worker stdout was not piped")?;
-        let session_request = WorkerRequest {
-            protocol: WORKER_PROTOCOL.to_owned(),
-            kind: "request".to_owned(),
-            request_id: format!("session:{}", job.watch_id),
-            method: if job.session_id.is_some() {
+    let value = worker_runtime
+        .codex
+        .call(
+            if job.session_id.is_some() {
                 "codex.session.resume"
             } else {
                 "codex.session.start"
-            }
-            .to_owned(),
-            params: serde_json::json!({"session_id":job.session_id,"cwd":cwd.clone(),"mode":mode}),
-        };
-        write_frame(&mut stdin, &session_request).await?;
-        let response: WorkerResponse = read_frame(&mut stdout).await?;
-        ensure!(
-            response.ok,
-            "Worker failed to prepare session: {:?}",
-            response.error
-        );
-        let session_id = response
-            .result
-            .as_ref()
-            .and_then(|value| value.get("session_id"))
-            .and_then(serde_json::Value::as_str)
-            .context("Worker session response omitted session_id")?
-            .to_owned();
-        let session_cwd = response
-            .result
-            .as_ref()
-            .and_then(|value| value.get("cwd"))
-            .and_then(serde_json::Value::as_str)
-            .map(PathBuf::from)
-            .unwrap_or(cwd);
-        let active = ActiveWorker {
-            stdin: Arc::new(AsyncMutex::new(stdin)),
-            waiters: Arc::new(Mutex::new(HashMap::new())),
-        };
-        (child, stdout, active, session_id, session_cwd)
-    };
+            },
+            serde_json::json!({"session_id":job.session_id,"cwd":cwd,"mode":mode}),
+        )
+        .await?;
+    let session_id = value["session_id"]
+        .as_str()
+        .context("Codex session ID missing")?
+        .to_owned();
+    let session_cwd = PathBuf::from(value["cwd"].as_str().context("Codex cwd missing")?);
     store.bind_session(
         &session_id,
         &job.project_id,
@@ -1917,113 +1940,43 @@ async fn run_auto_prompt_inner(
     if job.session_id.is_none() {
         store.link_watch_session(&job.watch_id, &session_id, unix_time())?;
     }
-    let registration =
-        register_active_worker(&worker_runtime.registry, &session_id, &active_worker)?;
-    store.enqueue_event(
-        &format!("{}:session-ready", job.watch_id), "codex.session.updated",
-        &serde_json::json!({"session_id":session_id,"project_id":job.project_id,"mode":mode,"state":"queued","title":null,"active_turn_id":null,"updated_at_unix":unix_time()}), unix_time(),
-    )?;
-
-    let turn_request = WorkerRequest {
-        protocol: WORKER_PROTOCOL.to_owned(),
-        kind: "request".to_owned(),
-        request_id: format!("turn:{}", job.watch_id),
-        method: "codex.turn.start".to_owned(),
-        params: serde_json::json!({"session_id":session_id,"prompt":job.prompt,"idempotency_key":job.idempotency_key}),
-    };
-    let turn_result: Result<String> = async {
-        {
-            let mut stdin = active_worker.stdin.lock().await;
-            write_frame(&mut *stdin, &turn_request).await?;
-        }
-        let mut event_number = 0_u64;
-        loop {
-            let frame: serde_json::Value = read_frame(&mut stdout).await.map_err(|error| {
-                anyhow::Error::new(WorkerTurnOrphaned(format!(
-                    "Worker exited or violated framing during turn: {error}"
-                )))
-            })?;
-            match frame.get("kind").and_then(serde_json::Value::as_str) {
-                Some("event") => {
-                    event_number += 1;
-                    let event_type = frame
-                        .get("event")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("codex.event");
-                    let data = frame
-                        .get("data")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null);
-                    store.enqueue_event(
-                        &format!("{}:worker:{event_number}", job.watch_id), event_type,
-                        &serde_json::json!({"operation_id":job.watch_id,"watch_id":job.watch_id,"project_id":job.project_id,"session_id":session_id,"data":data}), unix_time(),
-                    )?;
-                    if event_type == "codex.turn.started" {
-                        let turn_id = data.get("turn_id").and_then(serde_json::Value::as_str);
-                        store.enqueue_event(
-                            &format!("{}:session-running", job.watch_id), "codex.session.updated",
-                            &serde_json::json!({"session_id":session_id,"project_id":job.project_id,"mode":mode,"state":"running","title":null,"active_turn_id":turn_id,"updated_at_unix":unix_time()}), unix_time(),
-                        )?;
-                    }
-                }
-                Some("response") => {
-                    let response: WorkerResponse = serde_json::from_value(frame)?;
-                    if response.request_id != turn_request.request_id {
-                        complete_worker_waiter(&active_worker, response)?;
-                        continue;
-                    }
-                    ensure!(response.ok, "Worker turn failed");
-                    ensure!(response.result.as_ref().and_then(|v|v.get("status")).and_then(serde_json::Value::as_str).is_none_or(|v|v=="completed"),"Codex turn did not complete successfully");
-                    return response
-                        .result
-                        .as_ref()
-                        .and_then(|value| value.get("turn_id"))
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToOwned::to_owned)
-                        .context("Worker turn response omitted turn_id");
-                }
-                _ => bail!("Worker emitted an invalid frame"),
+    enqueue_session_state(store, job, &session_id, &mode, "queued", "session-ready")?;
+    let sequence = std::sync::atomic::AtomicU64::new(0);
+    let result = worker_runtime.codex.turn(&session_id, &job.prompt, &job.idempotency_key, |event_type, data| {
+        let event_number = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let payload = serde_json::json!({"operation_id":job.watch_id,"watch_id":job.watch_id,"project_id":job.project_id,"session_id":session_id,"data":data});
+        let session_id = &session_id;
+        let mode = &mode;
+        async move {
+            if event_type == "codex.message.delta" {
+                worker_runtime.link.delta(farhelm_protocol::AgentEvent {protocol:FARHELM_PROTOCOL.into(),sequence:0,event_id:format!("{}:delta:{event_number}",job.watch_id),agent_id:worker_runtime.agent_id.clone(),event_type:event_type.into(),payload,created_at_unix:unix_time()});
+                return Ok(());
             }
+            store.enqueue_event(&format!("{}:native:{event_number}",job.watch_id), event_type, &payload, unix_time())?;
+            worker_runtime.wake.notify_one();
+            if event_type == "codex.turn.started" {
+                store.enqueue_event(&format!("{}:session-running",job.watch_id), "codex.session.updated", &serde_json::json!({"session_id":session_id,"project_id":job.project_id,"mode":mode,"state":"running","title":null,"active_turn_id":data["turn_id"],"updated_at_unix":unix_time()}),unix_time())?;
+            }
+            Ok(())
         }
-    }
-    .await;
-    let turn_result = if turn_result.is_err() {
-        match store.recorded_turn(&job.watch_id)? {
-            Some((event, payload)) if event == "codex.turn.completed" => payload
-                .get("data")
-                .unwrap_or(&payload)
-                .get("turn_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-                .context("completed turn receipt omitted ID"),
-            _ => turn_result,
-        }
-    } else {
-        turn_result
-    };
-    match turn_result {
+    }).await;
+    match result {
         Ok(turn_id) => {
             enqueue_session_state(store, job, &session_id, &mode, "idle", "session-idle")?;
-            drop(registration);
-            let mut idle = worker_runtime.idle.lock().await;
-            if idle.len() >= 4
-                && let Some(key) = idle.keys().next().cloned()
-                && let Some(mut evicted) = idle.remove(&key)
-            {
-                let _ = evicted.child.start_kill();
-            }
-            idle.insert(
-                session_id.clone(),
-                IdleWorker {
-                    child,
-                    stdout,
-                    active: active_worker,
-                },
-            );
             Ok((session_id, turn_id))
         }
         Err(error) => {
-            let state = if error.downcast_ref::<WorkerTurnOrphaned>().is_some() {
+            if let Some((event, payload)) = store.recorded_turn(&job.watch_id)?
+                && event == "codex.turn.completed"
+            {
+                let turn = payload.get("data").unwrap_or(&payload)["turn_id"]
+                    .as_str()
+                    .context("completed receipt missing ID")?
+                    .to_owned();
+                enqueue_session_state(store, job, &session_id, &mode, "idle", "session-idle")?;
+                return Ok((session_id, turn));
+            }
+            let state = if error.downcast_ref::<CodexTurnOrphaned>().is_some() {
                 "orphaned"
             } else {
                 "failed"
@@ -2090,195 +2043,96 @@ async fn create_isolated_worktree(project_root: &Path, identifier: &str) -> Resu
     Ok(worktree_root)
 }
 
-fn register_active_worker(
-    registry: &WorkerRegistry,
-    session_id: &str,
-    worker: &ActiveWorker,
-) -> Result<ActiveWorkerRegistration> {
-    let mut workers = registry
-        .lock()
-        .map_err(|_| anyhow::anyhow!("active Worker registry lock was poisoned"))?;
-    ensure!(
-        !workers.contains_key(session_id),
-        "session already has an active Worker"
-    );
-    workers.insert(session_id.to_owned(), worker.clone());
-    Ok(ActiveWorkerRegistration {
-        registry: registry.clone(),
-        session_id: session_id.to_owned(),
-    })
-}
-
-fn complete_worker_waiter(worker: &ActiveWorker, response: WorkerResponse) -> Result<()> {
-    let sender = worker
-        .waiters
-        .lock()
-        .map_err(|_| anyhow::anyhow!("Worker response registry lock was poisoned"))?
-        .remove(&response.request_id)
-        .context("Worker returned an unknown response ID")?;
-    let result = if response.ok {
-        Ok(response.result.unwrap_or(serde_json::Value::Null))
-    } else {
-        let error = response.error.map_or_else(
-            || "Worker rejected request".to_owned(),
-            |error| format!("Worker {}: {}", error.code, error.message),
+async fn read_request(
+    hub: &HubArgs,
+    worker: &CodexRuntime,
+    store: &ExperimentStore,
+    request: farhelm_protocol::AgentReadRequest,
+) -> Result<AgentReadReportRequest> {
+    let outcome = if request.method == "codex.session.history" {
+        let session_id = request
+            .params
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .context("history read omitted session ID")?;
+        ensure!(
+            {
+                let id = session_id.to_owned();
+                store
+                    .background(move |s| s.session_binding(&id))
+                    .await?
+                    .is_some()
+            },
+            "history read references an unapproved session"
         );
-        Err(error)
+        worker
+            .codex
+            .call(&request.method, request.params)
+            .await
+            .and_then(|value| {
+                let page: farhelm_protocol::CodexTranscriptPage = serde_json::from_value(value)?;
+                Ok(serde_json::to_value(page)?)
+            })
+    } else if request.method == "codex.session.display" {
+        let ids: Option<Vec<String>> = request
+            .params
+            .get("session_ids")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?;
+        let project = request
+            .params
+            .get("project_id")
+            .and_then(serde_json::Value::as_str);
+        let project = project.map(str::to_owned);
+        let bindings = store
+            .background(move |s| s.display_bindings(project.as_deref(), ids.as_deref()))
+            .await?;
+        let mut params = request.params;
+        params["bindings"] = bindings;
+        params["agent_id"] = serde_json::json!(hub.agent_id);
+        tokio::time::timeout(
+            Duration::from_secs(18),
+            worker.codex.call(&request.method, params),
+        )
+        .await
+        .context("display read timed out")?
+    } else if request.method == "codex.schedule.detail" {
+        let id = request
+            .params
+            .get("schedule_id")
+            .and_then(serde_json::Value::as_str)
+            .context("schedule detail omitted ID")?;
+        let id = id.to_owned();
+        store.background(move |s| s.schedule_detail(&id)).await
+    } else {
+        bail!("Hub requested unsupported transient read")
     };
-    let _ = sender.send(result);
-    Ok(())
-}
-
-async fn active_worker_request(
-    registry: &WorkerRegistry,
-    session_id: &str,
-    request_id: &str,
-    method: &str,
-    params: serde_json::Value,
-) -> Result<serde_json::Value> {
-    let worker = registry
-        .lock()
-        .map_err(|_| anyhow::anyhow!("active Worker registry lock was poisoned"))?
-        .get(session_id)
-        .cloned()
-        .context("session has no active Worker; the turn may be orphaned")?;
-    let request = WorkerRequest {
-        protocol: WORKER_PROTOCOL.to_owned(),
-        kind: "request".to_owned(),
-        request_id: request_id.to_owned(),
-        method: method.to_owned(),
-        params,
+    let report = match outcome {
+        Ok(data) => AgentReadReportRequest {
+            protocol: FARHELM_PROTOCOL.to_owned(),
+            agent_id: hub.agent_id.clone(),
+            request_id: request.request_id.clone(),
+            ok: true,
+            data: Some(data),
+            detail: None,
+        },
+        Err(error) => AgentReadReportRequest {
+            protocol: FARHELM_PROTOCOL.to_owned(),
+            agent_id: hub.agent_id.clone(),
+            request_id: request.request_id.clone(),
+            ok: false,
+            data: None,
+            detail: Some(
+                if error.to_string().contains("not_configured") {
+                    "codex_not_configured"
+                } else {
+                    "codex_read_failed"
+                }
+                .into(),
+            ),
+        },
     };
-    let (sender, receiver) = oneshot::channel();
-    worker
-        .waiters
-        .lock()
-        .map_err(|_| anyhow::anyhow!("Worker response registry lock was poisoned"))?
-        .insert(request_id.to_owned(), sender);
-    let write_result = {
-        let mut stdin = worker.stdin.lock().await;
-        write_frame(&mut *stdin, &request).await
-    };
-    if let Err(error) = write_result {
-        if let Ok(mut waiters) = worker.waiters.lock() {
-            waiters.remove(request_id);
-        }
-        return Err(error.into());
-    }
-    timeout(Duration::from_secs(30), receiver)
-        .await
-        .context("Worker control request timed out")?
-        .context("active Worker exited before replying")?
-        .map_err(anyhow::Error::msg)
-}
-
-async fn worker_smoke(python: &str, worker_root: &Path) -> Result<()> {
-    let source_root = worker_root
-        .join("src")
-        .canonicalize()
-        .with_context(|| format!("worker source not found below {}", worker_root.display()))?;
-
-    let mut child = Command::new(python)
-        .arg("-m")
-        .arg("farhelm_worker_codex")
-        .env("PYTHONPATH", source_root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("failed to start Worker with `{python}`"))?;
-
-    let mut stdin = child.stdin.take().context("Worker stdin was not piped")?;
-    let mut stdout = child.stdout.take().context("Worker stdout was not piped")?;
-    let request = WorkerRequest::hello("req_worker_smoke", PRODUCT_VERSION);
-
-    write_frame(&mut stdin, &request)
-        .await
-        .context("failed to send Worker hello")?;
-    let response: WorkerResponse = timeout(Duration::from_secs(5), read_frame(&mut stdout))
-        .await
-        .context("Worker hello timed out")??;
-
-    ensure!(
-        response.protocol == WORKER_PROTOCOL,
-        "Worker protocol mismatch"
-    );
-    ensure!(
-        response.request_id == request.request_id,
-        "request ID mismatch"
-    );
-    if !response.ok {
-        bail!("Worker rejected hello: {:?}", response.error);
-    }
-    let result: WorkerHelloResult =
-        serde_json::from_value(response.result.context("Worker hello omitted its result")?)
-            .context("Worker hello result was invalid")?;
-    ensure!(
-        result
-            .capabilities
-            .iter()
-            .any(|item| item == "worker.hello"),
-        "Worker did not advertise worker.hello"
-    );
-
-    drop(stdin);
-    let status = timeout(Duration::from_secs(5), child.wait())
-        .await
-        .context("Worker did not stop after stdin closed")??;
-    ensure!(status.success(), "Worker exited with {status}");
-
-    println!(
-        "Worker handshake ok: {} {} ({})",
-        result.worker, result.version, response.protocol
-    );
-    Ok(())
-}
-
-async fn worker_call_once(
-    python: &str,
-    worker_root: &Path,
-    method: &str,
-    params: serde_json::Value,
-) -> Result<serde_json::Value> {
-    let source_root = worker_root
-        .join("src")
-        .canonicalize()
-        .with_context(|| format!("worker source not found below {}", worker_root.display()))?;
-    let mut child = Command::new(python)
-        .arg("-m")
-        .arg("farhelm_worker_codex")
-        .env("PYTHONPATH", source_root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("failed to start Worker with `{python}`"))?;
-    let mut stdin = child.stdin.take().context("Worker stdin was not piped")?;
-    let mut stdout = child.stdout.take().context("Worker stdout was not piped")?;
-    let request = WorkerRequest {
-        protocol: WORKER_PROTOCOL.to_owned(),
-        kind: "request".to_owned(),
-        request_id: format!("req_{:016x}", unix_time()),
-        method: method.to_owned(),
-        params,
-    };
-    write_frame(&mut stdin, &request).await?;
-    let response: WorkerResponse = timeout(Duration::from_secs(30), read_frame(&mut stdout))
-        .await
-        .context("Worker request timed out")??;
-    ensure!(
-        response.request_id == request.request_id,
-        "Worker response ID mismatch"
-    );
-    if !response.ok {
-        let error = response
-            .error
-            .context("Worker rejected request without error")?;
-        bail!("Worker {}: {}", error.code, error.message);
-    }
-    response.result.context("Worker response omitted result")
+    Ok(report)
 }
 
 #[cfg(test)]

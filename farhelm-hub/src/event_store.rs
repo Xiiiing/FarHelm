@@ -396,7 +396,7 @@ impl EventStore {
             ArchiveFilter::All => "",
         };
         let sql = format!(
-            "SELECT session_id,agent_id,project_id,mode,state,title,active_turn_id,updated_at_unix FROM codex_sessions WHERE (?1 IS NULL OR project_id=?1) AND (?2 IS NULL OR agent_id=?2){archive_clause} ORDER BY updated_at_unix DESC,session_id DESC LIMIT ?3 OFFSET ?4"
+            "SELECT session_id,agent_id,project_id,mode,state,title,active_turn_id,updated_at_unix,COALESCE((SELECT MAX(revision) FROM projection_revisions WHERE entity_id IN ('session:'||agent_id||':'||session_id||':metadata','session:'||agent_id||':'||session_id||':execution','session:'||agent_id||':'||session_id||':title')),0) FROM codex_sessions WHERE (?1 IS NULL OR project_id=?1) AND (?2 IS NULL OR agent_id=?2){archive_clause} ORDER BY updated_at_unix DESC,session_id DESC LIMIT ?3 OFFSET ?4"
         );
         let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map(
@@ -416,6 +416,7 @@ impl EventStore {
                     title: row.get(5)?,
                     active_turn_id: row.get(6)?,
                     updated_at_unix: row_u64(row, 7)?,
+                    revision: row_u64(row, 8)?,
                 })
             },
         )?;
@@ -444,11 +445,11 @@ impl EventStore {
     pub fn session(&self, session_id: &str) -> Result<Option<CodexSessionSummary>> {
         use rusqlite::OptionalExtension;
         self.lock()?.query_row(
-            "SELECT session_id,agent_id,project_id,mode,state,title,active_turn_id,updated_at_unix FROM codex_sessions WHERE session_id=?1",
+            "SELECT session_id,agent_id,project_id,mode,state,title,active_turn_id,updated_at_unix,COALESCE((SELECT MAX(revision) FROM projection_revisions WHERE entity_id IN ('session:'||agent_id||':'||session_id||':metadata','session:'||agent_id||':'||session_id||':execution','session:'||agent_id||':'||session_id||':title')),0) FROM codex_sessions WHERE session_id=?1",
             [session_id],
             |row| Ok(CodexSessionSummary {
                 session_id: row.get(0)?, agent_id: row.get(1)?, project_id: row.get(2)?, mode: parse_mode(&row.get::<_,String>(3)?)?,
-                state: parse_session_state(&row.get::<_,String>(4)?)?, title: row.get(5)?, active_turn_id: row.get(6)?, updated_at_unix: row_u64(row,7)?,
+                state: parse_session_state(&row.get::<_,String>(4)?)?, title: row.get(5)?, active_turn_id: row.get(6)?, updated_at_unix: row_u64(row,7)?, revision: row_u64(row,8)?,
             }),
         ).optional().map_err(Into::into)
     }

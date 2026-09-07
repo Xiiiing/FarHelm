@@ -202,6 +202,7 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .markdown-body > :last-child, .markdown-body > div > :last-child { margin-bottom: 0; }
 .markdown-body p { margin: 0 0 16px; }
 .markdown-body p.long-paragraph-chunk { margin: 0; content-visibility: auto; contain-intrinsic-size: auto 1600px; }
+.markdown-body p.markdown-chunk { content-visibility: auto; contain-intrinsic-size: auto 1600px; }
 .markdown-body h2 { font-size: 22px; line-height: 32px; margin: 28px 0 16px; }
 .markdown-body h3 { font-size: 20px; line-height: 28px; margin: 24px 0 12px; }
 .markdown-body h4 { font-size: 18px; line-height: 26px; margin: 20px 0 12px; }
@@ -316,3 +317,31 @@ button, a { -webkit-tap-highlight-color: transparent; }
     transition-duration: .001ms !important;
   }
 }
+
+/* Ant Design X uses the same FarHelm surfaces and touch targets as the shell. */
+.session-conversations { padding: 0 !important; }
+.session-conversations .ant-conversations-group-title { min-height: 52px; }
+.session-conversations .session-select { min-height: 44px; margin: 2px 0 2px 12px; padding: 10px 12px; border-radius: 6px; }
+.session-conversations .ant-conversations-item-active { background: color-mix(in srgb, var(--farhelm-accent) 12%, var(--farhelm-surface)) !important; }
+.session-conversations .ant-conversations-label { color: var(--farhelm-text); }
+.session-select:focus-visible, .ant-thought-chain-item-header:focus-visible { outline: 2px solid var(--farhelm-accent); outline-offset: -2px; }
+.execution-summary.ant-thought-chain { padding: 8px 12px; }
+.execution-summary .ant-thought-chain-item-header { min-height: 44px; }
+.execution-summary .ant-thought-chain-item-title { flex: 1; min-width: 0; }
+.execution-summary .ant-thought-chain-item-content { background: transparent; }
+.message-actions .ant-actions-item { min-width: 44px; min-height: 44px; }
+.pending-messages { max-width: 960px; margin: 0 auto; }
+.virtual-transcript { position: relative; display: block; }
+.virtual-turn { position: absolute; top: 0; left: 0; width: 100%; padding-bottom: 32px; }
+.composer.ant-sender { box-shadow: none; }
+.composer .ant-sender-content { padding: 0; }
+.composer .ant-sender-footer { padding: 0; background: transparent; border: 0; }
+.tool-group-toggle.ant-btn { display: block; min-height: 44px; height: auto; width: 100%; padding: 4px 0; text-align: left; white-space: normal; }
+.tool-group-toggle .tool-group-label { width: 100%; }
+.session-group-heading.ant-btn { height: auto; min-height: 44px; padding: 4px 0; text-align: left; }
+.message-actions .ant-btn { min-width: 44px; min-height: 44px; }
+.session-conversations .session-row { padding: 0 0 0 12px; }
+.session-conversations .session-select.ant-btn { margin: 0; min-height: 44px; }
+.session-conversations .ant-conversations-label { width: 100%; }
+
+.composer.ant-sender { border-radius: 8px; border-color: var(--farhelm-border); }

@@ -3,7 +3,7 @@ use std::{
     fs,
     os::unix::fs::MetadataExt,
     path::{Component, Path, PathBuf},
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 
@@ -127,12 +127,25 @@ pub struct ProjectCandidate {
     pub updated_at_unix: u64,
 }
 
+#[derive(Clone)]
 pub struct ExperimentStore {
-    connection: Mutex<Connection>,
+    connection: Arc<Mutex<Connection>>,
     path: PathBuf,
 }
 
 impl ExperimentStore {
+    pub async fn open_async(path: &Path) -> Result<Self> {
+        let path = path.to_owned();
+        crate::runtime_tasks::blocking(move || Self::open(&path)).await
+    }
+    pub async fn background<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&Self) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let store = self.clone();
+        crate::runtime_tasks::blocking(move || work(&store)).await
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         if path != Path::new(":memory:") {
             let parent = path
@@ -150,7 +163,7 @@ impl ExperimentStore {
         }
         crate::migrations::apply(&connection)?;
         Ok(Self {
-            connection: Mutex::new(connection),
+            connection: Arc::new(Mutex::new(connection)),
             path: path.to_owned(),
         })
     }
@@ -860,6 +873,8 @@ impl ExperimentStore {
             [&command.command_id], |row| Ok((row.get::<_,String>(0)?,row_u64(row,1)?,row.get::<_,String>(2)?)),
         ).optional()? {
             ensure!(action == action_name(command.action) && expires == command.expires_at_unix && encoded == serde_json::to_string(payload)?, "duplicate command identity mismatch");
+            connection.execute("UPDATE remote_codex_commands SET terminal_reported=0 WHERE command_id=?1 AND state IN ('completed','failed','expired')", [&command.command_id])?;
+            connection.commit()?;
             return Ok(());
         }
         connection.execute(
@@ -1031,6 +1046,34 @@ impl ExperimentStore {
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Retried deliveries return the actual persisted outcome, even after TTL.
+    pub fn remote_receipt(&self, command_id: &str) -> Result<RemoteCommandReport> {
+        self.lock()?
+            .query_row(
+                "SELECT state,data_json,detail FROM remote_codex_commands WHERE command_id=?1",
+                [command_id],
+                |row| {
+                    let state: String = row.get(0)?;
+                    let data: Option<String> = row.get(1)?;
+                    Ok(RemoteCommandReport {
+                        command_id: command_id.to_owned(),
+                        state: match state.as_str() {
+                            "completed" => farhelm_protocol::CommandState::Completed,
+                            "failed" => farhelm_protocol::CommandState::Failed,
+                            "expired" => farhelm_protocol::CommandState::Expired,
+                            _ => farhelm_protocol::CommandState::Accepted,
+                        },
+                        data: data
+                            .map(|value| serde_json::from_str(&value))
+                            .transpose()
+                            .map_err(json_conversion(1))?,
+                        detail: row.get(2)?,
+                    })
+                },
+            )
             .map_err(Into::into)
     }
 
@@ -1653,6 +1696,24 @@ mod tests {
             .mark_remote_terminal_reported("cmd_terminal", 14)
             .unwrap();
         assert!(reopened.pending_remote_reports().unwrap().is_empty());
+        reopened
+            .receive_remote_command(
+                &AgentCommand {
+                    protocol: FARHELM_PROTOCOL.into(),
+                    command_id: "cmd_terminal".into(),
+                    agent_id: "agent-a".into(),
+                    action: CommandAction::CodexTurnStart,
+                    created_at_unix: 10,
+                    expires_at_unix: 100,
+                    payload: Some(json!({"project_id":"p","session_id":"s","prompt":"go"})),
+                },
+                200,
+            )
+            .unwrap();
+        let receipt = reopened.remote_receipt("cmd_terminal").unwrap();
+        assert_eq!(receipt.state, farhelm_protocol::CommandState::Completed);
+        assert_eq!(receipt.data.unwrap()["turn_id"], "t");
+        assert!(!reopened.claim_remote_command("cmd_terminal", 200).unwrap());
     }
 
     #[test]

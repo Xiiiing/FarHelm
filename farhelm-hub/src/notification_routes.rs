@@ -47,11 +47,28 @@ async fn write(
     let Some(key) = idempotency_header(&headers).map(str::to_owned) else {
         return api_error(StatusCode::BAD_REQUEST, "missing_idempotency_key");
     };
+    let event_key = match action {
+        "notification.browser-test" => Some(format!("browser-test:{key}")),
+        "notification.test" => Some(format!("test:{target}:{key}")),
+        _ => None,
+    };
     let result = db(&state, move |s| {
         s.notification_write(&key, action, &target, &body, unix_time())
     })
     .await;
     if result.is_ok() {
+        if let Some(event_key) = event_key
+            && let Ok(notices) = db(&state, move |s| s.notifications_for_events(&[event_key])).await
+        {
+            for notice in notices {
+                let _ = state.event_bus.send(StoredEvent {
+                    sequence: 0,
+                    event_id: format!("notification:{}", notice.id),
+                    event_type: "notification.created".into(),
+                    payload: serde_json::to_value(notice).expect("notification metadata"),
+                });
+            }
+        }
         state.push_notify.notify_one();
         let _ = state.event_bus.send(StoredEvent {
             sequence: 0,

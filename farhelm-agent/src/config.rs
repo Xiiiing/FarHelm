@@ -15,7 +15,6 @@ pub struct AgentPaths {
     pub config: PathBuf,
     pub data: PathBuf,
     pub database: PathBuf,
-    pub worker: PathBuf,
     pub unit: PathBuf,
     pub legacy_root: PathBuf,
 }
@@ -23,8 +22,10 @@ pub struct AgentPaths {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentFileConfig {
     pub agent: AgentSection,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "WorkerSection::is_default")]
     pub worker: WorkerSection,
+    #[serde(default)]
+    pub codex: CodexSection,
     #[serde(default)]
     pub projects: BTreeMap<String, ProjectSection>,
 }
@@ -52,10 +53,23 @@ pub struct AgentSection {
     pub database: PathBuf,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CodexSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bin: Option<PathBuf>,
+}
+
+/// Retained only to preserve V0.7.1 rollback configuration. Never executed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerSection {
     #[serde(default = "default_python")]
     pub python: String,
+}
+
+impl WorkerSection {
+    fn is_default(&self) -> bool {
+        self.python == default_python()
+    }
 }
 
 impl Default for WorkerSection {
@@ -101,10 +115,6 @@ impl AgentPaths {
             previous: bin_home.join("farhelm-agent.previous"),
             config: config_home.join("farhelm/agent.toml"),
             database: data.join("state/agent.db"),
-            worker: data.join(format!(
-                "runtime/codex-worker/{}",
-                farhelm_core::PRODUCT_VERSION
-            )),
             unit: config_home.join("systemd/user/farhelm-agent.service"),
             legacy_root,
             data,
@@ -159,6 +169,7 @@ impl AgentFileConfig {
                 database,
             },
             worker: WorkerSection::default(),
+            codex: CodexSection::default(),
             projects: BTreeMap::new(),
         };
         config.validate()?;
@@ -192,6 +203,7 @@ impl AgentFileConfig {
                 database,
             },
             worker: WorkerSection::default(),
+            codex: CodexSection::default(),
             projects: BTreeMap::new(),
         };
         config.validate()?;
@@ -223,7 +235,9 @@ impl AgentFileConfig {
             !self.agent.database.as_os_str().is_empty(),
             "agent.database is empty"
         );
-        ensure!(!self.worker.python.is_empty(), "worker.python is empty");
+        if let Some(bin) = &self.codex.bin {
+            ensure!(bin.is_absolute(), "codex.bin must be absolute");
+        }
         for (project_id, project) in &self.projects {
             ensure!(
                 !project_id.is_empty()
@@ -353,7 +367,6 @@ mod tests {
             config: PathBuf::from("/tmp/config/farhelm/agent.toml"),
             data: PathBuf::from("/tmp/data/farhelm"),
             database: PathBuf::from("/tmp/data/farhelm/state/agent.db"),
-            worker: PathBuf::from("/tmp/data/farhelm/runtime/codex-worker/0.7.1"),
             unit: PathBuf::from("/tmp/config/systemd/user/farhelm-agent.service"),
             legacy_root: PathBuf::from("/tmp/data/farhelm-agent"),
         };
@@ -368,6 +381,7 @@ mod tests {
                 database: paths.database.clone(),
             },
             worker: WorkerSection::default(),
+            codex: CodexSection::default(),
             projects: BTreeMap::new(),
         };
         let decoded: AgentFileConfig = toml::from_str(&config.encode().unwrap()).unwrap();

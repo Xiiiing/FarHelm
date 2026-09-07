@@ -24,10 +24,6 @@ jobs:
           node-version-file: farhelm-console/.node-version
           cache: pnpm
           cache-dependency-path: farhelm-console/pnpm-lock.yaml
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: astral-sh/setup-uv@v6
       - name: Verify tag matches package version
         run: |
           ./scripts/check-version-policy.sh

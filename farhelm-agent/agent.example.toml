@@ -7,8 +7,9 @@ heartbeat_seconds = 15
 command_poll_seconds = 2
 database = "/home/user/.local/share/farhelm/state/agent.db"
 
-[worker]
-python = "python3"
+# Select an existing Codex installation; its parent directory is added to the child PATH.
+[codex]
+bin = "/home/user/.local/bin/codex"
 
 # Existing TOML projects migrate into the local registry; new Codex projects are discovered automatically.
 [projects.cc08]

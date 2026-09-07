@@ -4,14 +4,14 @@
   <p><strong>面向个人科研与 GPU 训练环境的远程控制平面</strong></p>
   <p>从手机查看训练服务器状态，并在不开放训练机入站端口的前提下安全扩展远程控制能力。</p>
   <p>
-    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.7.1">V0.7.1</a> ·
+    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.8.0">V0.8.0</a> ·
     <a href="./deploy/README.md">部署文档</a> ·
     <a href="./README.en.md">English</a>
   </p>
 </div>
 
 > [!IMPORTANT]
-> `V0.7.1` 修复 Codex 工作区：保留系统导航，明确项目、会话与执行过程层级；补齐 Markdown、公式、会话名称与全部已导入会话搜索，并修复输入区、流式消息及切换竞态。Codex 正文由 Agent 持久化，Hub 仅短暂中转。
+> `V0.8.0` 由 Rust Agent 直接管理本机已安装、已登录的 Codex，通过常驻 App Server 和主动 WSS 连接传输请求与增量。工作区使用 Ant Design X、统一内存缓存和长历史虚拟化，保留系统导航、实验、调度及页面通知。
 
 ## 快速安装
 
@@ -43,6 +43,17 @@ chmod +x farhelm-agent
 ```
 
 程序只询问 Hub HTTPS 地址和网页生成的 8 位配对码，独立 256-bit Token 会自动领取并写入 `0600` 配置。安装后的实际程序位于 `${XDG_BIN_HOME:-$HOME/.local/bin}/farhelm-agent`；成功后可以删除下载副本。
+
+Agent 复用已有 Codex，不下载 Python 或独立 Codex runtime。安装时自动发现唯一可用程序；如果终端能运行 Codex 而服务找不到（例如 NVM 安装），在该终端明确配置：
+
+```bash
+codex --version
+farhelm-agent codex configure --bin "$(command -v codex)"
+farhelm-agent restart
+farhelm-agent status
+```
+
+首个验收版本为 Codex 0.153.4，核心协议兼容测试覆盖 0.147.0。FarHelm 不更新用户 Codex，不修改其登录、模型或全局配置。未安装或未就绪时实验上报仍可运行；`status` 分别显示服务、Hub 连接和 Codex 状态。
 
 更完整的非交互安装、Caddy、systemd、迁移和卸载说明见[部署文档](deploy/README.md)。
 
@@ -118,16 +129,15 @@ printf '训练失败，请登录查看详情' | farhelm-agent experiment report 
 
 进入 Codex 后保留桌面全局侧栏和手机底部导航。项目分组可折叠，会话名称优先使用正式标题，没有标题时临时读取首条用户消息摘要。搜索覆盖筛选范围内全部已导入会话；离线 Agent 会明确提示结果不完整。摘要与搜索结果不写入 Hub 数据库或日志，也不用于通知标题。
 
-助手回复支持 Markdown 表格、代码复制、公式及安全 HTTPS 链接。同一轮连续执行过程默认合并折叠，失败可直接辨认。输入区固定可见，阅读旧内容时不会被新消息拉回底部；大消息的“继续加载此消息”与“加载更早对话”分别处理。切换会话保留各自草稿，补充与中断只针对可见的活动轮次。
+助手回复支持 Markdown 表格、代码复制、公式及安全 HTTPS 链接。每轮执行过程默认合并折叠，失败可直接辨认。输入区固定可见，阅读旧内容时不会被新消息拉回底部；大消息的“继续加载此消息”与“加载更早对话”分别处理。切换会话立即显示已有缓存，并保留各自草稿；刷新失败不清空已显示内容。非活动正文缓存与解析缓存合计不超过 32 MiB，最多保留 20 个非活动历史，退出登录清空。补充与中断只针对可见的活动轮次。
 
-从 V0.7.0 升级先更新 Hub，再更新 Agent。SQLite schema 保持 7，临时会话名称和搜索需要 V0.7.1 Agent；旧 Agent 会显示升级提示。
+从 V0.7.1 升级先更新 Hub，再更新 Agent。SQLite schema 保持 7，旧 Agent 的 HTTP 链路保留兼容；新 Agent 使用 WSS，连接期间不重复领取任务。旧 Python 目录保留在安装机供回退验证，新版本不再调用它。
 
 ## 当前实现
 
 - `farhelm-hub`：Rust 控制平面、密码登录、SQLite 30 天会话、短码配对、Secure HttpOnly Cookie、CSRF、登录限速、可靠事件、SSE 补发和 Web Push。
 - `farhelm-agent`：普通用户出站连接、自动发现 Codex 项目、本地项目授权表、明确登记的 PID 监视、PID 复用防护、SQLite inbox/outbox 和隔离 worktree。
-- `farhelm-console`：React、TypeScript、Ant Design、Vite PWA；提供实验与 Codex 手机/桌面界面、流式回复和通知深链处理。
-- `farhelm-worker-codex`：Agent 私有 Python stdio 适配层，固定 `openai-codex==0.147.0`，覆盖 thread list/start/resume 与 turn start/steer/interrupt。
+- `farhelm-console`：React、TypeScript、Ant Design / Ant Design X、TanStack Query / Virtual、Vite PWA；提供实验与 Codex 手机/桌面界面、流式回复和通知深链处理。
 
 所有远程动作都是固定类型；不接受 action、cwd、argv、环境变量或 shell 文本。训练仍由用户原有方式启动和停止。
 
@@ -135,20 +145,19 @@ printf '训练失败，请登录查看详情' | farhelm-agent experiment report 
 
 ```mermaid
 flowchart LR
-    Phone["手机 PWA"] -->|"HTTPS"| Hub["farhelm-hub<br/>公网控制平面"]
-    Agent["farhelm-agent<br/>训练服务器"] -->|"主动出站 HTTPS"| Hub
-    Agent -->|"长度前缀 JSON / stdio"| Worker["私有 Python Worker"]
+    Browser["浏览器 / 手机页面"] <-->|"REST / SSE"| Hub["farhelm-hub"]
+    Agent["Rust Agent"] <-->|"Agent 主动建立 WSS"| Hub
+    Agent <-->|"JSONRPC / stdio"| Codex["本机常驻 Codex App Server"]
 ```
 
-FarHelm 是一个 monorepo，但 Hub 与 Agent 分离编译并保持不同权限与攻击面。Worker 不监听网络，也不持有 Hub token。
+FarHelm 是一个 monorepo，但 Hub 与 Agent 分离编译并保持不同权限与攻击面。Codex 只通过本机 stdio 通信；登录凭据保留在本机，Hub 仅在最长 20 秒的有界内存中中转正文。
 
 ## 本地开发
 
-需要 Rust 1.98、Node.js 24、Corepack、Python 3.12 和 [uv](https://docs.astral.sh/uv/)。
+需要 Rust 1.98、Node.js 24 和 Corepack；原生联调另需已安装、已登录的 Codex。
 
 ```bash
 corepack pnpm@10.17.1 --dir farhelm-console install
-uv sync --project farhelm-worker-codex --all-groups
 corepack pnpm@10.17.1 --dir farhelm-console build
 cargo run -p farhelm-hub -- serve --config /path/to/hub.toml
 ```
@@ -170,16 +179,18 @@ make test-release
 - Agent 不需要 root，也不开放公网入站端口；Hub 只监听 loopback，由 Caddy 或等价 HTTPS 反向代理公开。
 - 管理员密码使用 Argon2id；浏览器 session 和 Agent Token 在 Hub 只保存哈希，原始 Agent Token 仅在配对响应中传输一次。
 - Hub 不保存 Codex 登录凭据、SSH 私钥、项目源码或完整本地日志。
-- Worker 只通过 stdin/stdout 与 Agent 通信；写操作必须经过白名单、TTL、幂等和审计。
+- Native Codex 只通过 stdin/stdout 与 Agent 通信；写操作必须经过白名单、TTL、幂等和审计。同一会话串行，跨会话最多 4 个活动 turn。
 - 版本使用 `MAJOR.MINOR.PATCH`：第一段只能由用户决定，功能提升第二段，纯修复提升第三段。
 - GitHub Releases 只保留最新正式版本；历史 Git 标签保留但不复用。在线更新只升级到最新版本，降级只使用本机 previous。
 
 ## 路线图
 
-1. 在 A6000/CC08、Titan/work831 与 3090/work832 完成 V0.7 部署 canary。
+1. 继续扩展不同服务器与 Codex 版本的升级验收。
 2. 开发 iOS 客户端并补充系统通知与真机后台验收。
 3. 按实际实验需求评估 GPU 指标与 TensorBoard；不加入远程训练控制。
 
 ## 许可证
 
 FarHelm 使用 [Apache License 2.0](LICENSE)。
+
+直接使用的界面组件与缓存依赖固定版本，许可见[第三方声明](farhelm-console/public/third-party-notices.txt)。

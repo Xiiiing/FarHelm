@@ -6,6 +6,7 @@ export type AgentSummary = {
   agent_version: string
   last_seen_unix: number
   online: boolean
+  codex?: { state: 'ready' | 'unconfigured' | 'unavailable' | 'starting' | 'login_required'; version?: string; reason?: string }
   credential_state: 'paired' | 'legacy' | 'needs_pairing'
 }
 

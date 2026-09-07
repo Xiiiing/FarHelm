@@ -33,8 +33,8 @@ token = "smoke-agent-token-with-at-least-32-characters"
 heartbeat_seconds = 15
 command_poll_seconds = 2
 database = "$smoke_dir/agent.db"
-[worker]
-python = "python3"
+[codex]
+bin = "$repo_root/tests/fixtures/native-codex.mjs"
 EOF
 
 export FARHELM_HUB_URL=http://127.0.0.1:8787
@@ -69,14 +69,14 @@ login_response=$(curl --fail --silent --show-error --cookie-jar "$cookie_jar" \
   --header 'Content-Type: application/json' \
   --data "{\"username\":\"$FARHELM_ADMIN_USER\",\"password\":\"$FARHELM_ADMIN_PASSWORD\"}" \
   "$FARHELM_HUB_URL/api/v1/auth/login")
-csrf=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["csrf_token"])' <<<"$login_response")
+csrf=$(node -e 'process.stdin.on("data", d => process.stdout.write(JSON.parse(d).csrf_token))'  <<<"$login_response")
 
 probe_response=$(curl --fail --silent --show-error \
   --cookie "$cookie_jar" --header "X-CSRF-Token: $csrf" \
   --header 'Content-Type: application/json' \
   --data '{"idempotency_key":"smoke-probe-request-0001","ttl_secs":60}' \
   "$FARHELM_HUB_URL/api/v1/agents/smoke-gpu/probe")
-command_id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["command_id"])' <<<"$probe_response")
+command_id=$(node -e 'process.stdin.on("data", d => process.stdout.write(JSON.parse(d).command_id))'  <<<"$probe_response")
 
 target/debug/farhelm-agent command-poll \
   --config "$agent_config"
@@ -94,7 +94,7 @@ duplicate_response=$(curl --fail --silent --show-error \
   --header 'Content-Type: application/json' \
   --data '{"idempotency_key":"smoke-probe-request-0001","ttl_secs":60}' \
   "$FARHELM_HUB_URL/api/v1/agents/smoke-gpu/probe")
-duplicate_id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["command_id"])' <<<"$duplicate_response")
+duplicate_id=$(node -e 'process.stdin.on("data", d => process.stdout.write(JSON.parse(d).command_id))'  <<<"$duplicate_response")
 if [[ "$duplicate_id" != "$command_id" ]]; then
   printf 'Idempotent probe retry created a different command\n' >&2
   exit 1
@@ -135,5 +135,5 @@ if ! grep -q '"state":"completed"' <<<"$persisted_status"; then
   exit 1
 fi
 
-target/debug/farhelm-agent worker-smoke
+target/debug/farhelm-agent codex-smoke --bin "$repo_root/tests/fixtures/native-codex.mjs"
 printf 'Deployment smoke passed.\n'

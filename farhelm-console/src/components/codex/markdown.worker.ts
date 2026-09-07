@@ -21,6 +21,8 @@ self.onmessage = (event: MessageEvent<{ id: number; text: string }>) => {
       for (let offset = 0; offset < value.length; offset += 4096) chunks.push({ ...node, properties: { ...node.properties, className: ['long-paragraph-chunk'] }, children: [{ type: 'text' as const, value: value.slice(offset, offset + 4096).join('') }] })
       return chunks
     })
-    self.postMessage({ id, tree })
+    for (const node of tree.children) { node.data = { ...node.data, fingerprint: JSON.stringify(node) } }
+    const bytes = (text.length + JSON.stringify(tree).length) * 2
+    self.postMessage({ id, tree, bytes })
   } catch { self.postMessage({ id, error: true }) }
 }

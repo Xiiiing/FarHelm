@@ -1,9 +1,10 @@
 import '@testing-library/jest-dom/vitest'
 
+import { queryClient } from '../api/cache'
 import { cleanup } from '@testing-library/react'
 import { afterEach, vi } from 'vitest'
 
-afterEach(cleanup)
+afterEach(() => { cleanup(); queryClient.clear() })
 
 Object.defineProperty(window, 'matchMedia', {
   writable: true,

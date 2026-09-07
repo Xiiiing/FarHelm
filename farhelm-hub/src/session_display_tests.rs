@@ -148,6 +148,7 @@ async fn search_uses_transient_agent_index_and_returns_partial_results_without_s
     state.agents.write().await.insert(
         "gpu-a".into(),
         StoredAgent {
+            codex: None,
             capabilities: vec!["codex.session_display".into()],
             hostname: "test".into(),
             agent_version: "0.7.1".into(),
@@ -299,6 +300,9 @@ async fn a_batch_broadcasts_item_deltas_before_its_terminal_and_deduplicates_ter
     assert_eq!(last.event_type, "codex.turn.completed");
     assert!(last.sequence > 0);
     assert!(last.payload["data"].get("delta").is_none());
+    let notification = events.try_recv().unwrap();
+    assert_eq!(notification.event_type, "notification.created");
+    assert!(events.try_recv().is_err());
     let response = agent_events(
         State(state.clone()),
         Extension(AgentIdentity::Dedicated("gpu-a".into())),
@@ -326,6 +330,7 @@ async fn search_skips_not_yet_imported_rows_and_keeps_stable_page_scope() {
     state.agents.write().await.insert(
         "gpu-a".into(),
         StoredAgent {
+            codex: None,
             hostname: "test".into(),
             agent_version: "0.7.1".into(),
             capabilities: vec!["codex.session_display".into()],

@@ -1,6 +1,6 @@
 use std::{
     path::Path,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 
@@ -20,11 +20,20 @@ pub struct PendingCommand {
     pub reported: bool,
 }
 
+#[derive(Clone)]
 pub struct CommandStore {
-    connection: Mutex<Connection>,
+    connection: Arc<Mutex<Connection>>,
 }
 
 impl CommandStore {
+    pub async fn background<T: Send + 'static>(
+        &self,
+        task: impl FnOnce(&Self) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let store = self.clone();
+        crate::runtime_tasks::blocking(move || task(&store)).await
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         if path != Path::new(":memory:") {
             let parent = path
@@ -46,7 +55,7 @@ impl CommandStore {
         }
         crate::migrations::apply(&connection)?;
         Ok(Self {
-            connection: Mutex::new(connection),
+            connection: Arc::new(Mutex::new(connection)),
         })
     }
 
