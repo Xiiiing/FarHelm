@@ -1,6 +1,7 @@
+import { useQuery } from '@tanstack/react-query'
 import { CheckCircleOutlined, DisconnectOutlined, FolderOpenOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons'
 import { Alert, Button, Card, Empty, Form, Input, List, Modal, Space, Spin, Tag, Typography } from 'antd'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 
 import { createPairingCode, type PairingCode } from '../api/agents'
 import { fetchProjects, importProjects, type ProjectCandidate } from '../api/features'
@@ -14,17 +15,11 @@ export function AgentListPage({ csrf, agents, onRefresh }: { csrf: string; agent
   const [pairingOpen, setPairingOpen] = useState(false)
   const [pairing, setPairing] = useState<PairingCode>()
   const [pairingError, setPairingError] = useState<string>()
-  const [projects, setProjects] = useState<ProjectCandidate[]>([])
+  const projectsQuery = useQuery({ queryKey: ['projects'], queryFn: fetchProjects }); const projects = useMemo(() => projectsQuery.data ?? [], [projectsQuery.data])
   const [projectsError, setProjectsError] = useState<string>()
   const [importing, setImporting] = useState(false)
   const [form] = Form.useForm()
-  const loadProjects = useCallback(() => void fetchProjects().then(setProjects).catch((reason: unknown) => setProjectsError(reason instanceof Error ? reason.message : '无法读取项目候选')), [])
-  useEffect(() => {
-    loadProjects()
-    if (typeof EventSource === 'undefined') return
-    const stream = new EventSource('/api/v1/events/stream'); stream.addEventListener('project.discovered', loadProjects); stream.addEventListener('project.updated', loadProjects)
-    return () => stream.close()
-  }, [loadProjects])
+  const loadProjects = () => { void projectsQuery.refetch() }
   const pending = useMemo(() => projects.filter((project) => project.state === 'discovered'), [projects])
   const importAll = async () => {
     setImporting(true); setProjectsError(undefined)
@@ -47,11 +42,11 @@ export function AgentListPage({ csrf, agents, onRefresh }: { csrf: string; agent
     {agents.state === 'error' && <Alert showIcon type="warning" title="无法读取 Agent 列表" description={agents.message} action={<Button onClick={onRefresh}>重试</Button>} />}
     {agents.state === 'loading' && <Card className="agent-list-card"><Space><Spin size="small" /><span>正在读取 Agent 心跳…</span></Space></Card>}
     {agents.state === 'ready' && agents.data.agents.length === 0 && <Card className="agent-list-card"><Empty description="尚无服务器。点击“添加服务器”开始配对。" /></Card>}
-    {agents.state === 'ready' && agents.data.agents.length > 0 && <Card className="agent-list-card" styles={{ body: { padding: 0 } }}><List dataSource={agents.data.agents} renderItem={(agent) => <List.Item className="agent-row"><List.Item.Meta title={<Space wrap><span>{agent.hostname}</span>{agent.online ? <Tag color="success" icon={<CheckCircleOutlined />}>在线</Tag> : <Tag icon={<DisconnectOutlined />}>离线</Tag>}{agent.credential_state !== 'paired' && <Tag color="warning">需要配对</Tag>}</Space>} description={<span className="agent-id">{agent.agent_id}</span>} /><dl className="agent-facts"><div><dt>版本</dt><dd>{agent.agent_version}</dd></div><div><dt>最后心跳</dt><dd>{lastSeen(agent.last_seen_unix)}</dd></div></dl></List.Item>} /></Card>}
+    {agents.state === 'ready' && agents.data.agents.length > 0 && <Card className="agent-list-card" styles={{ body: { padding: 0 } }}><List dataSource={agents.data.agents} renderItem={(agent) => <List.Item className="agent-row"><List.Item.Meta title={<Space wrap><span>{agent.hostname}</span>{agent.online ? <Tag color="success" icon={<CheckCircleOutlined />}>在线</Tag> : <Tag icon={<DisconnectOutlined />}>离线</Tag>}{agent.credential_state !== 'paired' && <Tag color="warning">需要配对</Tag>}</Space>} description={<span className="agent-id">{agent.agent_id}</span>} /><dl className="agent-facts"><div><dt>版本</dt><dd>{agent.agent_version}</dd></div><div><dt>Codex</dt><dd>{agent.codex ? `${agent.codex.state === 'ready' ? '已就绪' : agent.codex.state === 'starting' ? '初始化中' : agent.codex.state === 'login_required' ? '需要本机登录' : agent.codex.reason === 'codex_not_configured' || agent.codex.reason === 'codex_configured_binary_unavailable' ? '需要配置本机 Codex' : '暂不可用'}${agent.codex.version ? ` · ${agent.codex.version}` : ''}` : '请升级 Agent 查看状态'}</dd></div><div><dt>最后心跳</dt><dd>{lastSeen(agent.last_seen_unix)}</dd></div></dl></List.Item>} /></Card>}
 
     <div className="page-heading section-heading"><div><Typography.Text className="eyebrow">DISCOVERED PROJECTS</Typography.Text><Typography.Title level={2}>Codex 项目</Typography.Title><Typography.Paragraph type="secondary">Agent 自动识别 Codex 历史会话所在目录；路径只保留在服务器本地。</Typography.Paragraph></div>{pending.length > 0 && <Button type="primary" icon={<FolderOpenOutlined />} loading={importing} onClick={() => void importAll()}>一键导入全部（{pending.length}）</Button>}</div>
-    {projectsError && <Alert showIcon closable onClose={() => setProjectsError(undefined)} type="warning" title="项目同步失败" description={projectsError} />}
-    <Card className="agent-list-card" styles={{ body: { padding: projects.length ? 0 : 24 } }}>{projects.length === 0 ? <Empty description="等待 Agent 扫描 Codex 历史项目，通常不超过 60 秒。" /> : <List dataSource={projects} renderItem={(project) => <List.Item className="agent-row"><List.Item.Meta title={<Space wrap><span>{project.display_name}</span><Tag color={project.state === 'approved' ? 'success' : 'processing'}>{project.state === 'approved' ? '已导入' : '待确认'}</Tag></Space>} description={`${project.agent_id} · ${project.suggested_project_id}`} /><Typography.Text type="secondary">{project.session_count} 个会话</Typography.Text></List.Item>} />}</Card>
+    {(projectsError || projectsQuery.error) && <Alert showIcon closable onClose={() => setProjectsError(undefined)} type="warning" title="项目同步失败" description={projectsError ?? projectsQuery.error?.message} />}
+    <Card className="agent-list-card" styles={{ body: { padding: projects.length ? 0 : 24 } }}>{projects.length === 0 ? <Empty description="等待 Agent 扫描 Codex 历史项目，通常不超过 30 秒。" /> : <List dataSource={projects} renderItem={(project) => <List.Item className="agent-row"><List.Item.Meta title={<Space wrap><span>{project.display_name}</span><Tag color={project.state === 'approved' ? 'success' : 'processing'}>{project.state === 'approved' ? '已导入' : '待确认'}</Tag></Space>} description={`${project.agent_id} · ${project.suggested_project_id}`} /><Typography.Text type="secondary">{project.session_count} 个会话</Typography.Text></List.Item>} />}</Card>
 
     <Modal title="添加服务器" open={pairingOpen} onCancel={() => setPairingOpen(false)} footer={null} destroyOnHidden>
       {pairingError && <Alert showIcon type="error" title="无法创建配对码" description={pairingError} />}

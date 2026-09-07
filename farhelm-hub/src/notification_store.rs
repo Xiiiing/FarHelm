@@ -439,6 +439,20 @@ impl EventStore {
             json!({"protocol":FARHELM_PROTOCOL,"notifications":rows,"next_cursor":next,"unread_count":unread,"latest_id":latest,"preferences":preferences}),
         )
     }
+    /// Newly committed business events carry their existing projection to live browsers.
+    pub fn notifications_for_events(&self, ids: &[String]) -> Result<Vec<Notification>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT {COLUMNS} FROM notifications WHERE event_id=?1"
+        ))?;
+        let mut rows = Vec::new();
+        for id in ids {
+            if let Some(row) = statement.query_row([id], notification_row).optional()? {
+                rows.push(row);
+            }
+        }
+        Ok(rows)
+    }
     pub fn notification(&self, id: i64) -> Result<Option<Notification>> {
         self.lock()?
             .query_row(

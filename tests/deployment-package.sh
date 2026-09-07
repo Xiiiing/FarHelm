@@ -24,14 +24,12 @@ cmp "$agent_versioned" "$agent_stable"
 env -i "$hub_stable" --version | grep -Fxq "farhelm-hub $version"
 env -i "$agent_stable" --version | grep -Fxq "farhelm-agent $version"
 
-test -s "$release_dir/farhelm-codex-runtime-$version-linux-x86_64.tar.gz"
-runtime_archive="$release_dir/farhelm-codex-runtime-$version-linux-x86_64.tar.gz"
-runtime_size=$(stat -c '%s' "$runtime_archive")
-runtime_sha256=$(sha256sum "$runtime_archive" | cut -d' ' -f1)
-runtime_contents="$test_dir/runtime-contents.txt"
-tar -tzf "$runtime_archive" >"$runtime_contents"
-grep -q '^\.venv/bin/python' "$runtime_contents"
-grep -q '^python/bin/python3.12' "$runtime_contents"
+test -s "$release_dir/farhelm-third-party-notices.txt"
+if compgen -G "$release_dir/*runtime*" >/dev/null; then
+  printf 'Release must not bundle a Python or Codex runtime.\n' >&2
+  exit 1
+fi
+codex_fixture="$repo_root/tests/fixtures/native-codex.mjs"
 
 hub_config="$test_dir/hub.toml"
 agent_config="$test_dir/agent.toml"
@@ -54,8 +52,8 @@ token = "package-agent-token-with-at-least-32-characters"
 heartbeat_seconds = 15
 command_poll_seconds = 2
 database = "$test_dir/agent.db"
-[worker]
-python = "python3"
+[codex]
+bin = "$codex_fixture"
 EOF
 
 "$hub_stable" serve --config "$hub_config" >"$test_dir/hub.log" 2>&1 &
@@ -79,14 +77,14 @@ login_response=$(curl --fail --silent --show-error --cookie-jar "$cookie_jar" \
   --header 'Content-Type: application/json' \
   --data '{"username":"package-admin","password":"package-password-1234"}' \
   http://127.0.0.1:18787/api/v1/auth/login)
-csrf=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["csrf_token"])' <<<"$login_response")
+csrf=$(node -e 'process.stdin.on("data", d => process.stdout.write(JSON.parse(d).csrf_token))' <<<"$login_response")
 probe_response=$(curl --fail --silent --show-error \
   --cookie "$cookie_jar" \
   --header "X-CSRF-Token: $csrf" \
   --header 'Content-Type: application/json' \
   --data '{"idempotency_key":"package-probe-request-0001","ttl_secs":60}' \
   http://127.0.0.1:18787/api/v1/agents/package-gpu/probe)
-command_id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["command_id"])' <<<"$probe_response")
+command_id=$(node -e 'process.stdin.on("data", d => process.stdout.write(JSON.parse(d).command_id))' <<<"$probe_response")
 "$agent_stable" command-poll --config "$agent_config"
 curl --fail --silent --show-error \
   --cookie "$cookie_jar" \
@@ -101,7 +99,7 @@ pairing_code() {
     --header "X-CSRF-Token: $csrf" --header 'Content-Type: application/json' \
     --data "{\"agent_id\":\"$agent_id\"}" \
     http://127.0.0.1:18787/api/v1/agents/pairing-codes |
-    python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])'
+    node -e 'process.stdin.on("data", d => process.stdout.write(JSON.parse(d).code))'
 }
 
 package_installed_code=$(pairing_code package-installed)
@@ -126,7 +124,6 @@ chmod 0755 "$mock_bin/systemctl" "$mock_bin/loginctl"
 
 (
   export PATH="$mock_bin:$PATH"
-  export HOME="$test_dir/home"
   export XDG_DATA_HOME="$test_dir/user-data"
   export XDG_CONFIG_HOME="$test_dir/user-config"
   export XDG_BIN_HOME="$test_dir/user-bin"
@@ -134,12 +131,9 @@ chmod 0755 "$mock_bin/systemctl" "$mock_bin/loginctl"
   export FARHELM_HUB_URL=http://127.0.0.1:18787
   export FARHELM_PAIRING_CODE="$package_installed_code"
   export FARHELM_AGENT_HOSTNAME=package-installed-host
-  export FARHELM_CODEX_RUNTIME_ARCHIVE="$runtime_archive"
-  export FARHELM_CODEX_RUNTIME_SIZE="$runtime_size"
-  export FARHELM_CODEX_RUNTIME_SHA256="$runtime_sha256"
-  mkdir -p "$HOME"
 
   "$agent_stable" install
+  "$XDG_BIN_HOME/farhelm-agent" codex configure --bin "$codex_fixture"
   installed_binary="$XDG_BIN_HOME/farhelm-agent"
   installed_config="$XDG_CONFIG_HOME/farhelm/agent.toml"
   installed_data="$XDG_DATA_HOME/farhelm"
@@ -147,8 +141,8 @@ chmod 0755 "$mock_bin/systemctl" "$mock_bin/loginctl"
   test -x "$installed_binary"
   test -f "$installed_config"
   test "$(stat -c '%a' "$installed_config")" = 600
-  test -f "$installed_data/runtime/codex-worker/$version/src/farhelm_worker_codex/__main__.py"
-  test -x "$installed_data/runtime/codex-worker/$version/.venv/bin/python"
+  test ! -e "$installed_data/runtime"
+  grep -Fq "$codex_fixture" "$installed_config"
   grep -q "$installed_binary" "$unit_file"
   grep -q "$installed_config" "$unit_file"
   ! grep -q 'current/run.sh' "$unit_file"
@@ -170,7 +164,7 @@ chmod 0755 "$mock_bin/systemctl" "$mock_bin/loginctl"
   "$agent_stable" install
   test -f "$XDG_BIN_HOME/farhelm-agent.previous"
   "$installed_binary" rollback
-  grep -q 'runtime/codex-worker' "$installed_config"
+  grep -Fq "$codex_fixture" "$installed_config"
   test "$(<"$installed_data/state/preserved.txt")" = persistent-state
 
   "$installed_binary" uninstall
@@ -183,17 +177,12 @@ chmod 0755 "$mock_bin/systemctl" "$mock_bin/loginctl"
 failure_agent_code=$(pairing_code failure-agent)
 (
   export PATH="$mock_bin:$PATH"
-  export HOME="$test_dir/failure-home"
   export XDG_DATA_HOME="$test_dir/failure-data"
   export XDG_CONFIG_HOME="$test_dir/failure-config"
   export XDG_BIN_HOME="$test_dir/failure-bin"
   export USER=failure-user
   export FARHELM_HUB_URL=http://127.0.0.1:18787
   export FARHELM_PAIRING_CODE="$failure_agent_code"
-  export FARHELM_CODEX_RUNTIME_ARCHIVE="$runtime_archive"
-  export FARHELM_CODEX_RUNTIME_SIZE="$runtime_size"
-  export FARHELM_CODEX_RUNTIME_SHA256="$runtime_sha256"
-  mkdir -p "$HOME"
 
   "$agent_stable" install
   installed_binary="$XDG_BIN_HOME/farhelm-agent"
@@ -222,17 +211,12 @@ failure_agent_code=$(pairing_code failure-agent)
 fresh_failure_code=$(pairing_code fresh-failure-agent)
 (
   export PATH="$mock_bin:$PATH"
-  export HOME="$test_dir/fresh-failure-home"
   export XDG_DATA_HOME="$test_dir/fresh-failure-data"
   export XDG_CONFIG_HOME="$test_dir/fresh-failure-config"
   export XDG_BIN_HOME="$test_dir/fresh-failure-bin"
   export USER=fresh-failure-user
   export FARHELM_HUB_URL=http://127.0.0.1:18787
   export FARHELM_PAIRING_CODE="$fresh_failure_code"
-  export FARHELM_CODEX_RUNTIME_ARCHIVE="$runtime_archive"
-  export FARHELM_CODEX_RUNTIME_SIZE="$runtime_size"
-  export FARHELM_CODEX_RUNTIME_SHA256="$runtime_sha256"
-  mkdir -p "$HOME"
 
   set +e
   FARHELM_TEST_SYSTEMCTL_FAIL=enable "$agent_stable" install >"$test_dir/fresh-failure-install.log" 2>&1
@@ -245,4 +229,4 @@ fresh_failure_code=$(pairing_code fresh-failure-agent)
   test ! -e "$XDG_DATA_HOME/farhelm"
 )
 
-printf 'Native role program and managed Codex runtime smoke passed.\n'
+printf 'Native role programs and installed Codex configuration smoke passed.\n'

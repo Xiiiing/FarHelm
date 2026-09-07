@@ -8,7 +8,7 @@ import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import { toJsxRuntime } from 'hast-util-to-jsx-runtime'
 import { normalizeMath } from './math'
-import { renderMarkdown } from './markdownService'
+import { cachedMarkdown, renderMarkdown, type MarkdownTree } from './markdownService'
 import 'katex/dist/katex.min.css'
 
 function safeUrl(url?: string): string | undefined {
@@ -45,16 +45,19 @@ const components: Components = {
   h3: ({ children }) => <h4>{children}</h4>,
 }
 
+type BlockTree = MarkdownTree & { data?: { fingerprint?: string } }
+function blocks(tree?: MarkdownTree): BlockTree[] { return tree && 'children' in tree ? tree.children as BlockTree[] : tree ? [tree] : [] }
+const MarkdownBlock = memo(function MarkdownBlock({ tree }: { tree: BlockTree }) { return toJsxRuntime(tree, { Fragment, jsx, jsxs, components, passNode: true }) as ReactNode })
 function LargeMarkdown({ text }: { text: string }) {
-  const [rendered, setRendered] = useState<{ text: string; node: ReactNode }>()
+  const [rendered, setRendered] = useState(() => ({ text: cachedMarkdown(text) ? text : '', blocks: blocks(cachedMarkdown(text)), failed: false }))
   useEffect(() => {
     let cancel: (() => void) | undefined
     const timer = setTimeout(() => {
-      cancel = renderMarkdown(text, (tree) => setRendered({ text, node: tree ? toJsxRuntime(tree, { Fragment, jsx, jsxs, components, passNode: true }) as ReactNode : <div className="markdown-fallback">{text}</div> }))
-    }, 100)
+      cancel = renderMarkdown(text, (tree) => setRendered((old) => ({ text, failed: !tree, blocks: blocks(tree).map((node, index) => node.data?.fingerprint && node.data.fingerprint === old.blocks[index]?.data?.fingerprint ? old.blocks[index] : node) })))
+    }, 24)
     return () => { clearTimeout(timer); cancel?.() }
   }, [text])
-  return <div aria-busy={rendered?.text !== text}>{rendered?.node ?? <span className="message-role">正在排版长消息…</span>}</div>
+  return <div aria-busy={rendered.text !== text}>{rendered.failed ? <><span className="message-role">排版暂不可用，已显示原文</span>{Array.from({ length: Math.ceil(rendered.text.length / 4096) }, (_, index) => <p className="markdown-chunk" style={{ whiteSpace: 'pre-wrap' }} key={index}>{rendered.text.slice(index * 4096, (index + 1) * 4096)}</p>)}</> : rendered.blocks.length ? rendered.blocks.map((tree, index) => <MarkdownBlock key={index} tree={tree} />) : <span className="message-role">正在排版长消息…</span>}</div>
 }
 
 const rehypePlugins: ComponentProps<typeof ReactMarkdown>['rehypePlugins'] = [[rehypeKatex, { trust: false, strict: 'ignore', maxExpand: 1000 }]]

@@ -43,21 +43,6 @@ jobs:
       - run: pnpm --dir farhelm-console exec playwright install --with-deps chromium
       - run: pnpm --dir farhelm-console test:e2e
 
-  worker:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-        with:
-          version: "0.12.9"
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: uv sync --project farhelm-worker-codex --frozen --all-groups
-      - run: uv run --project farhelm-worker-codex ruff check farhelm-worker-codex
-      - run: uv run --project farhelm-worker-codex mypy farhelm-worker-codex/src
-      - run: uv run --project farhelm-worker-codex pytest farhelm-worker-codex/tests
-
   privacy:
     runs-on: ubuntu-latest
     steps:
@@ -66,18 +51,18 @@ jobs:
       - run: ./scripts/check-readme-parity.sh
 
   smoke:
-    needs: [rust, worker]
+    needs: [rust]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-node@v4
         with:
-          python-version: "3.12"
+          node-version-file: farhelm-console/.node-version
       - run: ./tests/smoke.sh
 
   release-bundles:
-    needs: [rust, console, worker, privacy, smoke]
+    needs: [rust, console, privacy, smoke]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -92,17 +77,11 @@ jobs:
           node-version-file: farhelm-console/.node-version
           cache: pnpm
           cache-dependency-path: farhelm-console/pnpm-lock.yaml
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: astral-sh/setup-uv@v6
-        with:
-          version: "0.12.9"
       - run: ./scripts/build-release.sh
       - run: ./tests/deployment-package.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: farhelm-V0.7.1-linux-x86_64
+          name: farhelm-V0.8.0-linux-x86_64
           path: |
             dist/release/farhelm-*
             dist/release/SHA256SUMS

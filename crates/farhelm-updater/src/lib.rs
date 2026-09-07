@@ -14,7 +14,6 @@ const RELEASES_API: &str = "https://api.github.com/repos/Xiiiing/FarHelm/release
 const DOWNLOAD_PREFIX: &str = "https://github.com/Xiiiing/FarHelm/releases/download/";
 const API_VERSION: &str = "2026-03-10";
 const MAX_REDIRECTS: usize = 8;
-const MAX_RUNTIME_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -66,21 +65,6 @@ pub struct UpdateCandidate {
     digest: [u8; 32],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeCandidate {
-    pub version: Version,
-    pub tag: String,
-    asset: ReleaseAsset,
-    digest: [u8; 32],
-}
-
-impl RuntimeCandidate {
-    #[must_use]
-    pub fn asset_name(&self) -> &str {
-        &self.asset.name
-    }
-}
-
 impl UpdateCandidate {
     #[must_use]
     pub fn asset_name(&self) -> &str {
@@ -90,13 +74,6 @@ impl UpdateCandidate {
 
 #[derive(Debug)]
 pub struct VerifiedExecutable {
-    _temporary: TempDir,
-    pub path: PathBuf,
-    pub version: Version,
-}
-
-#[derive(Debug)]
-pub struct VerifiedAsset {
     _temporary: TempDir,
     pub path: PathBuf,
     pub version: Version,
@@ -155,15 +132,6 @@ impl Updater {
         select_candidate(&releases, role, current, requested, allow_major)
     }
 
-    pub async fn runtime(&self, version: &str) -> Result<RuntimeCandidate> {
-        let version = Version::parse(version).context("Worker runtime version is invalid")?;
-        ensure!(
-            version.pre.is_empty() && version.build.is_empty(),
-            "Worker runtime requires a formal release version"
-        );
-        select_runtime_candidate(&self.releases().await?, &version)
-    }
-
     async fn releases(&self) -> Result<Vec<GithubRelease>> {
         let response = self
             .client
@@ -200,22 +168,6 @@ impl Updater {
         Ok(VerifiedExecutable {
             _temporary: temporary,
             path: binary_path,
-            version: candidate.version.clone(),
-        })
-    }
-
-    pub async fn download_runtime(&self, candidate: &RuntimeCandidate) -> Result<VerifiedAsset> {
-        let (temporary, path) = self
-            .download_asset(
-                &candidate.asset,
-                candidate.digest,
-                MAX_RUNTIME_BYTES,
-                "codex-runtime.tar.gz",
-            )
-            .await?;
-        Ok(VerifiedAsset {
-            _temporary: temporary,
-            path,
             version: candidate.version.clone(),
         })
     }
@@ -368,40 +320,6 @@ fn select_candidate(
     Ok(candidate)
 }
 
-fn select_runtime_candidate(
-    releases: &[GithubRelease],
-    version: &Version,
-) -> Result<RuntimeCandidate> {
-    let tag = format!("V{version}");
-    let release = releases
-        .iter()
-        .find(|release| {
-            release.tag_name == tag && !release.draft && !release.prerelease && release.immutable
-        })
-        .context("matching immutable FarHelm release is unavailable")?;
-    let name = format!("farhelm-codex-runtime-{version}-linux-x86_64.tar.gz");
-    let asset = release
-        .assets
-        .iter()
-        .find(|asset| asset.name == name)
-        .context("immutable release omits the Codex runtime asset")?;
-    ensure!(asset.size > 0, "Codex runtime asset is empty");
-    ensure!(
-        asset.size <= MAX_RUNTIME_BYTES,
-        "Codex runtime asset exceeds its size limit"
-    );
-    ensure!(
-        asset.browser_download_url == format!("{DOWNLOAD_PREFIX}{tag}/{name}"),
-        "Codex runtime URL is outside the official FarHelm release path"
-    );
-    Ok(RuntimeCandidate {
-        version: version.clone(),
-        tag,
-        asset: asset.clone(),
-        digest: parse_digest(asset.digest.as_deref())?,
-    })
-}
-
 fn parse_requested_version(value: &str) -> Result<Version> {
     let value = value.strip_prefix('V').unwrap_or(value);
     ensure!(
@@ -472,24 +390,14 @@ mod tests {
             draft: false,
             prerelease: false,
             immutable,
-            assets: vec![
-                ReleaseAsset {
-                    name: format!("farhelm-agent-{version}-linux-x86_64"),
-                    browser_download_url: format!(
-                        "{DOWNLOAD_PREFIX}{tag}/farhelm-agent-{version}-linux-x86_64"
-                    ),
-                    size: 1024,
-                    digest: Some(format!("sha256:{}", "11".repeat(32))),
-                },
-                ReleaseAsset {
-                    name: format!("farhelm-codex-runtime-{version}-linux-x86_64.tar.gz"),
-                    browser_download_url: format!(
-                        "{DOWNLOAD_PREFIX}{tag}/farhelm-codex-runtime-{version}-linux-x86_64.tar.gz"
-                    ),
-                    size: 2048,
-                    digest: Some(format!("sha256:{}", "22".repeat(32))),
-                },
-            ],
+            assets: vec![ReleaseAsset {
+                name: format!("farhelm-agent-{version}-linux-x86_64"),
+                browser_download_url: format!(
+                    "{DOWNLOAD_PREFIX}{tag}/farhelm-agent-{version}-linux-x86_64"
+                ),
+                size: 1024,
+                digest: Some(format!("sha256:{}", "11".repeat(32))),
+            }],
         }
     }
 
@@ -560,20 +468,5 @@ mod tests {
         assert!(validate_download(&candidate, 1023, [0x11; 32]).is_err());
         assert!(validate_download(&candidate, 1024, [0x22; 32]).is_err());
         assert!(validate_download(&candidate, 1024, [0x11; 32]).is_ok());
-    }
-
-    #[test]
-    fn runtime_requires_exact_immutable_release_asset() {
-        let candidate =
-            select_runtime_candidate(&[release("V0.4.0", true)], &Version::new(0, 4, 0)).unwrap();
-        assert_eq!(candidate.tag, "V0.4.0");
-        assert_eq!(
-            candidate.asset_name(),
-            "farhelm-codex-runtime-0.4.0-linux-x86_64.tar.gz"
-        );
-        assert_eq!(candidate.digest, [0x22; 32]);
-        assert!(
-            select_runtime_candidate(&[release("V0.4.0", false)], &Version::new(0, 4, 0)).is_err()
-        );
     }
 }

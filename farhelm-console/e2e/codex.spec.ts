@@ -111,6 +111,7 @@ test('history recovers when Agent heartbeat follows Hub restart', async ({ page 
   await page.goto('/codex?session=ses-a')
   await expect(page.getByText('Agent 离线，暂时无法读取历史')).toBeVisible()
   model.historyStatus = 200
+  await emit(page, 'agent.status', { agent_id: 'gpu-a', hostname: 'gpu-a', online: true, codex: { state: 'ready' } })
   await expect(page.locator('.markdown-table')).toHaveCount(1, { timeout: 10000 })
   await expect(page.getByText('Agent 离线，暂时无法读取历史')).toHaveCount(0)
   expect(model.historyReads).toBeLessThanOrEqual(4)
@@ -127,10 +128,10 @@ test('session metadata arriving after its creation receipt retries initial histo
 })
 
 for (const cancelled of [false, true]) test(`created session follows its receipt; dialog cancelled=${cancelled}`, async ({ page }) => {
-  const model = await setup(page); let ready = false; let reads = 0; let completed = false
+  const model = await setup(page); let ready = false; let reads = 0
   await page.route('**/projects', (route) => route.fulfill({ json: { protocol: 'farhelm/1', projects: [{ candidate_id: 'project-a', agent_id: 'gpu-a', suggested_project_id: 'cc08', display_name: '训练项目', state: 'approved' }] } }))
   await page.route('**/codex/sessions', (route) => route.request().method() === 'POST' ? route.fulfill({ json: { command_id: 'create-receipt', state: 'accepted' } }) : route.fallback())
-  await page.route('**/commands/create-receipt', (route) => { reads++; completed ||= ready; return route.fulfill({ json: { command_id: 'create-receipt', state: ready ? 'completed' : 'running', data: ready ? { session_id: 'ses-created' } : undefined } }) })
+  await page.route('**/commands/create-receipt', (route) => { reads++; return route.fulfill({ json: { command_id: 'create-receipt', state: ready ? 'completed' : 'running', data: ready ? { session_id: 'ses-created' } : undefined } }) })
   await page.route('**/ses-created/transcript?*', (route) => route.fulfill({ json: { session_id: 'ses-created', turns: [] } }))
   await page.goto('/codex?session=ses-a'); await expect(page.locator('.conversation-title')).toContainText('训练结果分析')
   await page.getByLabel('给 Codex 发送指令').fill('原会话草稿')
@@ -140,7 +141,8 @@ for (const cancelled of [false, true]) test(`created session follows its receipt
   await page.getByRole('button', { name: /创\s*建/, exact: true }).click(); await expect.poll(() => reads).toBeGreaterThan(0)
   if (cancelled) { const dialog = page.getByRole('dialog', { name: '创建 Codex 会话' }); await dialog.getByRole('button', { name: 'Close', exact: true }).press('Enter'); await expect(dialog).toBeHidden() }
   model.sessions.push({ ...session('ses-created'), title: '新建验收会话' }); ready = true
-  await expect.poll(() => completed).toBe(true)
+  await emit(page, 'command.updated', { command_id: 'create-receipt', state: 'completed', data: { session_id: 'ses-created' } })
+  expect(reads).toBe(1)
   if (cancelled) { await expect(page).toHaveURL(/session=ses-a/); await expect(page.getByLabel('给 Codex 发送指令')).toHaveValue('原会话草稿') }
   else { await expect(page).toHaveURL(/session=ses-created/); await expect(page.locator('.conversation-title')).toContainText('新建验收会话'); await expect(page.getByLabel('给 Codex 发送指令')).toHaveValue('') }
 })
@@ -208,4 +210,86 @@ test('one MiB message resumes separately from earlier turns without duplicate te
   await expect(page.getByRole('button', { name: '继续加载此消息' })).toHaveCount(0)
   expect(await page.locator('.markdown-body').textContent()).toBe(text.trimEnd())
   await expect(page.getByLabel('给 Codex 发送指令')).toHaveValue('大消息解析期间仍可输入'); await composerFits(page)
+})
+
+test('2000 turns load through every page and retain the visible anchor when virtualization starts', async ({ page }, info) => {
+  test.skip(info.project.name !== 'desktop', 'Long-history acceptance runs once')
+  test.setTimeout(90000)
+  await setup(page)
+  const cursors: number[] = []
+  await page.route('**/ses-a/transcript*', (route) => {
+    const offset = Number(new URL(route.request().url()).searchParams.get('cursor') ?? 0); cursors.push(offset)
+    return route.fulfill({ json: { session_id: 'ses-a', turns: Array.from({ length: 20 }, (_, index) => {
+      const number = 1999 - offset - index
+      return { turn_id: `long-${number}`, status: 'completed', items: [{ item_id: 'user', kind: 'user_message', text: `合成问题 ${number}` }, { item_id: 'assistant', kind: 'assistant_message', text: `合成回复 ${number}` }] }
+    }), next_cursor: offset < 1980 ? String(offset + 20) : null } })
+  })
+  await page.goto('/codex?session=ses-a')
+  await expect(page.locator('[data-turn-id="long-1999"]')).toBeVisible()
+  for (let index = 1; index < 100; index++) {
+    const button = page.getByRole('button', { name: '加载更早对话' })
+    await button.scrollIntoViewIfNeeded()
+    const previous = await page.locator('.conversation-scroll').evaluate((node) => {
+      const top = node.getBoundingClientRect().top
+      const first = [...node.querySelectorAll<HTMLElement>('[data-message-key]')].find((item) => item.getBoundingClientRect().bottom > top)
+      return first && { key: first.dataset.messageKey, offset: first.getBoundingClientRect().top - top }
+    })
+    await button.click()
+    await expect.poll(() => cursors.length).toBe(index + 1)
+    await expect(page.locator('.conversation-scroll [aria-busy="true"]')).toHaveCount(0)
+    if (index < 99) await expect(button).toBeEnabled()
+    if (index === 2 && previous) await expect.poll(async () => {
+      return page.locator('.conversation-scroll').evaluate((node, old) => {
+        const item = node.querySelector<HTMLElement>(`[data-message-key="${CSS.escape(old.key!)}"]`)
+        return item ? Math.abs(item.getBoundingClientRect().top - node.getBoundingClientRect().top - old.offset) : 99999
+      }, previous)
+    }).toBeLessThan(5)
+  }
+  expect(new Set(cursors).size).toBe(100)
+  await expect(page.getByRole('button', { name: '加载更早对话' })).toHaveCount(0)
+  await page.locator('.conversation-scroll').evaluate((node) => { node.scrollTop = 0 })
+  await expect(page.locator('[data-turn-id="long-0"]')).toBeVisible()
+  expect(await page.locator('.codex-turn').count()).toBeLessThan(35)
+  await page.getByLabel('给 Codex 发送指令').fill('长历史中仍可输入中文🙂')
+  await page.getByRole('button', { name: /回到底部/ }).click()
+  await expect(page.locator('[data-turn-id="long-1999"]')).toBeVisible()
+  await composerFits(page)
+})
+
+test('Enter submits identical prompts with independent identities and no command polling', async ({ page }, info) => {
+  test.skip(info.project.name !== 'desktop', 'Submission acceptance runs once')
+  await setup(page)
+  const identities: string[] = []; let statusReads = 0
+  await page.route('**/commands/*', (route) => { statusReads++; return route.fulfill({ json: { state: 'completed' } }) })
+  await page.route('**/ses-a/messages', (route) => {
+    identities.push(route.request().headers()['idempotency-key'])
+    return route.fulfill({ json: { command_id: `enter-${identities.length}`, state: 'accepted' } })
+  })
+  await page.goto('/codex?session=ses-a')
+  const input = page.getByLabel('给 Codex 发送指令')
+  for (let index = 1; index <= 20; index++) {
+    await input.fill('相同的中文指令'); await input.press('Enter'); await expect(input).toHaveValue('')
+    await emit(page, 'command.updated', { command_id: `enter-${index}`, state: 'completed' })
+  }
+  expect(new Set(identities).size).toBe(20); expect(statusReads).toBe(0)
+})
+
+test('separated terminal events and receipts reconcile each execution once in either order', async ({ page }, info) => {
+  test.skip(info.project.name !== 'desktop', 'Transport reconciliation runs once')
+  const model = await setup(page)
+  await page.goto('/codex?session=ses-a')
+  await expect(page.locator('.markdown-body strong')).toContainText('完整测量')
+  for (const receiptFirst of [false, true]) {
+    const operation = `dedupe-${receiptFirst}`; const turnId = `turn-${operation}`
+    const before = model.historyReads
+    const terminal = () => emit(page, 'codex.turn.completed', { session_id: 'ses-a', operation_id: operation, data: { turn_id: turnId } })
+    const receipt = () => emit(page, 'command.updated', { command_id: operation, state: 'completed', data: { session_id: 'ses-a', turn_id: turnId } })
+    await (receiptFirst ? receipt() : terminal())
+    await expect.poll(() => model.historyReads).toBe(before + 1)
+    // The second event arrives after the first read, beyond the coalescing window.
+    await (receiptFirst ? terminal() : receipt())
+    await terminal(); await receipt()
+    await page.waitForTimeout(180)
+    expect(model.historyReads).toBe(before + 1)
+  }
 })

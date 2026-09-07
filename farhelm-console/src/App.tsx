@@ -1,3 +1,5 @@
+import { clearMarkdownCache } from './components/codex/markdownService'
+import { clearOperationReceipts } from './api/features'
 import {
   BellOutlined,
   CodeOutlined,
@@ -11,6 +13,8 @@ import {
   SunOutlined,
   UnorderedListOutlined,
 } from '@ant-design/icons'
+import { QueryClientProvider } from '@tanstack/react-query'
+import { queryClient, connectCodexCache } from './api/cache'
 import { Button, ConfigProvider, Drawer, Grid, Layout, Menu, Space, Spin, Typography } from 'antd'
 import { lazy, Suspense, useEffect, useState } from 'react'
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
@@ -73,7 +77,7 @@ function FeatureRoutes({ csrf, preference, onPreference, onLogout }: { csrf: str
   )
 }
 
-export default function App() {
+function AppContent() {
   const screens = Grid.useBreakpoint()
   const isDesktop = Boolean(screens.md)
   const navigate = useNavigate()
@@ -82,6 +86,10 @@ export default function App() {
   const { mode, preference, setPreference, toggleMode } = useColorMode()
   const [session, setSession] = useState<BrowserSession | null | undefined>(undefined)
   useEffect(() => { void readSession().then(setSession).catch(() => setSession(null)) }, [])
+  useEffect(() => {
+    if (!session) { queryClient.clear(); clearMarkdownCache(); clearOperationReceipts(); return }
+    return connectCodexCache()
+  }, [session])
   const mobileSelection = ['/agents', '/notifications', '/audit', '/settings'].includes(location.pathname)
     ? '/more'
     : location.pathname
@@ -109,7 +117,7 @@ export default function App() {
               <div><strong>FarHelm</strong><span>远程训练控制台</span></div>
             </div>
             <Menu mode="inline" selectedKeys={[location.pathname]} items={desktopItems} onClick={({ key }) => go(key)} />
-            <div className="sider-footer"><Typography.Text type="secondary">V0.7.1 · Codex workspace</Typography.Text></div>
+            <div className="sider-footer"><Typography.Text type="secondary">V0.8.0 · Codex workspace</Typography.Text></div>
           </Sider>
         )}
 
@@ -146,4 +154,8 @@ export default function App() {
       </Layout>
     </ConfigProvider>
   )
+}
+
+export default function App() {
+  return <QueryClientProvider client={queryClient}><AppContent /></QueryClientProvider>
 }

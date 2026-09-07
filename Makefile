@@ -1,4 +1,4 @@
-.PHONY: check test test-ui run-hub run-console smoke smoke-worker privacy release test-release
+.PHONY: check test test-ui run-hub run-console smoke smoke-codex privacy release test-release
 
 check:
 	./scripts/check-version-policy.sh
@@ -6,12 +6,10 @@ check:
 	cargo clippy --workspace --all-targets -- -D warnings
 	corepack pnpm@10.17.1 --dir farhelm-console lint
 	corepack pnpm@10.17.1 --dir farhelm-console typecheck
-	cd farhelm-worker-codex && uv run ruff check . && uv run mypy src
 
 test:
 	cargo test --workspace
 	corepack pnpm@10.17.1 --dir farhelm-console test
-	cd farhelm-worker-codex && uv run pytest
 
 test-ui:
 	corepack pnpm@10.17.1 --dir farhelm-console build
@@ -27,8 +25,8 @@ run-console:
 smoke:
 	./tests/smoke.sh
 
-smoke-worker:
-	cargo run -p farhelm-agent -- worker-smoke
+smoke-codex:
+	cargo run -p farhelm-agent -- codex-smoke
 
 privacy:
 	./scripts/check-private-files.sh

@@ -113,7 +113,9 @@ test('experiment deep link and Codex manual queue use the mobile-safe workflow',
     await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' })
   })
   await page.goto('/codex?session=ses-a')
-  await expect(page.getByRole('button', { name: '复制会话 ID' })).toBeVisible()
+  await page.getByRole('button', { name: '会话操作' }).click()
+  await expect(page.getByRole('menuitem', { name: '复制会话 ID' })).toBeVisible()
+  await page.keyboard.press('Escape')
   await expect(page.getByText('结果正常')).toBeVisible()
   await page.getByLabel('给 Codex 发送指令').fill('继续分析结果')
   await page.getByRole('button', { name: '发送指令' }).click()
@@ -150,7 +152,7 @@ test('browser reminders deduplicate IDs and do not toast restored history', asyn
       constructor() { super(); sources.push(this); setTimeout(() => this.dispatchEvent(new Event('open')), 0) }
       close() { sources.splice(sources.indexOf(this), 1) }
     }
-    Object.assign(window, { EventSource: FakeEventSource, emitNotice: (kind: string) => { for (const source of sources) source.dispatchEvent(new MessageEvent(kind, { data: '{}' })) } })
+    Object.assign(window, { EventSource: FakeEventSource, emitNotice: (kind: string) => { for (const source of sources) source.dispatchEvent(new MessageEvent(kind, { data: JSON.stringify({ payload: { id: 2, agent_id: 'gpu-a', category: 'test', state: 'succeeded', title: '新的页面测试', created_at_unix: Math.floor(Date.now() / 1000) } }) })) } })
   })
   let latest = 1; let lists = 0
   await page.route('**/api/v1/notifications?*', (route) => {
@@ -164,26 +166,25 @@ test('browser reminders deduplicate IDs and do not toast restored history', asyn
   await expect(page.locator('.ant-notification-notice')).toHaveCount(0)
   await page.getByRole('button', { name: '发送页面测试通知' }).click()
   const emit = (kind: string) => page.evaluate((event) => { (window as unknown as { emitNotice: (kind: string) => void }).emitNotice(event) }, kind)
-  await emit('notification.changed')
+  await emit('notification.created')
   await expect(page.locator('.ant-notification-notice')).toHaveCount(1)
   await expect(page.locator('.ant-notification-notice')).toContainText('新的页面测试')
-  await emit('notification.changed'); await emit('open'); await emit('notification.changed')
+  await emit('notification.created'); await emit('open'); await emit('notification.created')
   await expect(page.locator('.ant-notification-notice')).toHaveCount(1)
 })
 
 test('switching sessions ignores late history responses', async ({ page }, testInfo) => {
   await page.route('**/api/v1/codex/sessions?*', (route) => route.fulfill({ json: { protocol: 'farhelm/1', sessions: ['ses-a', 'ses-b'].map((session_id) => ({ session_id, agent_id: 'gpu-a', project_id: 'cc08', mode: 'inspect', state: 'idle', title: session_id, updated_at_unix: 2000000000 })) } }))
-  let release: () => void = () => {}
+  let release: () => void = () => {}; let returned = false
   const gate = new Promise<void>((resolve) => { release = resolve })
-  await page.route('**/api/v1/codex/sessions/ses-a/transcript?*', async (route) => { await gate; await route.fulfill({ json: { session_id: 'ses-a', turns: [{ turn_id: 'old', status: 'completed', items: [{ item_id: 'old', kind: 'assistant_message', text: '迟到的旧会话正文' }] }] } }) })
+  await page.route('**/api/v1/codex/sessions/ses-a/transcript?*', async (route) => { await gate; await route.fulfill({ json: { session_id: 'ses-a', turns: [{ turn_id: 'old', status: 'completed', items: [{ item_id: 'old', kind: 'assistant_message', text: '迟到的旧会话正文' }] }] } }); returned = true })
   await page.route('**/api/v1/codex/sessions/ses-b/transcript?*', (route) => route.fulfill({ json: { session_id: 'ses-b', turns: [{ turn_id: 'new', status: 'completed', items: [{ item_id: 'new', kind: 'assistant_message', text: '当前会话正文' }] }] } }))
   await page.goto('/codex?session=ses-a')
   if (testInfo.project.name === 'mobile') await page.getByRole('button', { name: '打开会话列表' }).click()
   await page.getByRole('button', { name: /ses-b/ }).filter({ visible: true }).click()
   await expect(page.getByText('当前会话正文')).toBeVisible()
-  const oldResponse = page.waitForResponse((response) => response.url().includes('/ses-a/transcript'))
   release()
-  await oldResponse
+  await expect.poll(() => returned).toBe(true)
   await expect(page.getByText('迟到的旧会话正文')).toHaveCount(0)
   await expect(page.getByText('当前会话正文')).toBeVisible()
 })

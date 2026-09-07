@@ -13,8 +13,6 @@ fi
 
 grep -Fxq "version = \"$version\"" <(sed -n '/\[workspace.package\]/,/^$/p' Cargo.toml)
 grep -Fq "\"version\": \"$version\"" farhelm-console/package.json
-grep -Fxq "version = \"$version\"" farhelm-worker-codex/pyproject.toml
-grep -Fxq "__version__ = \"$version\"" farhelm-worker-codex/src/farhelm_worker_codex/__init__.py
 grep -Fq "V$version" README.md
 grep -Fq "V$version" README.en.md
 grep -Fq "V$version" deploy/README.md

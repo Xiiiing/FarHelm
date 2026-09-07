@@ -1,7 +1,7 @@
 //! Fixed service lanes and bounded execution workers keep SQLite off the I/O executor.
 use std::{
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, watch},
@@ -35,14 +35,11 @@ impl RuntimeTasks {
 
     pub fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
         let mut stop = self.stop.subscribe();
-        let runtime = tokio::runtime::Handle::current();
-        let handle = tokio::task::spawn_blocking(move || {
-            runtime.block_on(async move {
-                if *stop.borrow() {
-                    return;
-                }
-                tokio::select! { () = future => {}, _ = stop.changed() => {} }
-            })
+        let handle = tokio::spawn(async move {
+            if *stop.borrow() {
+                return;
+            }
+            tokio::select! { () = future => {}, _ = stop.changed() => {} }
         });
         let mut handles = self.handles.lock().expect("runtime task registry poisoned");
         handles.retain(|handle| !handle.is_finished());
@@ -55,6 +52,92 @@ impl RuntimeTasks {
             std::mem::take(&mut *self.handles.lock().expect("runtime task registry poisoned"));
         for handle in handles {
             let _ = handle.await;
+        }
+    }
+}
+
+static DATABASE_PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(8)));
+/// Only synchronous work occupies this bounded executor, never network futures.
+pub async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    let permit = DATABASE_PERMITS.clone().acquire_owned().await?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await?
+}
+
+pub async fn watch_database(path: std::path::PathBuf, wake: Arc<tokio::sync::Notify>) {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let Some(parent) = path.parent() else { return };
+    let parent = if parent.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        parent
+    };
+    let Ok(name) = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes()) else {
+        return;
+    };
+    let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    if raw < 0 {
+        return;
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+    if unsafe {
+        libc::inotify_add_watch(
+            raw,
+            name.as_ptr(),
+            libc::IN_MODIFY | libc::IN_CLOSE_WRITE | libc::IN_CREATE,
+        )
+    } < 0
+    {
+        return;
+    }
+    let Ok(fd) = tokio::io::unix::AsyncFd::new(owned) else {
+        return;
+    };
+    let filename = path.file_name().unwrap_or_default().as_encoded_bytes();
+    loop {
+        let Ok(mut ready) = fd.readable().await else {
+            return;
+        };
+        let read = ready.try_io(|fd| {
+            let mut bytes = [0u8; 8192];
+            let size = unsafe {
+                libc::read(
+                    fd.get_ref().as_raw_fd(),
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                )
+            };
+            if size < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut offset = 0;
+            let mut changed = false;
+            while offset + 16 <= size as usize {
+                let len = u32::from_ne_bytes(
+                    bytes[offset + 12..offset + 16]
+                        .try_into()
+                        .expect("inotify name length"),
+                ) as usize;
+                if offset + 16 + len > size as usize {
+                    break;
+                }
+                let name = &bytes[offset + 16..offset + 16 + len];
+                let name = &name[..name.iter().position(|b| *b == 0).unwrap_or(name.len())];
+                changed |=
+                    name == filename || (name.starts_with(filename) && name.ends_with(b"-wal"));
+                offset += 16 + len;
+            }
+            Ok(changed)
+        });
+        match read {
+            Ok(Ok(true)) => wake.notify_one(),
+            Ok(Err(_)) => return,
+            _ => {}
         }
     }
 }
@@ -74,7 +157,11 @@ mod tests {
         let (ready, started) = tokio::sync::oneshot::channel();
         tasks.spawn(async move {
             let _ = ready.send(());
-            std::thread::sleep(Duration::from_millis(150));
+            let _ = blocking(|| {
+                std::thread::sleep(Duration::from_millis(150));
+                Ok(())
+            })
+            .await;
         });
         started.await.unwrap();
         let (done, receipt) = tokio::sync::oneshot::channel();

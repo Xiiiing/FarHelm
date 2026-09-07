@@ -14,8 +14,8 @@ use farhelm_protocol::{
 use farhelm_updater::{Role, Updater};
 
 use crate::{
+    codex,
     config::{AgentFileConfig, AgentPaths},
-    resources::ensure_worker_environment,
 };
 
 pub const UNIT_NAME: &str = "farhelm-agent.service";
@@ -44,10 +44,7 @@ pub async fn install(no_service: bool) -> Result<()> {
         fs::create_dir_all(parent)?;
         set_mode(parent, 0o700)?;
     }
-    config.worker.python = ensure_worker_environment(&paths.worker, &config.worker.python)
-        .await?
-        .to_string_lossy()
-        .into_owned();
+    discover_codex(&mut config);
     let current = std::env::current_exe().context("failed to locate current Agent executable")?;
     let replaced_binary = install_binary(&current, &paths.binary, &paths.previous)?;
     if let Some(parent) = paths.config.parent() {
@@ -146,7 +143,40 @@ pub async fn restart() -> Result<()> {
 pub fn status() -> Result<()> {
     require_user()?;
     if service_is_active(ServiceScope::User, UNIT_NAME)? {
-        println!("FarHelm Agent {PRODUCT_VERSION} is active.");
+        println!("Service: active (FarHelm Agent CLI {PRODUCT_VERSION})");
+        let paths = AgentPaths::discover()?;
+        let config = AgentFileConfig::load(&paths.config)?;
+        let value = fs::read(config.agent.database.with_extension("status.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        if let Some(value) = value.filter(|v| {
+            v["updated_at_unix"]
+                .as_u64()
+                .is_some_and(|t| crate::unix_time().saturating_sub(t) <= 45)
+        }) {
+            println!(
+                "Hub: {}",
+                if value["hub_connected"] == true {
+                    "connected"
+                } else {
+                    "disconnected; local work is retained"
+                }
+            );
+            println!(
+                "Codex: {} ({})",
+                value["codex"]["state"].as_str().unwrap_or("unknown"),
+                value["codex"]["version"]
+                    .as_str()
+                    .unwrap_or("version unavailable")
+            );
+            if let Some(reason) = value["codex"]["reason"].as_str() {
+                println!("Codex detail: {reason}");
+            }
+        } else {
+            println!(
+                "Hub and Codex: waiting for current service health; run farhelm-agent doctor for diagnostics"
+            );
+        }
         Ok(())
     } else {
         anyhow::bail!("FarHelm Agent service is not active")
@@ -160,15 +190,14 @@ pub async fn doctor(config_path: Option<&Path>) -> Result<(AgentFileConfig, Agen
     let config = AgentFileConfig::load(path)?;
     let mode = fs::metadata(path)?.permissions().mode() & 0o777;
     ensure!(mode & 0o077 == 0, "Agent config must use mode 0600");
-    let python_ok = Command::new(&config.worker.python)
-        .args(["-c", "import openai_codex"])
-        .output()
-        .is_ok_and(|output| output.status.success());
-    ensure!(
-        python_ok,
-        "Codex Worker dependency is unavailable in `{}`; run `farhelm-agent install` to repair it",
-        config.worker.python
+    let codex = codex::Codex::new(config.codex.bin.clone());
+    codex.warm().await?;
+    println!(
+        "Codex: {} ({})",
+        codex.status().state,
+        codex.status().version.as_deref().unwrap_or("unknown")
     );
+    codex.shutdown().await;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()?;
@@ -225,7 +254,7 @@ pub async fn doctor(config_path: Option<&Path>) -> Result<(AgentFileConfig, Agen
         event_response.status()
     );
     println!("FarHelm Agent {PRODUCT_VERSION} configuration is valid.");
-    println!("Worker runtime: {}", paths.worker.display());
+    println!("Codex credentials and configuration remain on this host.");
     Ok((config, paths))
 }
 
@@ -246,6 +275,7 @@ pub async fn pair() -> Result<()> {
     .await?;
     if let Some(existing) = existing {
         enrolled.worker = existing.worker;
+        enrolled.codex = existing.codex;
         enrolled.projects = existing.projects;
         enrolled.agent.database = existing.agent.database;
         enrolled.agent.hostname = existing.agent.hostname;
@@ -385,10 +415,7 @@ pub async fn update(check: bool, requested: Option<&str>, allow_major: bool) -> 
     println!("Downloading verified {}...", candidate.asset_name());
     let executable = updater.download(Role::Agent, &candidate).await?;
     let mut config = AgentFileConfig::load(&paths.config)?;
-    config.worker.python = ensure_worker_environment(&paths.worker, &config.worker.python)
-        .await?
-        .to_string_lossy()
-        .into_owned();
+    discover_codex(&mut config);
     write_atomic(&paths.config, config.encode()?.as_bytes(), 0o600)?;
     install_binary(&executable.path, &paths.binary, &paths.previous)?;
     if let Err(error) = restart_and_check().await {
@@ -594,6 +621,15 @@ fn warn_if_linger_disabled() {
     }
 }
 
+fn discover_codex(config: &mut AgentFileConfig) {
+    if config.codex.bin.is_none() {
+        match codex::transport::discover(None) {
+            Ok(bin) => config.codex.bin = Some(bin),
+            Err(error) => eprintln!("Codex setup pending: {error}. Experiments remain available."),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,7 +642,6 @@ mod tests {
             config: "/tmp/home/.config/farhelm/agent.toml".into(),
             data: "/tmp/home/.local/share/farhelm".into(),
             database: "/tmp/home/.local/share/farhelm/state/agent.db".into(),
-            worker: "/tmp/home/.local/share/farhelm/runtime/codex-worker/0.7.1".into(),
             unit: "/tmp/home/.config/systemd/user/farhelm-agent.service".into(),
             legacy_root: "/tmp/home/.local/share/farhelm-agent".into(),
         };

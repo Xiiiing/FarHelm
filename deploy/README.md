@@ -1,4 +1,4 @@
-# FarHelm V0.7.1 部署与生命周期
+# FarHelm V0.8.0 部署与生命周期
 
 [简体中文](README.md) · [English](README.en.md)
 
@@ -21,7 +21,7 @@ sudo env \
   ./farhelm-hub install
 ```
 
-V0.5.0 可直接执行 `update` 升级；SQLite 会话、配对、项目和调度表会在重启时幂等创建。旧 TOTP 与 Token 字段保留供本机回滚，但 V0.7.1 不再要求 TOTP。V0.3.0 首次跨代安装前仍建议备份：
+V0.5.0 可直接执行 `update` 升级；SQLite 会话、配对、项目和调度表会在重启时幂等创建。旧 TOTP 与 Token 字段保留供本机回滚，但 V0.8.0 不再要求 TOTP。V0.3.0 首次跨代安装前仍建议备份：
 
 ```bash
 sudo cp /var/lib/farhelm/farhelm.db /var/lib/farhelm/farhelm.db.v0.3.bak
@@ -83,14 +83,18 @@ chmod +x farhelm-agent
 ./farhelm-agent install
 ```
 
-Agent 会从同版本不可变 Release 下载独立 Python 3.12/Codex runtime，并校验资产长度和 SHA-256。离线安装时，先传输同版本 runtime 资产，再提供受信任的校验元数据：
+V0.8 复用当前用户已安装、登录的 Codex，不下载 Python 或 Codex，不修改全局模型与登录配置。安装时自动发现唯一可用程序；存在多个候选时需要明确选择。首个验收版本是 Codex 0.153.4，核心协议兼容检查覆盖 0.147.0。
+
+如果终端可以使用 NVM/npm 安装的 Codex，但服务 PATH 找不到，请在该终端安装 Agent 后执行：
 
 ```bash
-FARHELM_CODEX_RUNTIME_ARCHIVE="$PWD/farhelm-codex-runtime-0.7.1-linux-x86_64.tar.gz" \
-FARHELM_CODEX_RUNTIME_SIZE="$(stat -c '%s' farhelm-codex-runtime-0.7.1-linux-x86_64.tar.gz)" \
-FARHELM_CODEX_RUNTIME_SHA256="从受信任的SHA256SUMS复制" \
-./farhelm-agent install
+farhelm-agent codex configure --bin "$(command -v codex)"
+farhelm-agent restart
+farhelm-agent status
+farhelm-agent doctor
 ```
+
+服务启动固定使用配置的绝对路径及同目录解释器。`status` 分别展示服务运行、Hub 连接与 Codex 就绪状态及版本。未安装 Codex、需要登录或初始化失败不影响实验上报。安装路径变化后重新运行 `codex configure` 并重启。离线安装只需已校验的 Agent 程序及已有本机 Codex。
 
 先在网页“服务器 → 添加服务器”生成 8 位码。程序只询问 Hub HTTPS URL 和配对码，独立 Token 自动保存。非交互安装：
 
@@ -105,7 +109,7 @@ Agent 创建并管理：
 - `${XDG_BIN_HOME:-$HOME/.local/bin}/farhelm-agent`：实际运行程序。
 - 同目录的 `farhelm-agent.previous`：唯一回滚备份。
 - `${XDG_CONFIG_HOME:-$HOME/.config}/farhelm/agent.toml`：唯一配置，权限 `0600`。
-- `${XDG_DATA_HOME:-$HOME/.local/share}/farhelm/`：SQLite 状态与私有 Worker runtime。
+- `${XDG_DATA_HOME:-$HOME/.local/share}/farhelm/`：SQLite 状态与本地连接状态。
 - `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/farhelm-agent.service`：用户服务。
 
 如果 `~/.local/bin` 尚未进入当前 shell 的 `PATH`，安装程序会显示完整命令路径；重新登录后 Ubuntu 通常会自动加入，也可以暂时使用 `~/.local/bin/farhelm-agent`。
@@ -150,17 +154,17 @@ farhelm-agent uninstall --keep-data
 
 ## 从 V0.2.0 迁移
 
-已安装 `V0.3.0` 至 `V0.5.0` 的主机可以直接执行 `farhelm-hub update` 或 `farhelm-agent update`。`V0.2.0` 必须先升级到 `V0.3.0` 完成旧布局迁移，再升级到 V0.7.1。
+已安装 `V0.3.0` 至 `V0.7.1` 的主机可以直接执行 `farhelm-hub update` 或 `farhelm-agent update`。`V0.2.0` 必须先升级到 `V0.3.0` 完成旧布局迁移，再升级到 V0.8.0。
 
-旧小写 `v0.1.0/v0.2.0` 不属于正式升级序列，仍需先使用对应旧卸载器清理，再安装 V0.7.1。
+旧小写 `v0.1.0/v0.2.0` 不属于正式升级序列，仍需先使用对应旧卸载器清理，再安装 V0.8.0。
 
 ## 安全说明
 
 - 下载文件就是程序；首次安装不执行远端动态脚本。
-- V0.3+ updater 只下载版本化资产，并验证固定官方仓库、immutable Release、长度、SHA-256、角色和版本；V0.4 对独立 Codex runtime 使用相同校验。
+- V0.3+ updater 只下载版本化资产，并验证固定官方仓库、immutable Release、长度、SHA-256、角色和版本。
 - 新程序完整写入同一文件系统后才原子替换，服务健康失败自动恢复 previous。
-- 配置、数据库和 Worker runtime 不随二进制覆盖；日志进入 journald。
-- 当前只允许固定类型的实验观察和 Codex session/turn 命令；不能启动/停止训练、传入任意 cwd/argv/env/shell，Codex Worker 只通过 Agent 的本地 stdio 连接真实 SDK。
+- 配置、数据库不随二进制覆盖；日志进入 journald。已有 Python 目录保留供回退使用，但 V0.8 不再调用。
+- 当前只允许固定类型的实验观察和 Codex session/turn 命令；不能启动/停止训练、传入任意 cwd/argv/env/shell，Rust Agent 只通过本地 stdio 连接已安装的 Codex。Agent 主动建立到 `/api/v1/agent/connect` 的出站 WSS，Agent 和 Codex 不接受入站网络连接。上游反向代理需要允许 WebSocket 升级（提供的 Caddy 配置已经支持）。
 
 ## V0.7 数据升级
 
@@ -169,3 +173,11 @@ farhelm-agent uninstall --keep-data
 schema 7 会让 V0.6 及更早程序拒绝打开数据库，因此不能用旧数据库快照覆盖当前执行记录来强行降级。保留当前数据库并使用兼容 schema 7 的修复版；二进制回滚失败时恢复当前程序。恢复旧快照可能重放已执行操作，不属于支持的回滚路径。
 
 V0.7 的页面通知通过现有 SSE 和持久通知中心工作，无需 VAPID 或手机通知权限。已有 Web Push 接口保留兼容；iOS 系统推送不在本版验收范围。
+
+## V0.7.1 → V0.8.0
+
+先更新 Hub，再更新 Agent。数据库保持 schema 7，保留项目、会话、收据、实验和调度身份。新 Agent 通过一个长连接传输读取、命令、收据和事件，不同时进行 HTTP 轮询；旧 Agent 在迁移期间保留 HTTP 兼容链路。
+
+二进制回退始终保留当前数据库和收据。不能恢复旧队列数据库，否则可能重复执行已完成操作。重启中的运行任务标记为 orphaned，需检查结果，不自动重放。V0.8 不会降级用户 Codex；旧 FarHelm 只有在回退验证后才可复用保留的 Python 目录。
+
+在浏览器中检查始终可见的系统导航、会话缓存切换、Markdown、排队发送、中断和完成通知。对话缓存仅在内存中，退出登录时清除；非活动历史最多 20 个或 24 MiB，另保留最多 8 MiB 的 Markdown 解析缓存。本版继续使用页面通知。

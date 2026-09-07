@@ -1,4 +1,4 @@
-# FarHelm V0.7.1 deployment and lifecycle
+# FarHelm V0.8.0 deployment and lifecycle
 
 [简体中文](README.md) · [English](README.en.md)
 
@@ -21,7 +21,7 @@ sudo env \
   ./farhelm-hub install
 ```
 
-V0.5.0 upgrades directly with `update`; SQLite session, pairing, project, and schedule tables are created idempotently on restart. Old TOTP and token fields remain for local rollback, but V0.7.1 does not require TOTP. A backup is still recommended before the first V0.3.0 cross-generation install:
+V0.5.0 upgrades directly with `update`; SQLite session, pairing, project, and schedule tables are created idempotently on restart. Old TOTP and token fields remain for local rollback, but V0.8.0 does not require TOTP. A backup is still recommended before the first V0.3.0 cross-generation install:
 
 ```bash
 sudo cp /var/lib/farhelm/farhelm.db /var/lib/farhelm/farhelm.db.v0.3.bak
@@ -83,14 +83,18 @@ chmod +x farhelm-agent
 ./farhelm-agent install
 ```
 
-Agent downloads the independent Python 3.12/Codex runtime from the matching immutable Release and verifies its length and SHA-256. For an offline installation, transfer the matching runtime asset first and provide trusted verification metadata:
+V0.8 reuses the Codex already installed and authenticated by this user. It downloads neither Python nor Codex and changes no global model or login configuration. Installation discovers an unambiguous executable; multiple candidates require an explicit choice. The initial acceptance version is Codex 0.153.4, with core protocol compatibility checked against 0.147.0.
+
+If an NVM/npm installation works in your terminal but is missing from the service PATH, configure it from that terminal after installing Agent:
 
 ```bash
-FARHELM_CODEX_RUNTIME_ARCHIVE="$PWD/farhelm-codex-runtime-0.7.1-linux-x86_64.tar.gz" \
-FARHELM_CODEX_RUNTIME_SIZE="$(stat -c '%s' farhelm-codex-runtime-0.7.1-linux-x86_64.tar.gz)" \
-FARHELM_CODEX_RUNTIME_SHA256="copy-from-trusted-SHA256SUMS" \
-./farhelm-agent install
+farhelm-agent codex configure --bin "$(command -v codex)"
+farhelm-agent restart
+farhelm-agent status
+farhelm-agent doctor
 ```
+
+The configured absolute path and its sibling interpreter directory are used at startup. `status` distinguishes service activity, the Hub connection, and Codex readiness/version. Missing Codex, login failure, or an initialization failure does not stop experiment reporting. If the installed path moves, run `codex configure` again and restart. Offline installation only requires the verified Agent program and an existing local Codex installation.
 
 First generate an eight-digit code under “Servers → Add server”. The installer asks only for the Hub HTTPS URL and pairing code, then stores its dedicated token automatically. For non-interactive installation:
 
@@ -105,7 +109,7 @@ Agent creates and manages:
 - `${XDG_BIN_HOME:-$HOME/.local/bin}/farhelm-agent`: the actual program.
 - `farhelm-agent.previous` in the same directory: the single rollback backup.
 - `${XDG_CONFIG_HOME:-$HOME/.config}/farhelm/agent.toml`: the only configuration, mode `0600`.
-- `${XDG_DATA_HOME:-$HOME/.local/share}/farhelm/`: SQLite state and private Worker runtime.
+- `${XDG_DATA_HOME:-$HOME/.local/share}/farhelm/`: SQLite state and local connection status.
 - `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/farhelm-agent.service`: user service.
 
 If `~/.local/bin` is not yet in the current shell's `PATH`, installation prints the complete command path. Ubuntu normally adds it after the next login; until then, use `~/.local/bin/farhelm-agent` directly.
@@ -150,17 +154,17 @@ farhelm-agent uninstall --keep-data
 
 ## Migrating from V0.2.0
 
-Hosts already on `V0.3.0` through `V0.5.0` can run `farhelm-hub update` or `farhelm-agent update` directly. `V0.2.0` must first upgrade to `V0.3.0` to migrate the old layout, then upgrade to V0.7.1.
+Hosts already on `V0.3.0` through `V0.7.1` can run `farhelm-hub update` or `farhelm-agent update` directly. `V0.2.0` must first upgrade to `V0.3.0` to migrate the old layout, then upgrade to V0.8.0.
 
-Lowercase legacy `v0.1.0/v0.2.0` releases are outside the formal update sequence. Remove them with their matching old uninstaller before installing V0.7.1.
+Lowercase legacy `v0.1.0/v0.2.0` releases are outside the formal update sequence. Remove them with their matching old uninstaller before installing V0.8.0.
 
 ## Security notes
 
 - The downloaded file is the program; initial installation executes no dynamic remote script.
-- V0.3+ updater only downloads versioned assets and verifies the fixed official repository, immutable Release, length, SHA-256, role, and version; V0.4 applies the same checks to the independent Codex runtime.
+- V0.3+ updater only downloads versioned assets and verifies the fixed official repository, immutable Release, length, SHA-256, role, and version.
 - A new program is fully written on the same filesystem before atomic replacement; failed service health restores previous.
-- Configuration, database, and Worker runtime are not overwritten with the executable; logs go to journald.
-- The current release permits only typed experiment-observation and Codex session/turn commands. It cannot start or stop training or accept arbitrary cwd/argv/env/shell values; the Codex Worker connects to the real SDK only through the Agent's local stdio channel.
+- Configuration and database are not overwritten with the executable; logs go to journald. Existing legacy Python directories remain available for rollback but are never invoked by V0.8.
+- The current release permits only typed experiment-observation and Codex session/turn commands. It cannot start or stop training or accept arbitrary cwd/argv/env/shell values; Rust Agent communicates with the installed Codex through local stdio. The Agent opens an outbound WSS connection to `/api/v1/agent/connect`; neither Agent nor Codex accepts inbound network connections. Ensure an upstream reverse proxy permits WebSocket upgrades (the supplied Caddy configuration already does).
 
 ## V0.7 data migration
 
@@ -169,3 +173,11 @@ Upgrade Hub before Agent. Each role has one schema migration entry point upgradi
 Schema 7 makes V0.6 and older programs refuse the database. Do not overwrite current execution receipts with an old snapshot to force a downgrade. Retain the current database and use a schema-7-compatible repair build; restore the current binary if binary rollback fails. Restoring an old snapshot can replay completed work and is not a supported rollback path.
 
 V0.7 in-page alerts use the existing SSE connection and durable notification center, with no VAPID or phone permission requirement. Existing Web Push APIs remain compatible; iOS system push is outside this release's acceptance scope.
+
+## V0.7.1 → V0.8.0
+
+Update Hub first, then Agent. The database stays at schema 7; project, session, receipt, experiment and schedule identities are preserved. New Agents use one live channel for reads, commands, receipts and events, without concurrent HTTP polling. Older Agents retain their HTTP compatibility path during migration.
+
+A binary rollback retains the current database and receipts. Never restore an older queue database: it could repeat completed operations. Running work becomes orphaned after restart and requires inspection instead of automatic replay. V0.8 does not downgrade your Codex executable; an older FarHelm installation can reuse its retained Python directory only after rollback verification.
+
+In the browser, verify the permanent system navigation, cached session switching, Markdown, queued sends, interrupts and completion alerts. Conversation caches are memory-only and cleared on logout; at most 20 inactive histories or 24 MiB plus up to 8 MiB of parsed Markdown are retained. Page notifications remain the supported notification experience for this release.

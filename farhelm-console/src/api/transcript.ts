@@ -1,23 +1,27 @@
 import type { TranscriptItem, TranscriptTurn } from './features'
-type FragmentItem = TranscriptItem & { parts?: Record<number, string>; completeAt?: number }
+type FragmentItem = TranscriptItem & { parts?: Record<number, string>; completeAt?: number; textEnd?: number }
 const terminal = (status: string) => ['completed', 'failed', 'interrupted', 'orphaned'].includes(status)
+function length(text: string) { let count = 0; for (let index = 0; index < text.length; count++) index += text.codePointAt(index)! > 0xffff ? 2 : 1; return count }
+function suffix(text: string, offset: number) { let index = 0; for (const point of text) { if (offset-- <= 0) break; index += point.length } return text.slice(index) }
 function mergeItem(old: FragmentItem | undefined, incoming: TranscriptItem): FragmentItem {
   if (incoming.streaming && old?.text_complete && !old.streaming) return old
   const offset = incoming.text_offset ?? 0
-  // A bounded first page is a prefix, not a replacement for continuation
-  // fragments already read. Retain them only when the authoritative prefix agrees.
   const matchingPrefix = incoming.text_complete === false && old && !old.streaming && old.text.startsWith(incoming.text)
   const prior = !incoming.streaming && offset === 0 && !matchingPrefix ? undefined : old
-  const parts = { ...(prior?.parts ?? (prior ? { [prior.text_offset ?? 0]: prior.text } : {})), [offset]: incoming.text }
-  let text = ''; let end = 0
-  for (const [start, value] of Object.entries(parts).sort(([a], [b]) => Number(a) - Number(b))) {
-    const position = Number(start)
-    if (position > end) break
-    const suffix = position === end ? value : Array.from(value).slice(end - position).join('')
-    text += suffix; end += Array.from(suffix).length
+  let text = prior?.text ?? ''; let end = prior?.textEnd ?? length(text)
+  const parts = { ...prior?.parts }
+  const append = (position: number, value: string) => {
+    if (position > end) { parts[position] = value; return }
+    const tail = position === end ? value : suffix(value, end - position)
+    text += tail; end += length(tail)
   }
-  const completeAt = incoming.text_complete === true || (!incoming.streaming && incoming.text_complete === undefined) ? offset + Array.from(incoming.text).length : prior?.completeAt
-  return { ...old, ...incoming, text, text_offset: 0, text_complete: completeAt !== undefined && end >= completeAt, completeAt, parts }
+  append(offset, incoming.text)
+  for (const start of Object.keys(parts).map(Number).sort((a, b) => a - b)) {
+    if (start > end) break
+    append(start, parts[start]); delete parts[start]
+  }
+  const completeAt = incoming.text_complete === true || (!incoming.streaming && incoming.text_complete === undefined) ? offset + length(incoming.text) : prior?.completeAt
+  return { ...old, ...incoming, text, text_offset: 0, textEnd: end, text_complete: completeAt !== undefined && end >= completeAt, completeAt, parts }
 }
 export function mergeTurns(current: TranscriptTurn[], incoming: TranscriptTurn[], older = false): TranscriptTurn[] {
   const merged = new Map(current.map((turn) => [turn.turn_id, turn]))
