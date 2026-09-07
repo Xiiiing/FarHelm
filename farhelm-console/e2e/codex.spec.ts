@@ -273,3 +273,23 @@ test('Enter submits identical prompts with independent identities and no command
   }
   expect(new Set(identities).size).toBe(20); expect(statusReads).toBe(0)
 })
+
+test('separated terminal events and receipts reconcile each execution once in either order', async ({ page }, info) => {
+  test.skip(info.project.name !== 'desktop', 'Transport reconciliation runs once')
+  const model = await setup(page)
+  await page.goto('/codex?session=ses-a')
+  await expect(page.locator('.markdown-body strong')).toContainText('完整测量')
+  for (const receiptFirst of [false, true]) {
+    const operation = `dedupe-${receiptFirst}`; const turnId = `turn-${operation}`
+    const before = model.historyReads
+    const terminal = () => emit(page, 'codex.turn.completed', { session_id: 'ses-a', operation_id: operation, data: { turn_id: turnId } })
+    const receipt = () => emit(page, 'command.updated', { command_id: operation, state: 'completed', data: { session_id: 'ses-a', turn_id: turnId } })
+    await (receiptFirst ? receipt() : terminal())
+    await expect.poll(() => model.historyReads).toBe(before + 1)
+    // The second event arrives after the first read, beyond the coalescing window.
+    await (receiptFirst ? terminal() : receipt())
+    await terminal(); await receipt()
+    await page.waitForTimeout(180)
+    expect(model.historyReads).toBe(before + 1)
+  }
+})

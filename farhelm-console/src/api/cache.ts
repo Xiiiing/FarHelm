@@ -69,6 +69,7 @@ function updateSession(payload: Partial<CodexSession> & { update_kind?: string }
 export function connectCodexCache() {
   let opened = false
   const refresh = new Map<string, ReturnType<typeof setTimeout>>()
+  const reconciled = new Set<string>()
   let frame: ReturnType<typeof setTimeout> | undefined
   const deltas = new Map<string, Parameters<typeof mergeDelta>[1][]>()
   const flush = () => {
@@ -81,6 +82,13 @@ export function connectCodexCache() {
   const refreshHistory = (id: string) => {
     if (refresh.has(id)) return
     refresh.set(id, setTimeout(() => { refresh.delete(id); void queryClient.invalidateQueries({ queryKey: keys.history(id), exact: true, refetchType: 'active' }) }, 50))
+  }
+  const reconcileTerminal = (session: string, operation?: string, turn?: string) => {
+    const identities = [...(operation ? [`operation:${operation}`] : []), ...(turn ? [`turn:${session}:${turn}`] : [])]
+    const seen = identities.some((identity) => reconciled.has(identity))
+    for (const identity of identities) reconciled.add(identity)
+    while (reconciled.size > 512) reconciled.delete(reconciled.values().next().value!)
+    if (!seen) refreshHistory(session)
   }
   const off = subscribeEvents(['open', 'codex.stream.resync', 'agent.status', 'project.discovered', 'project.updated', 'command.updated', 'codex.schedule.updated', 'experiment.updated', 'experiment.reported', 'codex.session.updated', 'codex.turn.started', 'codex.turn.completed', 'codex.turn.failed', 'codex.turn.orphaned', 'codex.message.delta'], (event) => {
     if (event.type === 'open' || event.type === 'codex.stream.resync') {
@@ -101,7 +109,7 @@ export function connectCodexCache() {
         if (agent.online) for (const query of queryClient.getQueryCache().findAll({ queryKey: ['codex', 'history'], type: 'active' })) if (query.state.status === 'error') refreshHistory(String(query.queryKey[2]))
       } else if (event.type === 'command.updated' && payload.command_id) {
         cacheOperation(payload.command_id, payload)
-        if (terminal(payload.state) && payload.data?.session_id) refreshHistory(payload.data.session_id)
+        if (terminal(payload.state) && payload.data?.session_id) reconcileTerminal(payload.data.session_id, payload.command_id, payload.data.turn_id)
       } else if (event.type === 'codex.session.updated') {
         updateSession(payload)
         if (payload.session_id && queryClient.getQueryState(keys.history(payload.session_id))?.status === 'error') refreshHistory(payload.session_id)
@@ -117,7 +125,7 @@ export function connectCodexCache() {
           if (payload.operation_id) cacheOperation(payload.operation_id, { command_id: payload.operation_id, state, data: { turn_id: data?.turn_id, session_id: id } })
           if (terminal(state)) {
             queryClient.setQueryData<TranscriptPage>(keys.history(id), (old) => old && ({ ...old, turns: old.turns.map((turn) => turn.turn_id === data?.turn_id ? { ...turn, status: state } : turn) }))
-            refreshHistory(id)
+            reconcileTerminal(id, payload.operation_id, data?.turn_id)
           }
         }
       }
