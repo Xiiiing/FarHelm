@@ -117,7 +117,7 @@ enum CommandKind {
         /// Only report whether an update is available.
         #[arg(long)]
         check: bool,
-        /// Install one exact formal version, such as V0.7.0.
+        /// Install one exact formal version, such as V0.7.1.
         #[arg(long)]
         version: Option<String>,
         /// Permit a user-approved first-number version change.
@@ -654,8 +654,14 @@ async fn discover_projects(database: &Path, python: &str, worker_root: &Path) ->
             .get("updated_at_unix")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or_else(unix_time);
-        store.bind_session(session_id, project_id, &path, "inspect", updated)?;
-        store.enqueue_event(&format!("session-sync:{session_id}:{updated}"),"codex.session.updated",&serde_json::json!({"session_id":session_id,"project_id":project_id,"mode":"inspect","state":if session.get("archived").and_then(serde_json::Value::as_bool).unwrap_or(false){"archived"}else{"idle"},"title":session.get("title"),"active_turn_id":null,"updated_at_unix":updated}),unix_time())?;
+        store.discover_session(
+            session_id,
+            project_id,
+            &path,
+            &session["title"],
+            session["archived"].as_bool().unwrap_or(false),
+            updated,
+        )?;
     }
     Ok(())
 }
@@ -707,10 +713,13 @@ async fn sync_project_sessions(
             .get("updated_at_unix")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or_else(unix_time);
-        store.bind_session(session_id, project_id, project_path, "inspect", updated)?;
-        store.enqueue_event(
-            &format!("session-sync:{session_id}:{updated}"),"codex.session.updated",
-            &serde_json::json!({"session_id":session_id,"project_id":project_id,"mode":"inspect","state":if session.get("archived").and_then(serde_json::Value::as_bool).unwrap_or(false) { "archived" } else { "idle" },"title":session.get("title"),"active_turn_id":null,"updated_at_unix":updated}),unix_time(),
+        store.discover_session(
+            session_id,
+            project_id,
+            project_path,
+            &session["title"],
+            session["archived"].as_bool().unwrap_or(false),
+            updated,
         )?;
     }
     Ok(())
@@ -1099,6 +1108,30 @@ async fn process_read_once(
             request.params,
         )
         .await
+        .and_then(|value| {
+            let page: farhelm_protocol::CodexTranscriptPage = serde_json::from_value(value)?;
+            Ok(serde_json::to_value(page)?)
+        })
+    } else if request.method == "codex.session.display" {
+        let ids: Option<Vec<String>> = request
+            .params
+            .get("session_ids")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?;
+        let project = request
+            .params
+            .get("project_id")
+            .and_then(serde_json::Value::as_str);
+        let bindings = store.display_bindings(project, ids.as_deref())?;
+        let mut params = request.params;
+        params["bindings"] = bindings;
+        params["agent_id"] = serde_json::json!(hub.agent_id);
+        tokio::time::timeout(
+            Duration::from_secs(18),
+            worker_call_once(&worker.python, &worker.root, &request.method, params),
+        )
+        .await
+        .context("display read timed out")?
     } else if request.method == "codex.schedule.detail" {
         let id = request
             .params
@@ -1309,6 +1342,7 @@ async fn execute_remote_command(
     let (state, data, detail) = match outcome {
         Ok(data) => (CommandState::Completed, Some(data), None),
         Err(error) => {
+            warn!(command_id = %command.command_id, %error, "local Codex operation failed");
             let event_type = if error.downcast_ref::<WorkerTurnOrphaned>().is_some() {
                 "codex.turn.orphaned"
             } else {
@@ -1321,6 +1355,20 @@ async fn execute_remote_command(
             } else {
                 "failed"
             };
+            if command.action == CommandAction::CodexTurnStart
+                && let Some(session) = command
+                    .payload
+                    .get("session_id")
+                    .and_then(serde_json::Value::as_str)
+                && let Some(binding) = store.session_binding(session)?
+            {
+                store.enqueue_event(
+                    &format!("{}:session-failed", command.command_id),
+                    "codex.session.updated",
+                    &serde_json::json!({"session_id":session,"project_id":binding.project_id,"mode":binding.mode,"state":status,"title":null,"active_turn_id":null,"updated_at_unix":unix_time()}),
+                    unix_time(),
+                )?;
+            }
             (
                 CommandState::Failed,
                 Some(serde_json::json!({"status":status})),

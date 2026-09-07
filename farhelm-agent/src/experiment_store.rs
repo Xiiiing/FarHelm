@@ -720,6 +720,69 @@ impl ExperimentStore {
         Ok(())
     }
 
+    pub fn discover_session(
+        &self,
+        session_id: &str,
+        project_id: &str,
+        cwd: &Path,
+        title: &Value,
+        archived: bool,
+        updated: u64,
+    ) -> Result<()> {
+        let connection = self.lock()?;
+        let transaction = crate::migrations::write_transaction(&connection)?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO codex_session_bindings (session_id,project_id,cwd,mode,updated_at_unix) VALUES (?1,?2,?3,'inspect',?4)",
+            params![session_id,project_id,cwd.to_string_lossy(),as_i64(updated)?],
+        )?;
+        let (bound_project, mode): (String, String) = transaction.query_row(
+            "SELECT project_id,mode FROM codex_session_bindings WHERE session_id=?1",
+            [session_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        ensure!(
+            bound_project == project_id,
+            "discovered session project changed"
+        );
+        let payload = json!({"session_id":session_id,"project_id":project_id,"mode":mode,
+            "update_kind":"metadata","state":if archived {"archived"}else{"idle"},
+            "title":title,"updated_at_unix":updated});
+        let fingerprint = Sha256::digest(serde_json::to_vec(&payload)?)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        insert_event(
+            &transaction,
+            &format!("session-index:{session_id}:{fingerprint}"),
+            "codex.session.updated",
+            &payload,
+            updated,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn display_bindings(&self, project: Option<&str>, ids: Option<&[String]>) -> Result<Value> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT b.session_id,b.project_id,b.cwd FROM codex_session_bindings b JOIN approved_projects p ON p.project_id=b.project_id WHERE (?1 IS NULL OR b.project_id=?1)")?;
+        let rows = statement.query_map([project], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut bindings = serde_json::Map::new();
+        for row in rows {
+            let (id, project_id, cwd) = row?;
+            if ids.is_none_or(|ids| ids.contains(&id)) {
+                bindings.insert(id, json!({"project_id":project_id,"cwd":cwd}));
+            }
+        }
+        Ok(Value::Object(bindings))
+    }
+
     pub fn link_watch_session(&self, watch_id: &str, session_id: &str, now: u64) -> Result<bool> {
         let connection = self.lock()?;
         let transaction = crate::migrations::write_transaction(&connection)?;
@@ -1642,6 +1705,30 @@ mod tests {
         store
             .bind_session("session-a", "project-a", &cwd, "edit", 10)
             .unwrap();
+        store
+            .discover_session(
+                "session-a",
+                "project-a",
+                &directory.path().join("project"),
+                &Value::Null,
+                false,
+                11,
+            )
+            .unwrap();
+        store
+            .discover_session(
+                "session-a",
+                "project-a",
+                &directory.path().join("project"),
+                &Value::Null,
+                false,
+                11,
+            )
+            .unwrap();
+        let events = store.pending_events("agent-a", 100).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["mode"], "edit");
+        assert_eq!(events[0].payload["update_kind"], "metadata");
         drop(store);
         let binding = ExperimentStore::open(&database)
             .unwrap()

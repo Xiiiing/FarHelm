@@ -429,6 +429,18 @@ impl EventStore {
         })
     }
 
+    pub fn session_agents(
+        &self,
+        agent: Option<&str>,
+        project: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare("SELECT DISTINCT agent_id FROM codex_sessions WHERE (?1 IS NULL OR agent_id=?1) AND (?2 IS NULL OR project_id=?2) ORDER BY agent_id")?;
+        Ok(statement
+            .query_map(params![agent, project], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn session(&self, session_id: &str) -> Result<Option<CodexSessionSummary>> {
         use rusqlite::OptionalExtension;
         self.lock()?.query_row(
@@ -655,13 +667,36 @@ fn apply_materialized_view(
             }
             let session: CodexSessionSummary =
                 serde_json::from_value(value).context("invalid Codex session event")?;
+            let metadata =
+                event.payload.get("update_kind").and_then(Value::as_str) == Some("metadata");
+            let dimension = if metadata { "metadata" } else { "execution" };
+            let revision_key = format!("session:{agent_id}:{}:{dimension}", session.session_id);
+            if connection.execute("INSERT INTO projection_revisions VALUES(?1,?2) ON CONFLICT(entity_id) DO UPDATE SET revision=excluded.revision WHERE excluded.revision>projection_revisions.revision", params![revision_key,as_i64(event.sequence)?])? == 0 {
+                return Ok(());
+            }
+            let title = session
+                .title
+                .filter(|title| farhelm_protocol::valid_session_title(title));
             connection.execute(
                 "INSERT INTO codex_sessions (session_id,agent_id,project_id,mode,state,title,active_turn_id,updated_at_unix)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
-                 ON CONFLICT(session_id) DO UPDATE SET state=excluded.state,title=excluded.title,active_turn_id=excluded.active_turn_id,updated_at_unix=excluded.updated_at_unix
-                 WHERE excluded.updated_at_unix>=codex_sessions.updated_at_unix",
-                params![session.session_id,agent_id,session.project_id,mode_name(session.mode),session_state_name(session.state),session.title,session.active_turn_id,as_i64(session.updated_at_unix)?],
+                 ON CONFLICT(session_id) DO UPDATE SET
+                 mode=CASE WHEN ?9 THEN codex_sessions.mode ELSE excluded.mode END,
+                 state=CASE WHEN NOT ?9 THEN excluded.state
+                   WHEN codex_sessions.state IN ('creating','queued','running','interrupting') THEN codex_sessions.state
+                   WHEN excluded.state='archived' THEN 'archived'
+                   WHEN codex_sessions.state='archived' THEN 'idle' ELSE codex_sessions.state END,
+                 active_turn_id=CASE WHEN ?9 THEN codex_sessions.active_turn_id ELSE excluded.active_turn_id END,
+                 updated_at_unix=MAX(codex_sessions.updated_at_unix,excluded.updated_at_unix)
+                 WHERE codex_sessions.agent_id=excluded.agent_id",
+                params![session.session_id,agent_id,session.project_id,mode_name(session.mode),session_state_name(session.state),title,session.active_turn_id,as_i64(session.updated_at_unix)?,metadata],
             )?;
+            if let Some(title) = title {
+                let key = format!("session:{agent_id}:{}:title", session.session_id);
+                if connection.execute("INSERT INTO projection_revisions VALUES(?1,?2) ON CONFLICT(entity_id) DO UPDATE SET revision=excluded.revision WHERE excluded.revision>projection_revisions.revision", params![key,as_i64(event.sequence)?])? > 0 {
+                    connection.execute("UPDATE codex_sessions SET title=?1 WHERE session_id=?2 AND agent_id=?3", params![title, session.session_id,agent_id])?;
+                }
+            }
         }
         "codex.schedule.updated" => {
             let id = format!(

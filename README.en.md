@@ -4,14 +4,14 @@
   <p><strong>A remote control plane for personal research and GPU training environments</strong></p>
   <p>See training-host status from your phone and safely extend remote control without exposing inbound ports on training machines.</p>
   <p>
-    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.7.0">V0.7.0</a> ·
+    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.7.1">V0.7.1</a> ·
     <a href="./deploy/README.en.md">Deployment guide</a> ·
     <a href="./README.md">简体中文</a>
   </p>
 </div>
 
 > [!IMPORTANT]
-> `V0.7.0` adds training-script reports, a unified notification center, and in-page alerts, with improved Codex queues, large-message continuation, and restart recovery. The Agent persists Codex content; Hub only relays it temporarily. Training continues to run locally.
+> `V0.7.1` fixes the Codex workspace: global navigation stays visible, projects, sessions, and execution details have clear hierarchy, and Markdown, math, session labels, and search across all imported sessions render correctly. It also fixes composer placement, streamed message identity, and session-switch races. The Agent persists Codex content; Hub only relays it temporarily.
 
 ## Quick install
 
@@ -113,6 +113,14 @@ The [Bash example](examples/experiment-report.sh) and [Python example](examples/
 The notification center provides pagination, type/Agent/result filters, synchronized unread state, and details. Settings include system/light/dark themes, experiment/Codex in-page alert switches, and a browser test notification. Keep FarHelm open to receive completion alerts and click through to details. Initial loading and reconnect history do not trigger a burst of old alerts. This release covers browser in-page notifications; iOS system notifications are planned for a later version.
 
 Browser commands and schedules are acknowledged after Agent persistence. Failed submissions retain the current-page draft and operation identity for retries. On restart, saved terminal receipts reconcile completed work; running tasks without a terminal receipt become orphaned and are not replayed. Upgrade Hub before Agent; the new content relay requires the Agent's V0.7 capability.
+
+## Codex workspace
+
+Desktop global navigation and mobile bottom navigation remain visible in Codex. Project groups collapse, and sessions use formal names or a temporary first-user-message summary. Search covers all imported sessions in the selected scope; offline Agents are clearly marked as incomplete results. Summaries and search results never enter Hub databases, logs, or notification titles.
+
+Assistant replies support Markdown tables, code copying, math, and safe HTTPS links. Consecutive execution details in a turn form a collapsed group with visible failures. The composer stays visible, and reading older content does not jump to the bottom on new messages. Large-message continuation is separate from loading earlier conversations. Each session retains its draft; steer and interrupt target the visible active turn.
+
+Upgrade Hub before Agent when moving from V0.7.0. SQLite schema stays at 7. Temporary labels and search require a V0.7.1 Agent; older Agents show an upgrade prompt.
 
 ## What is implemented
 

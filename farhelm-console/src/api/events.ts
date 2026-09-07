@@ -8,12 +8,10 @@ export function subscribeEvents(names: string[], listener: Listener): () => void
   for (const name of names) {
     if (!listeners.has(name)) {
       listeners.set(name, new Set())
-      let queued: ReturnType<typeof setTimeout> | undefined
-      let latest: Event
       const dispatch: EventListener = (event) => {
-        if (name === 'codex.message.delta' || name === 'open') { listeners.get(name)?.forEach((fn) => fn(event as MessageEvent<string>)); return }
-        latest = event
-        queued ??= setTimeout(() => { queued = undefined; listeners.get(name)?.forEach((fn) => fn(latest as MessageEvent<string>)) }, 150)
+        // Preserve every identity and event order. Consumers coalesce their own
+        // refreshes; dropping all but the last event loses other sessions' turns.
+        listeners.get(name)?.forEach((fn) => fn(event as MessageEvent<string>))
       }
       dispatchers.set(name, dispatch)
       stream.addEventListener(name, dispatch)

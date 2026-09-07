@@ -53,7 +53,7 @@ async fn write(
     .await;
     if result.is_ok() {
         state.push_notify.notify_one();
-        let _ = state.transient_bus.send(StoredEvent {
+        let _ = state.event_bus.send(StoredEvent {
             sequence: 0,
             event_id: random_token(),
             event_type: "notification.changed".to_owned(),
