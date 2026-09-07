@@ -1,15 +1,17 @@
 import { Alert, Button, Drawer, Form, Input, List, Modal, Radio, Segmented, Select, Tag } from 'antd'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { cancelSchedule, createSchedule, createSession, fetchExperiments, fetchSchedules, waitForCommand, type CodexSchedule, type CodexSession, type Experiment, type ProjectCandidate } from '../../api/features'
 import { subscribeEvents } from '../../api/events'
 import { errorText, sessionName, stateNames } from './presentation'
 
-export function CreateDialog({ csrf, projects, onClose, onCreated }: { csrf: string; projects: ProjectCandidate[]; onClose: () => void; onCreated: () => void }) {
+export function CreateDialog({ csrf, projects, onClose, onCreated }: { csrf: string; projects: ProjectCandidate[]; onClose: () => void; onCreated: (sessionId?: string) => void }) {
   const [error, setError] = useState<string>(); const [busy, setBusy] = useState(false)
+  const active = useRef(true)
+  useEffect(() => { active.current = true; return () => { active.current = false } }, [])
   return <Modal title="创建 Codex 会话" open onCancel={onClose} footer={null}><Form layout="vertical" onFinish={async (values: { project: string; mode: 'inspect' | 'edit' }) => {
     const project = projects.find((p) => p.candidate_id === values.project && p.state === 'approved'); if (!project || busy) return
     setBusy(true); setError(undefined)
-    try { await waitForCommand(await createSession(csrf, project.agent_id, project.suggested_project_id, values.mode)); onCreated(); onClose() } catch (e) { setError(errorText(e)) } finally { setBusy(false) }
+    try { const result = await waitForCommand(await createSession(csrf, project.agent_id, project.suggested_project_id, values.mode)); if (active.current) { onCreated(result.data?.session_id ?? result.result?.session_id); onClose() } } catch (e) { if (active.current) setError(errorText(e)) } finally { if (active.current) setBusy(false) }
   }}>{error && <Alert type="error" showIcon title={error} />}<Form.Item label="项目" name="project" rules={[{ required: true }]}><Select options={projects.filter((p) => p.state === 'approved').map((p) => ({ value: p.candidate_id, label: `${p.display_name} · ${p.agent_id}` }))} /></Form.Item><Form.Item label="模式" name="mode" initialValue="inspect"><Radio.Group><Radio value="inspect">只读</Radio><Radio value="edit">编辑（隔离工作区）</Radio></Radio.Group></Form.Item><Button type="primary" htmlType="submit" loading={busy} block>创建</Button></Form></Modal>
 }
 

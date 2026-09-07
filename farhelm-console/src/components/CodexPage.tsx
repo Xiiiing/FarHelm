@@ -54,7 +54,7 @@ export function CodexPage({ csrf }: { csrf: string }) {
   </aside>
   return <main className={`codex-workspace ${collapsed ? 'rail-collapsed' : ''}`}><div className="codex-desktop-rail">{rail}</div><Drawer className="codex-mobile-drawer" placement="left" open={railOpen} onClose={() => setRailOpen(false)} size={Math.min(320, window.innerWidth - 24)} closable={false}>{rail}</Drawer>
     <Conversation key={id ?? 'empty'} csrf={csrf} id={id} session={sessions.rows.find((s) => s.session_id === id)} draft={operations.get(id ?? '')} onDraft={(change) => { if (id) operations.update(id, change) }} onSend={(turn) => { if (id) void operations.send(id, turn) }} onRail={() => setRailOpen(true)} onCollapse={() => setCollapsed((old) => !old)} collapsed={collapsed} onSchedule={setSchedule} onSchedules={setSchedules} />
-    {creating && <CreateDialog csrf={csrf} projects={projects} onClose={() => setCreating(false)} onCreated={() => void sessions.refresh()} />}
+    {creating && <CreateDialog csrf={csrf} projects={projects} onClose={() => setCreating(false)} onCreated={(sessionId) => { if (sessionId) select(sessionId); void sessions.refresh() }} />}
     {schedule && <ScheduleDialog csrf={csrf} target={schedule} prompt={operations.get(schedule.session_id).text} onClose={() => setSchedule(undefined)} />}
     {schedules && <SchedulesDrawer csrf={csrf} target={schedules} onClose={() => setSchedules(undefined)} />}
   </main>

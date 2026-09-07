@@ -116,6 +116,25 @@ test('history recovers when Agent heartbeat follows Hub restart', async ({ page 
   expect(model.historyReads).toBeLessThanOrEqual(4)
 })
 
+for (const cancelled of [false, true]) test(`created session follows its receipt; dialog cancelled=${cancelled}`, async ({ page }) => {
+  const model = await setup(page); let ready = false; let reads = 0; let completed = false
+  await page.route('**/projects', (route) => route.fulfill({ json: { protocol: 'farhelm/1', projects: [{ candidate_id: 'project-a', agent_id: 'gpu-a', suggested_project_id: 'cc08', display_name: '训练项目', state: 'approved' }] } }))
+  await page.route('**/codex/sessions', (route) => route.request().method() === 'POST' ? route.fulfill({ json: { command_id: 'create-receipt', state: 'accepted' } }) : route.fallback())
+  await page.route('**/commands/create-receipt', (route) => { reads++; completed ||= ready; return route.fulfill({ json: { command_id: 'create-receipt', state: ready ? 'completed' : 'running', data: ready ? { session_id: 'ses-created' } : undefined } }) })
+  await page.route('**/ses-created/transcript?*', (route) => route.fulfill({ json: { session_id: 'ses-created', turns: [] } }))
+  await page.goto('/codex?session=ses-a'); await expect(page.locator('.conversation-title')).toContainText('训练结果分析')
+  await page.getByLabel('给 Codex 发送指令').fill('原会话草稿')
+  if (await page.getByRole('button', { name: '打开会话列表' }).isVisible()) await page.getByRole('button', { name: '打开会话列表' }).click()
+  await page.getByRole('button', { name: '新建会话' }).filter({ visible: true }).click()
+  await page.getByLabel('项目', { exact: true }).click(); await page.getByLabel('项目', { exact: true }).press('Enter')
+  await page.getByRole('button', { name: /创\s*建/, exact: true }).click(); await expect.poll(() => reads).toBeGreaterThan(0)
+  if (cancelled) { await page.keyboard.press('Escape'); await expect(page.getByRole('dialog', { name: '创建 Codex 会话' })).toBeHidden() }
+  model.sessions.push({ ...session('ses-created'), title: '新建验收会话' }); ready = true
+  await expect.poll(() => completed).toBe(true)
+  if (cancelled) { await expect(page).toHaveURL(/session=ses-a/); await expect(page.getByLabel('给 Codex 发送指令')).toHaveValue('原会话草稿') }
+  else { await expect(page).toHaveURL(/session=ses-created/); await expect(page.locator('.conversation-title')).toContainText('新建验收会话'); await expect(page.getByLabel('给 Codex 发送指令')).toHaveValue('') }
+})
+
 test('failed send belongs to its original session while switching', async ({ page }) => {
   await setup(page); let release: () => void = () => {}; const gate = new Promise<void>((r) => { release = r })
   await page.route('**/ses-a/messages', async (route) => { await gate; await route.fulfill({ status: 504, json: { error: 'agent_save_unconfirmed' } }) })

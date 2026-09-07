@@ -86,12 +86,12 @@ export async function mutate(url: string, csrf: string, body?: unknown, method =
   if (result.command_id) { savedReceipts.set(result.command_id, { identity, key }); if (savedReceipts.size > 256) savedReceipts.delete(savedReceipts.keys().next().value!) }
   return result
 }
-export async function waitForCommand(operation: Operation): Promise<void> {
-  if (!operation.command_id) return
+export async function waitForCommand(operation: Operation): Promise<Operation> {
+  if (!operation.command_id) return operation
   try {
     for (let count = 0; count < 60; count++) {
-      const status = await json<{ state: string; detail?: string }>(`/api/v1/commands/${encodeURIComponent(operation.command_id)}`)
-      if (status.state === 'completed') { savedReceipts.delete(operation.command_id); return }
+      const status = await json<Operation & { state: string; detail?: string }>(`/api/v1/commands/${encodeURIComponent(operation.command_id)}`)
+      if (status.state === 'completed') { savedReceipts.delete(operation.command_id); return status }
       if (['failed', 'expired', 'unknown'].includes(status.state)) throw new Error(status.detail || `操作结果：${status.state}`)
       await new Promise((resolve) => setTimeout(resolve, 500))
     }
