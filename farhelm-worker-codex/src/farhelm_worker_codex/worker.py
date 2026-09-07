@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import shlex
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -10,6 +9,9 @@ from time import monotonic
 from typing import Any, Protocol, cast
 
 from farhelm_worker_codex import __version__
+from farhelm_worker_codex.display import display_page, formal_title
+from farhelm_worker_codex.text import StreamText
+from farhelm_worker_codex.text import redact_paths as _redact_paths
 
 WORKER_PROTOCOL = "farhelm-worker/1"
 WORKER_NAME = "farhelm-worker-codex"
@@ -21,6 +23,7 @@ CAPABILITIES = [
     "codex.session.start",
     "codex.session.resume",
     "codex.session.history",
+    "codex.session.display",
     "codex.turn.start",
     "codex.turn.steer",
     "codex.turn.interrupt",
@@ -29,6 +32,7 @@ Emit = Callable[[Mapping[str, Any]], None]
 
 
 class Backend(Protocol):
+    def session_display(self, params: Mapping[str, Any]) -> Mapping[str, Any]: ...
     def projects_discover(self) -> Mapping[str, Any]: ...
     def sessions_list(self, project_path: str, archived: str) -> Mapping[str, Any]: ...
     def session_start(self, cwd: str, mode: str) -> Mapping[str, Any]: ...
@@ -60,7 +64,7 @@ class CodexBackend:
     def _threads(self, *, archived: bool, cwd: str | None = None) -> list[Any]:
         threads: list[Any] = []
         cursor: str | None = None
-        for _ in range(100):
+        while True:
             request: dict[str, Any] = {"archived": archived, "limit": 100}
             if cwd is not None:
                 request["cwd"] = cwd
@@ -74,6 +78,18 @@ class CodexBackend:
             cursor = next_cursor
         return threads
 
+    def session_display(self, params: Mapping[str, Any]) -> Mapping[str, Any]:
+        archive = params.get("archived", "false")
+        values = (False, True) if archive == "all" else (archive == "true",)
+        return display_page(
+            (
+                (thread, archived)
+                for archived in values
+                for thread in self._threads(archived=archived)
+            ),
+            params,
+        )
+
     def projects_discover(self) -> Mapping[str, Any]:
         projects: dict[str, dict[str, Any]] = {}
         sessions: list[dict[str, Any]] = []
@@ -83,7 +99,7 @@ class CodexBackend:
                 sessions.append(
                     {
                         "session_id": thread.id,
-                        "title": thread.name or "Codex session",
+                        "title": formal_title(thread.name),
                         "cwd": cwd,
                         "archived": archived,
                         "updated_at_unix": thread.updated_at,
@@ -126,7 +142,7 @@ class CodexBackend:
                 sessions.append(
                     {
                         "session_id": thread.id,
-                        "title": thread.name or "Codex session",
+                        "title": formal_title(thread.name),
                         "cwd": thread_cwd,
                         "archived": is_archived,
                         "created_at_unix": thread.created_at,
@@ -139,6 +155,12 @@ class CodexBackend:
     def session_start(self, cwd: str, mode: str) -> Mapping[str, Any]:
         response = self._client.thread_start(
             {"cwd": cwd, "sandbox": _sandbox(mode), "approvalPolicy": "on-request"}
+        )
+        # Empty threads must survive this short-lived Worker. The native name
+        # operation persists their metadata without inventing a conversation turn.
+        # Our display projection treats this placeholder as a missing name.
+        self._client.thread_set_name(
+            response.thread.id, formal_title(response.thread.name) or "Codex session"
         )
         return _thread_result(response.thread)
 
@@ -182,32 +204,44 @@ class CodexBackend:
         )
         turn_id = started.turn.id
         emit(_event("codex.turn.started", {"session_id": session_id, "turn_id": turn_id}))
-        delta_buffer = ""
+        buffers: dict[str, StreamText] = {}
+        pending: dict[str, str] = {}
         last_flush = monotonic()
+
+        def flush(*, final: bool = False) -> None:
+            for item_id, buffer in buffers.items():
+                offset, text = buffer.feed(pending.pop(item_id, ""), final=final)
+                if text:
+                    emit(
+                        _event(
+                            "codex.message.delta",
+                            {
+                                "session_id": session_id,
+                                "turn_id": turn_id,
+                                "item_id": item_id,
+                                "text_offset": offset,
+                                "delta": text,
+                            },
+                        )
+                    )
+
         while True:
             notification = self._client.next_turn_notification(turn_id)
             data = _model_json(notification.payload)
             if notification.method == "item/agentMessage/delta":
                 delta = data.get("delta")
-                if isinstance(delta, str):
-                    delta_buffer += delta
-                if len(delta_buffer.encode("utf-8")) >= 4096 or monotonic() - last_flush >= 0.1:
-                    emit(
-                        _event(
-                            "codex.message.delta",
-                            {"session_id": session_id, "turn_id": turn_id, "delta": delta_buffer},
-                        )
-                    )
-                    delta_buffer = ""
+                item_id = data.get("itemId", data.get("item_id"))
+                if isinstance(delta, str) and isinstance(item_id, str) and item_id:
+                    buffers.setdefault(item_id, StreamText())
+                    pending[item_id] = pending.get(item_id, "") + delta
+                if (
+                    sum(len(value.encode("utf-8")) for value in pending.values()) >= 4096
+                    or monotonic() - last_flush >= 0.1
+                ):
+                    flush()
                     last_flush = monotonic()
             elif notification.method == "turn/completed":
-                if delta_buffer:
-                    emit(
-                        _event(
-                            "codex.message.delta",
-                            {"session_id": session_id, "turn_id": turn_id, "delta": delta_buffer},
-                        )
-                    )
+                flush(final=True)
                 completed_turn = data.get("turn")
                 status = (
                     completed_turn.get("status", "completed")
@@ -261,21 +295,15 @@ def _summary(value: Any, limit: int = 2048) -> str:
     return encoded[: max(0, limit - 3)].decode("utf-8", errors="ignore") + "…"
 
 
-def _redact_paths(text: str) -> str:
-    # Most prose has no path; avoid a per-character regex scan of every complete message.
-    if "/" not in text:
-        return text
-    return re.sub(r"/(?<!\w/)[^\s'\"]+", "[local path]", text)
-
-
 def _normalise_turn(value: Mapping[str, Any]) -> Mapping[str, Any]:
-    items: list[dict[str, str]] = []
+    items: list[dict[str, Any]] = []
     for index, item in enumerate(value.get("items", [])):
         if not isinstance(item, Mapping):
             continue
         item_type = item.get("type")
         text = ""
         kind = ""
+        metadata: dict[str, Any] = {}
         if item_type == "userMessage":
             kind = "user_message"
             text = "\n".join(
@@ -289,8 +317,15 @@ def _normalise_turn(value: Mapping[str, Any]) -> Mapping[str, Any]:
             kind, text = "assistant_message", str(item.get("text", ""))
         elif item_type == "commandExecution":
             kind = "command_summary"
+            if item.get("status") in {"completed", "failed", "inProgress", "declined"}:
+                metadata["status"] = item["status"]
             exit_code = item.get("exitCode")
             duration = item.get("durationMs")
+            if type(exit_code) is int:
+                metadata["exit_code"] = exit_code
+                metadata["status"] = "completed" if exit_code == 0 else "failed"
+            if isinstance(duration, (float, int)) and duration >= 0:
+                metadata["duration_ms"] = int(duration)
             suffix = " · ".join(
                 part
                 for part in (
@@ -306,6 +341,8 @@ def _normalise_turn(value: Mapping[str, Any]) -> Mapping[str, Any]:
             text = f"{executable} …" + (f" · {suffix}" if suffix else "")
         elif item_type == "fileChange":
             kind = "file_change_summary"
+            if item.get("status") in {"completed", "failed", "inProgress", "declined"}:
+                metadata["status"] = item["status"]
             changes = item.get("changes", [])
             text = "\n".join(
                 f"{change.get('kind', 'update')}: {Path(str(change.get('path', 'file'))).name}"
@@ -315,6 +352,7 @@ def _normalise_turn(value: Mapping[str, Any]) -> Mapping[str, Any]:
         if kind and text:
             items.append(
                 {
+                    **metadata,
                     "item_id": str(item.get("id") or f"item-{index}"),
                     "kind": kind,
                     "text": _summary(text)
@@ -346,7 +384,7 @@ def _thread_result(thread: Any) -> Mapping[str, Any]:
     return {
         "session_id": str(thread.id),
         "cwd": _absolute_path(thread.cwd),
-        "title": thread.name or "Codex session",
+        "title": formal_title(thread.name),
         "updated_at_unix": int(thread.updated_at),
     }
 
@@ -457,6 +495,8 @@ def handle_request(
 def _dispatch(
     method: str, params: Mapping[str, Any], backend: Backend, emit: Emit
 ) -> Mapping[str, Any]:
+    if method == "codex.session.display":
+        return backend.session_display(params)
     if method == "codex.sessions.list":
         archived = str(params.get("archived", "false"))
         if archived not in {"false", "true", "all"}:

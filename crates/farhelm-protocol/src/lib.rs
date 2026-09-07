@@ -53,7 +53,11 @@ impl AgentHeartbeat {
         agent_version: impl Into<String>,
     ) -> Self {
         Self {
-            capabilities: vec!["codex.ephemeral_submit".to_owned()],
+            capabilities: vec![
+                "codex.ephemeral_submit".to_owned(),
+                "codex.session_display".to_owned(),
+                "codex.item_offsets".to_owned(),
+            ],
             protocol: FARHELM_PROTOCOL.to_owned(),
             agent_id: agent_id.into(),
             hostname: hostname.into(),
@@ -283,6 +287,25 @@ pub struct CodexSessionListResponse {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionDisplayRequest {
+    pub mode: String,
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+    pub query: Option<String>,
+    pub agent_id: Option<String>,
+    pub project_id: Option<String>,
+    #[serde(default = "display_archive_filter")]
+    pub archived: String,
+    pub cursor: Option<String>,
+    pub limit: Option<usize>,
+}
+
+fn display_archive_filter() -> String {
+    "false".into()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CodexTranscriptItemKind {
@@ -298,6 +321,16 @@ pub struct CodexTranscriptItem {
     pub item_id: String,
     pub kind: CodexTranscriptItemKind,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_complete: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -313,11 +346,22 @@ pub struct CodexTranscriptTurn {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodexTranscriptPage {
+    #[serde(default)]
     pub protocol: String,
     pub session_id: String,
     pub turns: Vec<CodexTranscriptTurn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<TranscriptContinuation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptContinuation {
+    pub kind: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub text_offset: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -487,6 +531,8 @@ pub enum PromptDelivery {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendCodexMessageRequest {
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
     #[serde(default = "default_prompt_delivery")]
     pub delivery: PromptDelivery,
 }
@@ -626,6 +672,19 @@ where
 
 /// Only this metadata crosses into durable Hub events. Transcript content uses the read relay.
 #[must_use]
+pub fn valid_session_title(title: &str) -> bool {
+    !matches!(
+        title.trim().to_lowercase().as_str(),
+        "" | "codex session"
+            | "untitled"
+            | "new conversation"
+            | "new chat"
+            | "未命名会话"
+            | "新会话"
+    )
+}
+
+#[must_use]
 pub fn public_event_payload(event_type: &str, payload: &serde_json::Value) -> serde_json::Value {
     use serde_json::{Map, Value};
     let keys: &[&str] = match event_type {
@@ -651,6 +710,7 @@ pub fn public_event_payload(event_type: &str, payload: &serde_json::Value) -> se
             "updated_at_unix",
         ],
         "codex.session.updated" => &[
+            "update_kind",
             "session_id",
             "project_id",
             "mode",
@@ -726,6 +786,11 @@ pub fn public_event_payload(event_type: &str, payload: &serde_json::Value) -> se
         {
             safe.insert("delta".to_owned(), delta.clone());
         }
+        if event_type == "codex.message.delta"
+            && let Some(offset) = data.get("text_offset").and_then(Value::as_u64)
+        {
+            safe.insert("text_offset".to_owned(), Value::from(offset));
+        }
         result.insert("data".to_owned(), Value::Object(safe));
     }
     Value::Object(result)
@@ -734,6 +799,27 @@ pub fn public_event_payload(event_type: &str, payload: &serde_json::Value) -> se
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_and_extended_history_contract_keep_content_out_of_event_fields() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/session-display.json")).unwrap();
+        let request: SessionDisplayRequest = serde_json::from_value(fixture.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), fixture);
+        let page: CodexTranscriptPage = serde_json::from_value(serde_json::json!({"session_id":"s","turns":[{"turn_id":"t","status":"completed","cwd":"private","items":[{"item_id":"i","kind":"assistant_message","text":"完整🙂","text_offset":7,"text_complete":false,"raw_output":"private"}]}],"continuation":{"kind":"message","turn_id":"t","item_id":"i","text_offset":10}})).unwrap();
+        let safe = serde_json::to_value(page).unwrap();
+        assert!(safe["turns"][0].get("cwd").is_none());
+        assert!(safe["turns"][0]["items"][0].get("raw_output").is_none());
+        assert_eq!(safe["turns"][0]["items"][0]["text_offset"], 7);
+        let delta = public_event_payload(
+            "codex.message.delta",
+            &serde_json::json!({"session_id":"s","data":{"turn_id":"t","item_id":"i","text_offset":7,"delta":"完整🙂","cwd":"private"}}),
+        );
+        assert_eq!(delta["data"]["text_offset"], 7);
+        assert!(delta["data"].get("cwd").is_none());
+        let terminal = public_event_payload("codex.turn.completed", &delta);
+        assert!(terminal["data"].get("delta").is_none());
+    }
 
     #[test]
     fn health_shape_is_stable() {
@@ -760,7 +846,7 @@ mod tests {
                 "agent_id": "gpu-a",
                 "hostname": "trainer-a",
                 "agent_version": "0.1.0",
-                "capabilities": ["codex.ephemeral_submit"]
+                "capabilities": ["codex.ephemeral_submit", "codex.session_display", "codex.item_offsets"]
             })
         );
     }

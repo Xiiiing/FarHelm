@@ -90,5 +90,11 @@ def bounded_page(
             page["next_cursor"] = PREFIX + base64.urlsafe_b64encode(
                 json.dumps(value, separators=(",", ":")).encode()
             ).decode().rstrip("=")
+            page["continuation"] = {
+                "kind": "message" if offset + low > 0 else "history",
+                "turn_id": turn["turn_id"],
+                "item_id": item["item_id"],
+                "text_offset": offset + low,
+            }
             return page
     return page

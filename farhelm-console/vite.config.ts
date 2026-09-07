@@ -1,8 +1,20 @@
 import react from '@vitejs/plugin-react'
+import { createRequire } from 'node:module'
 import { VitePWA } from 'vite-plugin-pwa'
 import { defineConfig } from 'vitest/config'
 
+const require = createRequire(import.meta.url)
+
 export default defineConfig({
+  worker: {
+    plugins: () => [{
+      name: 'farhelm-worker-parsers',
+      enforce: 'pre',
+      // Browser exports use document/DOMParser. Default exports provide a static
+      // entity table and parse5, so Markdown and KaTeX can run without a DOM.
+      resolveId(source) { if (['decode-named-character-reference', 'hast-util-from-html-isomorphic'].includes(source)) return require.resolve(source) },
+    }],
+  },
   plugins: [
     react(),
     VitePWA({

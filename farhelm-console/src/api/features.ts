@@ -3,10 +3,18 @@ import { PROTOCOL_VERSION } from './health'
 export type ExperimentState = 'watching' | 'succeeded' | 'failed' | 'unknown' | 'cancelled'
 export type Experiment = { watch_id: string; agent_id: string; project_id: string; name: string; pid: number; state: ExperimentState; session_id?: string; detail?: string; updated_at_unix: number }
 export type SessionState = 'creating' | 'idle' | 'queued' | 'running' | 'interrupting' | 'failed' | 'orphaned' | 'archived'
-export type CodexSession = { session_id: string; agent_id: string; project_id: string; mode: 'inspect' | 'edit'; state: SessionState; title?: string; active_turn_id?: string; updated_at_unix: number }
-export type TranscriptItem = { item_id: string; kind: 'user_message' | 'assistant_message' | 'command_summary' | 'file_change_summary' | 'error'; text: string; text_offset?: number; text_complete?: boolean }
+export type CodexSession = { session_id: string; agent_id: string; project_id: string; mode: 'inspect' | 'edit'; state: SessionState; title?: string; display_label?: string; active_turn_id?: string; updated_at_unix: number }
+export type TranscriptItem = { item_id: string; kind: 'user_message' | 'assistant_message' | 'command_summary' | 'file_change_summary' | 'error'; text: string; text_offset?: number; text_complete?: boolean; status?: string; exit_code?: number; duration_ms?: number; streaming?: boolean }
 export type TranscriptTurn = { turn_id: string; status: string; started_at_unix?: number; completed_at_unix?: number; items: TranscriptItem[] }
-export type TranscriptPage = { protocol?: string; session_id: string; turns: TranscriptTurn[]; next_cursor?: string }
+export type TranscriptPage = { protocol?: string; session_id: string; turns: TranscriptTurn[]; next_cursor?: string; continuation?: { kind: 'message' | 'history'; turn_id: string; item_id: string; text_offset: number } }
+export type DisplayPage = { sessions: CodexSession[]; next_cursor?: string; incomplete_agents: { agent_id: string; reason: string }[] }
+export async function fetchSessionDisplay(csrf: string, request: { mode: 'labels' | 'search'; session_ids?: string[]; query?: string; agent_id?: string; project_id?: string; archived?: 'false' | 'true' | 'all'; cursor?: string }, signal?: AbortSignal): Promise<DisplayPage> {
+  const response = await fetch('/api/v1/codex/session-display', { method: 'POST', credentials: 'same-origin', signal, headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf }, body: JSON.stringify(request) })
+  if (!response.ok) throw await apiError(response)
+  const page = await response.json() as DisplayPage
+  if (!Array.isArray(page.sessions) || !Array.isArray(page.incomplete_agents)) throw new Error('会话显示信息无效')
+  return page
+}
 export type ScheduleTrigger = { type: 'at_time'; run_at_unix: number } | { type: 'experiment_succeeded'; watch_id: string }
 export type CodexSchedule = { schedule_id: string; agent_id: string; session_id: string; project_id: string; trigger: ScheduleTrigger; state: 'pending' | 'queued' | 'running' | 'completed' | 'cancelled' | 'skipped' | 'missed' | 'failed' | 'orphaned'; created_at_unix: number; updated_at_unix: number }
 export type ProjectCandidate = { candidate_id: string; agent_id: string; display_name: string; suggested_project_id: string; session_count: number; state: 'discovered' | 'approved'; updated_at_unix: number }
@@ -55,11 +63,14 @@ export async function fetchProjects(): Promise<ProjectCandidate[]> {
 
 const pendingOperations = new Map<string, string>()
 const savedReceipts = new Map<string, { identity: string; key: string }>()
-export type Operation = { command_id?: string; state?: string; status_url?: string }
+export type Operation = { command_id?: string; state?: string; status_url?: string; data?: { turn_id?: string; session_id?: string }; result?: { turn_id?: string; session_id?: string } }
+export class ApiError extends Error {
+  constructor(message: string, public code: string, public status: number) { super(message); this.name = 'ApiError' }
+}
 async function apiError(response: Response) {
   const value = await response.json().catch(() => ({})) as { error?: string }
-  const errors: Record<string, string> = { operation_expired: '这次操作已过期，草稿已保留；核对状态后可修改指令重新提交', operation_failed: '这次操作已失败，草稿已保留；请先核对执行结果', agent_offline: 'Agent 离线，指令尚未保存；连接恢复后重试', agent_upgrade_required: '请先升级 Agent 至 V0.7.0', agent_save_unconfirmed: '尚未确认 Agent 保存，重试会核对同一次操作', invalid_schedule_time: '时间必须在 60 秒至 365 天之间', session_is_not_running: '当前会话已没有活动对话', visible_turn_changed: '活动对话已改变，请刷新后再操作', idempotency_conflict: '操作身份与之前的请求冲突' }
-  return new Error(errors[value.error ?? ''] ?? (response.status === 401 ? '登录已过期，请重新登录' : `请求失败（HTTP ${response.status}）${value.error ? `：${value.error}` : ''}`))
+  const errors: Record<string, string> = { operation_expired: '这次操作已过期，草稿已保留；核对状态后可修改指令重新提交', operation_failed: '这次操作已失败，草稿已保留；请先核对执行结果', agent_offline: 'Agent 离线，指令尚未保存；连接恢复后重试', agent_upgrade_required: '请先升级 Agent 至 V0.7.1', agent_save_unconfirmed: '尚未确认 Agent 保存，重试会核对同一次操作', invalid_schedule_time: '时间必须在 60 秒至 365 天之间', session_is_not_running: '当前会话已没有活动对话', visible_turn_changed: '活动对话已改变，请刷新后再操作', idempotency_conflict: '操作身份与之前的请求冲突' }
+  return new ApiError(errors[value.error ?? ''] ?? (response.status === 401 ? '登录已过期，请重新登录' : `请求失败（HTTP ${response.status}）${value.error ? `：${value.error}` : ''}`), value.error ?? 'request_failed', response.status)
 }
 export async function mutate(url: string, csrf: string, body?: unknown, method = 'POST'): Promise<Operation> {
   const identity = `${method}:${url}:${JSON.stringify(body)}`
@@ -75,12 +86,12 @@ export async function mutate(url: string, csrf: string, body?: unknown, method =
   if (result.command_id) { savedReceipts.set(result.command_id, { identity, key }); if (savedReceipts.size > 256) savedReceipts.delete(savedReceipts.keys().next().value!) }
   return result
 }
-export async function waitForCommand(operation: Operation): Promise<void> {
-  if (!operation.command_id) return
+export async function waitForCommand(operation: Operation): Promise<Operation> {
+  if (!operation.command_id) return operation
   try {
     for (let count = 0; count < 60; count++) {
-      const status = await json<{ state: string; detail?: string }>(`/api/v1/commands/${encodeURIComponent(operation.command_id)}`)
-      if (status.state === 'completed') { savedReceipts.delete(operation.command_id); return }
+      const status = await json<Operation & { state: string; detail?: string }>(`/api/v1/commands/${encodeURIComponent(operation.command_id)}`)
+      if (status.state === 'completed') { savedReceipts.delete(operation.command_id); return status }
       if (['failed', 'expired', 'unknown'].includes(status.state)) throw new Error(status.detail || `操作结果：${status.state}`)
       await new Promise((resolve) => setTimeout(resolve, 500))
     }
@@ -95,8 +106,8 @@ export async function waitForCommand(operation: Operation): Promise<void> {
 export function createSession(csrf: string, agentId: string, projectId: string, mode: 'inspect' | 'edit') {
   return mutate('/api/v1/codex/sessions', csrf, { agent_id: agentId, project_id: projectId, mode })
 }
-export function sendMessage(csrf: string, sessionId: string, prompt: string, delivery: 'queue' | 'steer') {
-  return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/messages`, csrf, { prompt, delivery })
+export function sendMessage(csrf: string, sessionId: string, prompt: string, delivery: 'queue' | 'steer', turnId?: string) {
+  return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/messages`, csrf, { prompt, delivery, ...(delivery === 'steer' ? { turn_id: turnId } : {}) })
 }
 export function interruptSession(csrf: string, sessionId: string, turnId?: string) {
   return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/interrupt`, csrf, { turn_id: turnId })

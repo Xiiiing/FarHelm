@@ -97,12 +97,11 @@ export default function App() {
 
   if (session === undefined) return <ConfigProvider theme={createTheme(mode)}><div className="session-loading"><Spin /><span>正在恢复安全会话…</span></div></ConfigProvider>
   if (session === null) return <ConfigProvider theme={createTheme(mode)}><LoginPage onLogin={setSession} /></ConfigProvider>
-  if (location.pathname === '/codex') return <ConfigProvider theme={createTheme(mode)}><LiveNotifications /><Suspense fallback={codexFallback}><CodexPage csrf={session.csrf_token} /></Suspense></ConfigProvider>
 
   return (
     <ConfigProvider theme={createTheme(mode)}>
       <LiveNotifications />
-      <Layout className="app-layout">
+      <Layout className={location.pathname === '/codex' ? 'app-layout codex-shell' : 'app-layout'}>
         {isDesktop && (
           <Sider width={240} className="app-sider">
             <div className="brand" aria-label="FarHelm Console">
@@ -110,7 +109,7 @@ export default function App() {
               <div><strong>FarHelm</strong><span>远程训练控制台</span></div>
             </div>
             <Menu mode="inline" selectedKeys={[location.pathname]} items={desktopItems} onClick={({ key }) => go(key)} />
-            <div className="sider-footer"><Typography.Text type="secondary">V0.7.0 · Codex workspace</Typography.Text></div>
+            <div className="sider-footer"><Typography.Text type="secondary">V0.7.1 · Codex workspace</Typography.Text></div>
           </Sider>
         )}
 
@@ -128,7 +127,7 @@ export default function App() {
               {!isDesktop && <Button type="text" icon={<MenuOutlined />} onClick={() => setDrawerOpen(true)} aria-label="打开更多导航" />}
             </Space>
           </Header>
-          <Content className="app-content"><FeatureRoutes csrf={session.csrf_token} preference={preference} onPreference={setPreference} onLogout={() => void logout(session.csrf_token).then(() => setSession(null))} /></Content>
+          <Content className={location.pathname === '/codex' ? 'app-content codex-content' : 'app-content'}><FeatureRoutes csrf={session.csrf_token} preference={preference} onPreference={setPreference} onLogout={() => void logout(session.csrf_token).then(() => setSession(null))} /></Content>
         </Layout>
 
         {!isDesktop && (

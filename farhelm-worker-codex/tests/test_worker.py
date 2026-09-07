@@ -37,7 +37,7 @@ def test_worker_hello_advertises_implemented_capabilities() -> None:
     assert response["request_id"] == "req_test"
     assert response["result"] == {
         "worker": "farhelm-worker-codex",
-        "version": "0.7.0",
+        "version": "0.7.1",
         "capabilities": CAPABILITIES,
     }
 
@@ -109,6 +109,9 @@ def test_stdio_loop_can_interrupt_an_active_turn() -> None:
 
 
 class FakeBackend:
+    def session_display(self, params: Mapping[str, Any]) -> Mapping[str, Any]:
+        return {"sessions": []}
+
     def projects_discover(self) -> Mapping[str, Any]:
         return {"projects": [{"cwd": "/srv/project", "session_count": 1}]}
 
@@ -185,7 +188,7 @@ def test_sdk_absolute_path_root_model_is_used_for_session_filtering() -> None:
         "sessions": [
             {
                 "session_id": "ses_sdk",
-                "title": "Codex session",
+                "title": None,
                 "cwd": "/srv/project",
                 "archived": False,
                 "created_at_unix": 10,
@@ -225,14 +228,14 @@ def test_project_discovery_deduplicates_current_and_archived_thread_cwds() -> No
         "sessions": [
             {
                 "session_id": "archived",
-                "title": "Codex session",
+                "title": None,
                 "cwd": "/srv/project",
                 "archived": True,
                 "updated_at_unix": 30,
             },
             {
                 "session_id": "current",
-                "title": "Codex session",
+                "title": None,
                 "cwd": "/srv/project",
                 "archived": False,
                 "updated_at_unix": 20,
@@ -280,7 +283,13 @@ def test_transcript_normalisation_drops_reasoning_output_and_absolute_paths() ->
     )
     assert turn["items"] == [
         {"item_id": "u", "kind": "user_message", "text": "hello"},
-        {"item_id": "c", "kind": "command_summary", "text": "python … · exit 0"},
+        {
+            "item_id": "c",
+            "kind": "command_summary",
+            "text": "python … · exit 0",
+            "exit_code": 0,
+            "status": "completed",
+        },
         {"item_id": "f", "kind": "file_change_summary", "text": "update: model.py"},
     ]
 

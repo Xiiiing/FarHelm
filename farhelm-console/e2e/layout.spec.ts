@@ -42,6 +42,8 @@ test.beforeEach(async ({ page }) => {
     contentType: 'application/json',
     body: JSON.stringify({ protocol: 'farhelm/1', sessions: [{ session_id: 'ses-a', agent_id: 'gpu-a', project_id: 'cc08', mode: 'inspect', state: 'idle', updated_at_unix: 2_000_000_000 }] }),
   }))
+  await page.route('**/api/v1/codex/session-display', (route) => route.fulfill({ json: { protocol: 'farhelm/1', sessions: [], incomplete_agents: [] } }))
+  await page.route(/\/api\/v1\/codex\/sessions\/ses-[ab]$/, (route) => route.fulfill({ json: { session_id: route.request().url().split('/').at(-1), agent_id: 'gpu-a', project_id: 'cc08', mode: 'inspect', state: 'idle', updated_at_unix: 2_000_000_000 } }))
   await page.route('**/api/v1/codex/sessions/ses-a/transcript?*', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ session_id: 'ses-a', turns: [{ turn_id: 'turn-a', status: 'completed', items: [{ item_id: 'user-a', kind: 'user_message', text: '检查训练结果' }, { item_id: 'agent-a', kind: 'assistant_message', text: '结果正常' }] }] }) }))
   await page.route('**/api/v1/codex/schedules?*', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ protocol: 'farhelm/1', schedules: [] }) }))
   await page.route('**/api/v1/events/stream', (route) => route.fulfill({ status: 200, contentType: 'text/event-stream', body: '' }))
@@ -111,12 +113,13 @@ test('experiment deep link and Codex manual queue use the mobile-safe workflow',
     await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' })
   })
   await page.goto('/codex?session=ses-a')
-  await expect(page.getByText('ses-a').first()).toBeVisible()
+  await expect(page.getByRole('button', { name: '复制会话 ID' })).toBeVisible()
   await expect(page.getByText('结果正常')).toBeVisible()
   await page.getByLabel('给 Codex 发送指令').fill('继续分析结果')
   await page.getByRole('button', { name: '发送指令' }).click()
   await expect.poll(() => sent).toEqual({ prompt: '继续分析结果', delivery: 'queue' })
-  await expect(page.locator('.app-sider')).toHaveCount(0)
+  if (page.viewportSize()!.width >= 768) await expect(page.locator('.app-sider')).toBeVisible()
+  else await expect(page.getByRole('navigation', { name: '主要导航' })).toBeVisible()
 
   let scheduled: unknown
   await page.route('**/api/v1/codex/sessions/ses-a/schedules', async (route) => {

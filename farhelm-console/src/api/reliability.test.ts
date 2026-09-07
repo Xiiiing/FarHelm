@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mutate, waitForCommand, type TranscriptTurn } from './features'
-import { mergeTurns } from './transcript'
+import { mergeDelta, mergeTurns } from './transcript'
+import { normalizeMath } from '../components/codex/math'
+import { sessionName } from '../components/codex/presentation'
 import { subscribeEvents } from './events'
 
 afterEach(() => vi.unstubAllGlobals())
@@ -41,4 +43,58 @@ it('shares one stream and closes it after the last subscriber', () => {
   const a = subscribeEvents(['open'], () => {})
   const b = subscribeEvents(['codex.message.delta'], () => {})
   expect(count).toBe(1); a(); expect(close).not.toHaveBeenCalled(); b(); expect(close).toHaveBeenCalledOnce()
+})
+
+it('keeps out-of-order offsets incomplete until gaps arrive, and deduplicates authoritative items', () => {
+  let turns: TranscriptTurn[] = []
+  turns = mergeDelta(turns, { turn_id: 't', item_id: 'a', text_offset: 3, delta: '完成' })
+  expect(turns[0].items[0].text).toBe('')
+  turns = mergeDelta(turns, { turn_id: 't', item_id: 'b', text_offset: 0, delta: '另一个输出' })
+  turns = mergeDelta(turns, { turn_id: 't', item_id: 'a', text_offset: 0, delta: '你好🙂' })
+  expect(turns[0].items.map((i) => i.text)).toEqual(['你好🙂完成', '另一个输出'])
+  turns = mergeTurns(turns, [{ turn_id: 't', status: 'completed', items: [{ item_id: 'a', kind: 'assistant_message', text: '你好🙂完成' }, { item_id: 'b', kind: 'assistant_message', text: '另一个输出' }] }])
+  turns = mergeDelta(turns, { turn_id: 't', item_id: 'a', text_offset: 3, delta: '完成' })
+  expect(turns[0].items).toHaveLength(2)
+  expect(turns[0].items[0].text).toBe('你好🙂完成')
+})
+
+it('retains item order when continuing later items in the same turn', () => {
+  const current: TranscriptTurn[] = [{ turn_id: 't', status: 'completed', items: [{ item_id: 'u', kind: 'user_message', text: 'question' }, { item_id: 'a', kind: 'assistant_message', text: 'first', text_complete: false, text_offset: 0 }] }]
+  const continuation: TranscriptTurn[] = [{ turn_id: 't', status: 'completed', items: [{ item_id: 'a', kind: 'assistant_message', text: 'second', text_offset: 5, text_complete: true }, { item_id: 'tool', kind: 'command_summary', text: 'done' }] }]
+  const result = mergeTurns(current, continuation, true)
+  expect(result[0].items.map((item) => item.item_id)).toEqual(['u', 'a', 'tool'])
+  expect(result[0].items[1].text).toBe('firstsecond')
+})
+
+it('retains a completed continuation across bounded refreshes but replaces a changed prefix', () => {
+  const item = { item_id: 'a', kind: 'assistant_message' as const, text: '前缀🙂', text_offset: 0, text_complete: false }
+  let turns = mergeTurns([], [{ turn_id: 't', status: 'completed', items: [item] }])
+  turns = mergeTurns(turns, [{ turn_id: 't', status: 'completed', items: [{ ...item, text: '结尾', text_offset: 3, text_complete: true }] }], true)
+  turns = mergeTurns(turns, [{ turn_id: 't', status: 'completed', items: [item] }])
+  expect(turns[0].items[0]).toMatchObject({ text: '前缀🙂结尾', text_complete: true })
+  turns = mergeTurns(turns, [{ turn_id: 't', status: 'completed', items: [{ ...item, text: '已修改' }] }])
+  expect(turns[0].items[0]).toMatchObject({ text: '已修改', text_complete: false })
+})
+
+it('does not coalesce distinct session events out of existence', () => {
+  const sources: EventTarget[] = []
+  vi.stubGlobal('EventSource', class extends EventTarget { constructor() { super(); sources.push(this) } close() {} })
+  const seen: string[] = []
+  const off = subscribeEvents(['codex.turn.completed'], (event) => seen.push(event.data))
+  sources[0].dispatchEvent(new MessageEvent('codex.turn.completed', { data: 'a' }))
+  sources[0].dispatchEvent(new MessageEvent('codex.turn.completed', { data: 'b' }))
+  expect(seen).toEqual(['a', 'b']); off()
+})
+
+it('converts both TeX delimiters without rewriting literal code', () => {
+  expect(normalizeMath('内联 \\(x^2\\)，块 \\[x+y\\]')).toBe('内联 $x^2$，块 \n$$\nx+y\n$$\n')
+  const code = '```python\ntext = "\\(literal\\)"\n```\n`\\[literal\\]`'
+  expect(normalizeMath(code)).toBe(code)
+})
+
+it('uses ephemeral labels instead of placeholders and retains formal names', () => {
+  const session = { session_id: 'session-long-id', project_id: 'cc08', agent_id: 'a', title: 'Codex session', display_label: '首条用户摘要', mode: 'inspect' as const, state: 'idle' as const, updated_at_unix: 100 }
+  expect(sessionName(session)).toBe('首条用户摘要')
+  expect(sessionName({ ...session, title: '正式标题' })).toBe('正式标题')
+  expect(sessionName({ ...session, display_label: undefined })).toContain('cc08')
 })

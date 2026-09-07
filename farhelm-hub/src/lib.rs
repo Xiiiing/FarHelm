@@ -56,6 +56,9 @@ mod command_store;
 mod event_store;
 mod migrations;
 mod notification_routes;
+mod session_display;
+#[cfg(test)]
+mod session_display_tests;
 mod typed_command_store;
 
 use command_store::{CommandStore, CreateCommandError, ReportCommandError};
@@ -89,7 +92,6 @@ pub struct AppState {
     commands: Arc<CommandStore>,
     events: Arc<EventStore>,
     event_bus: broadcast::Sender<StoredEvent>,
-    transient_bus: broadcast::Sender<StoredEvent>,
     typed_commands: Arc<TypedCommandStore>,
     push_client: Client,
     push_notify: Arc<Notify>,
@@ -138,7 +140,6 @@ impl AppState {
         let events = EventStore::open(&config.database_path)?;
         let typed_commands = TypedCommandStore::open(&config.database_path)?;
         let (event_bus, _) = broadcast::channel(256);
-        let (transient_bus, _) = broadcast::channel(512);
         let now = unix_time();
         for (agent_id, token) in &config.agent_tokens {
             events.import_agent_credential(agent_id, &secret_hash(token), now)?;
@@ -155,7 +156,6 @@ impl AppState {
             commands: Arc::new(commands),
             events: Arc::new(events),
             event_bus,
-            transient_bus,
             typed_commands: Arc::new(typed_commands),
             push_client,
             push_notify: Arc::new(Notify::new()),
@@ -358,6 +358,10 @@ pub fn app(state: AppState) -> Router {
             get(get_codex_transcript),
         )
         .route("/api/v1/codex/schedules", get(list_codex_schedules))
+        .route(
+            "/api/v1/codex/session-display",
+            post(session_display::display),
+        )
         .route(
             "/api/v1/codex/schedules/{schedule_id}",
             get(get_codex_schedule),
@@ -1191,11 +1195,12 @@ async fn agent_events(
         )
             .into_response();
     }
-    let (transient, durable): (Vec<_>, Vec<_>) = batch
+    let durable: Vec<_> = batch
         .events
         .iter()
+        .filter(|event| event.event_type != "codex.message.delta")
         .cloned()
-        .partition(|event| event.event_type == "codex.message.delta");
+        .collect();
     let agent = batch.agent_id.clone();
     let inserted = match database(&state, move |s| s.events.ingest(&agent, &durable)).await {
         Ok(inserted) => inserted,
@@ -1211,16 +1216,24 @@ async fn agent_events(
         }
     };
     state.push_notify.notify_one();
-    for event in inserted {
-        let _ = state.event_bus.send(event);
-    }
-    for event in transient {
-        let _ = state.transient_bus.send(StoredEvent {
-            sequence: 0,
-            event_id: event.event_id,
-            event_type: event.event_type.clone(),
-            payload: farhelm_protocol::public_event_payload(&event.event_type, &event.payload),
-        });
+    let mut inserted: HashMap<_, _> = inserted
+        .into_iter()
+        .map(|event| (event.event_id.clone(), event))
+        .collect();
+    for event in &batch.events {
+        let outgoing = if event.event_type == "codex.message.delta" {
+            Some(StoredEvent {
+                sequence: 0,
+                event_id: event.event_id.clone(),
+                event_type: event.event_type.clone(),
+                payload: farhelm_protocol::public_event_payload(&event.event_type, &event.payload),
+            })
+        } else {
+            inserted.remove(&event.event_id)
+        };
+        if let Some(event) = outgoing {
+            let _ = state.event_bus.send(event);
+        }
     }
     Json(AgentEventAck {
         protocol: FARHELM_PROTOCOL.to_owned(),
@@ -1423,6 +1436,9 @@ async fn send_codex_message(
             let Some(turn_id) = session.active_turn_id.clone() else {
                 return api_error(StatusCode::CONFLICT, "session_is_not_running");
             };
+            if request.turn_id.as_deref() != Some(turn_id.as_str()) {
+                return api_error(StatusCode::CONFLICT, "visible_turn_changed");
+            }
             (CommandAction::CodexTurnSteer, Some(turn_id))
         }
     };
@@ -1984,7 +2000,6 @@ async fn event_stream(State(state): State<AppState>, headers: HeaderMap) -> Resp
     // live delivery remains buffered in the receiver. Sequence filtering below
     // removes the resulting overlap.
     let mut receiver = state.event_bus.subscribe();
-    let mut transient_receiver = state.transient_bus.subscribe();
     let replay = match database(&state, move |s| s.events.replay(after, 1000)).await {
         Ok(replay) => replay,
         Err(error) => {
@@ -2023,19 +2038,16 @@ async fn event_stream(State(state): State<AppState>, headers: HeaderMap) -> Resp
             }
         }
         loop {
-            tokio::select! {
-            transient = transient_receiver.recv() => match transient {
-                Ok(event) => yield Ok::<Event, Infallible>(transient_sse_event(&event)),
-                Err(broadcast::error::RecvError::Lagged(_)) => yield Ok::<Event, Infallible>(Event::default().event("codex.stream.resync").data("{}")),
-                Err(broadcast::error::RecvError::Closed) => break,
-            },
-            durable = receiver.recv() => match durable {
+            match receiver.recv().await {
+                Ok(event) if event.sequence == 0 => yield Ok::<Event, Infallible>(transient_sse_event(&event)),
                 Ok(event) if event.sequence > cursor => {
                     cursor = event.sequence;
                     yield Ok::<Event, Infallible>(sse_event(&event));
                 }
                 Ok(_) => {}
-                Err(broadcast::error::RecvError::Lagged(_)) => loop {
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    yield Ok::<Event, Infallible>(Event::default().event("codex.stream.resync").data("{}"));
+                    loop {
                     let page = match database(&state,move |s|s.events.replay(cursor,1000)).await {
                         Ok(page) => page,
                         Err(error) => {
@@ -2053,9 +2065,9 @@ async fn event_stream(State(state): State<AppState>, headers: HeaderMap) -> Resp
                     if page_len < 1000 {
                         break;
                     }
-                },
+                }},
                 Err(broadcast::error::RecvError::Closed) => break,
-            }}
+            }
         }
     };
     Sse::new(stream)
