@@ -18,6 +18,7 @@ export function Conversation({ csrf, id, session: listed, draft, onDraft, onSend
   const [loading, setLoading] = useState(false)
   const [failure, setFailure] = useState<Error>()
   const [ready, setReady] = useState(false)
+  const readyRef = useRef(ready); readyRef.current = ready
   const [newMessages, setNewMessages] = useState(false)
   const [away, setAway] = useState(false)
   const scroll = useRef<HTMLDivElement>(null)
@@ -126,7 +127,7 @@ export function Conversation({ csrf, id, session: listed, draft, onDraft, onSend
           flush ??= setTimeout(commit, 80)
         } else if (event.type.startsWith('codex.turn.') || event.type === 'codex.session.updated') {
           commit()
-          const needsHistory = event.type.startsWith('codex.turn.')
+          const needsHistory = event.type.startsWith('codex.turn.') || !readyRef.current
           if (needsHistory && !follow.current) setNewMessages(true)
           scheduleRefresh(needsHistory)
         }

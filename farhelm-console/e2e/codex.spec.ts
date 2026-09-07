@@ -116,6 +116,16 @@ test('history recovers when Agent heartbeat follows Hub restart', async ({ page 
   expect(model.historyReads).toBeLessThanOrEqual(4)
 })
 
+test('session metadata arriving after its creation receipt retries initial history', async ({ page }) => {
+  const model = await setup(page); model.historyStatus = 404; model.historyError = 'session_not_found'
+  await page.goto('/codex?session=ses-a')
+  await expect(page.getByText('会话不存在或尚未导入')).toBeVisible()
+  model.historyStatus = 200
+  await emit(page, 'codex.session.updated', { session_id: 'ses-a' })
+  await expect(page.locator('.markdown-table')).toHaveCount(1)
+  await expect(page.getByLabel('给 Codex 发送指令')).toBeEnabled()
+})
+
 for (const cancelled of [false, true]) test(`created session follows its receipt; dialog cancelled=${cancelled}`, async ({ page }) => {
   const model = await setup(page); let ready = false; let reads = 0; let completed = false
   await page.route('**/projects', (route) => route.fulfill({ json: { protocol: 'farhelm/1', projects: [{ candidate_id: 'project-a', agent_id: 'gpu-a', suggested_project_id: 'cc08', display_name: '训练项目', state: 'approved' }] } }))
