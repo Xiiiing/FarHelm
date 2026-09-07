@@ -1,4 +1,4 @@
-# FarHelm V0.6.0 deployment and lifecycle
+# FarHelm V0.7.0 deployment and lifecycle
 
 [简体中文](README.md) · [English](README.en.md)
 
@@ -21,7 +21,7 @@ sudo env \
   ./farhelm-hub install
 ```
 
-V0.5.0 upgrades directly with `update`; SQLite session, pairing, project, and schedule tables are created idempotently on restart. Old TOTP and token fields remain for local rollback, but V0.6.0 does not require TOTP. A backup is still recommended before the first V0.3.0 cross-generation install:
+V0.5.0 upgrades directly with `update`; SQLite session, pairing, project, and schedule tables are created idempotently on restart. Old TOTP and token fields remain for local rollback, but V0.7.0 does not require TOTP. A backup is still recommended before the first V0.3.0 cross-generation install:
 
 ```bash
 sudo cp /var/lib/farhelm/farhelm.db /var/lib/farhelm/farhelm.db.v0.3.bak
@@ -86,8 +86,8 @@ chmod +x farhelm-agent
 Agent downloads the independent Python 3.12/Codex runtime from the matching immutable Release and verifies its length and SHA-256. For an offline installation, transfer the matching runtime asset first and provide trusted verification metadata:
 
 ```bash
-FARHELM_CODEX_RUNTIME_ARCHIVE="$PWD/farhelm-codex-runtime-0.6.0-linux-x86_64.tar.gz" \
-FARHELM_CODEX_RUNTIME_SIZE="$(stat -c '%s' farhelm-codex-runtime-0.6.0-linux-x86_64.tar.gz)" \
+FARHELM_CODEX_RUNTIME_ARCHIVE="$PWD/farhelm-codex-runtime-0.7.0-linux-x86_64.tar.gz" \
+FARHELM_CODEX_RUNTIME_SIZE="$(stat -c '%s' farhelm-codex-runtime-0.7.0-linux-x86_64.tar.gz)" \
 FARHELM_CODEX_RUNTIME_SHA256="copy-from-trusted-SHA256SUMS" \
 ./farhelm-agent install
 ```
@@ -150,9 +150,9 @@ farhelm-agent uninstall --keep-data
 
 ## Migrating from V0.2.0
 
-Hosts already on `V0.3.0` through `V0.5.0` can run `farhelm-hub update` or `farhelm-agent update` directly. `V0.2.0` must first upgrade to `V0.3.0` to migrate the old layout, then upgrade to V0.6.0.
+Hosts already on `V0.3.0` through `V0.5.0` can run `farhelm-hub update` or `farhelm-agent update` directly. `V0.2.0` must first upgrade to `V0.3.0` to migrate the old layout, then upgrade to V0.7.0.
 
-Lowercase legacy `v0.1.0/v0.2.0` releases are outside the formal update sequence. Remove them with their matching old uninstaller before installing V0.6.0.
+Lowercase legacy `v0.1.0/v0.2.0` releases are outside the formal update sequence. Remove them with their matching old uninstaller before installing V0.7.0.
 
 ## Security notes
 
@@ -161,3 +161,11 @@ Lowercase legacy `v0.1.0/v0.2.0` releases are outside the formal update sequence
 - A new program is fully written on the same filesystem before atomic replacement; failed service health restores previous.
 - Configuration, database, and Worker runtime are not overwritten with the executable; logs go to journald.
 - The current release permits only typed experiment-observation and Codex session/turn commands. It cannot start or stop training or accept arbitrary cwd/argv/env/shell values; the Codex Worker connects to the real SDK only through the Agent's local stdio channel.
+
+## V0.7 data migration
+
+Upgrade Hub before Agent. Each role has one schema migration entry point upgrading its shared database to schema 7 while preserving command and experiment identities. New prompt bodies only pass briefly through Hub memory; unacknowledged legacy bodies remain until durable Agent receipt (expired commands are stored and reported expired without execution). Older database/WAL/backups may contain historical bodies and must remain private.
+
+Schema 7 makes V0.6 and older programs refuse the database. Do not overwrite current execution receipts with an old snapshot to force a downgrade. Retain the current database and use a schema-7-compatible repair build; restore the current binary if binary rollback fails. Restoring an old snapshot can replay completed work and is not a supported rollback path.
+
+V0.7 in-page alerts use the existing SSE connection and durable notification center, with no VAPID or phone permission requirement. Existing Web Push APIs remain compatible; iOS system push is outside this release's acceptance scope.

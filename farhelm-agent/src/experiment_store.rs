@@ -18,6 +18,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+#[path = "execution_store.rs"]
+pub(crate) mod execution;
+pub use execution::ScriptReport;
+
 const LOG_TAIL_LIMIT: u64 = 1024 * 1024;
 const PROMPT_LIMIT: usize = 32 * 1024;
 
@@ -144,81 +148,7 @@ impl ExperimentStore {
         if path != Path::new(":memory:") {
             connection.pragma_update(None, "journal_mode", "WAL")?;
         }
-        connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS experiment_watches (
-                watch_id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL,
-                project_root TEXT NOT NULL,
-                name TEXT NOT NULL,
-                pid INTEGER NOT NULL,
-                proc_start_time INTEGER NOT NULL,
-                uid INTEGER NOT NULL,
-                log_path TEXT NOT NULL,
-                session_id TEXT,
-                new_session_mode TEXT CHECK (new_session_mode IS NULL OR new_session_mode IN ('inspect','edit')),
-                success_prompt TEXT,
-                state TEXT NOT NULL CHECK (state IN ('watching','succeeded','failed','unknown','cancelled')),
-                detail TEXT,
-                auto_prompt_claimed INTEGER NOT NULL DEFAULT 0 CHECK (auto_prompt_claimed IN (0,1,2)),
-                created_at_unix INTEGER NOT NULL,
-                updated_at_unix INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS event_outbox (
-                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id TEXT NOT NULL UNIQUE,
-                event_type TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                created_at_unix INTEGER NOT NULL,
-                acknowledged INTEGER NOT NULL DEFAULT 0 CHECK (acknowledged IN (0,1))
-            );
-            CREATE TABLE IF NOT EXISTS remote_codex_commands (
-                command_id TEXT PRIMARY KEY,
-                action TEXT NOT NULL,
-                expires_at_unix INTEGER NOT NULL,
-                payload_json TEXT NOT NULL,
-                state TEXT NOT NULL CHECK (state IN ('accepted','running','completed','failed','expired','orphaned')),
-                accepted_reported INTEGER NOT NULL DEFAULT 0 CHECK (accepted_reported IN (0,1)),
-                terminal_reported INTEGER NOT NULL DEFAULT 0 CHECK (terminal_reported IN (0,1)),
-                data_json TEXT,
-                detail TEXT,
-                updated_at_unix INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS codex_session_bindings (
-                session_id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL,
-                cwd TEXT NOT NULL,
-                mode TEXT NOT NULL CHECK (mode IN ('inspect','edit')),
-                updated_at_unix INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS discovered_projects (
-                candidate_id TEXT PRIMARY KEY,
-                path TEXT NOT NULL UNIQUE,
-                display_name TEXT NOT NULL,
-                suggested_project_id TEXT NOT NULL,
-                session_count INTEGER NOT NULL,
-                state TEXT NOT NULL CHECK (state IN ('discovered','approved')),
-                updated_at_unix INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS approved_projects (
-                project_id TEXT PRIMARY KEY,
-                path TEXT NOT NULL UNIQUE,
-                success_patterns_json TEXT NOT NULL DEFAULT '[]',
-                failure_patterns_json TEXT NOT NULL DEFAULT '[]',
-                updated_at_unix INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS codex_prompt_schedules (
-                schedule_id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                trigger_json TEXT NOT NULL,
-                prompt TEXT NOT NULL,
-                state TEXT NOT NULL CHECK (state IN ('pending','queued','running','completed','cancelled','skipped','missed','failed','orphaned')),
-                grace_expires_at_unix INTEGER,
-                created_at_unix INTEGER NOT NULL,
-                updated_at_unix INTEGER NOT NULL
-            );",
-        )?;
-        ensure_remote_command_columns(&connection)?;
+        crate::migrations::apply(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
             path: path.to_owned(),
@@ -231,7 +161,7 @@ impl ExperimentStore {
         now: u64,
     ) -> Result<()> {
         let connection = self.lock()?;
-        let transaction = connection.unchecked_transaction()?;
+        let transaction = crate::migrations::write_transaction(&connection)?;
         for (project_id, project) in projects {
             let path = fs::canonicalize(&project.path).unwrap_or_else(|_| project.path.clone());
             transaction.execute(
@@ -242,203 +172,6 @@ impl ExperimentStore {
         }
         transaction.commit()?;
         Ok(())
-    }
-
-    pub fn create_schedule(&self, payload: &Value, now: u64) -> Result<String> {
-        let schedule_id = required_payload_string(payload, "schedule_id")?;
-        let project_id = required_payload_string(payload, "project_id")?;
-        let session_id = required_payload_string(payload, "session_id")?;
-        let prompt = required_payload_string(payload, "prompt")?;
-        ensure!(
-            prompt.len() <= PROMPT_LIMIT,
-            "scheduled prompt exceeds 32 KiB"
-        );
-        let trigger: CodexScheduleTrigger = serde_json::from_value(
-            payload
-                .get("trigger")
-                .cloned()
-                .context("schedule omitted trigger")?,
-        )?;
-        let grace = match &trigger {
-            CodexScheduleTrigger::AtTime { run_at_unix } => {
-                Some(run_at_unix.saturating_add(24 * 60 * 60))
-            }
-            CodexScheduleTrigger::ExperimentSucceeded { watch_id } => {
-                let valid: bool = self.lock()?.query_row("SELECT EXISTS(SELECT 1 FROM experiment_watches WHERE watch_id=?1 AND project_id=?2 AND state='watching')",params![watch_id,project_id],|row|row.get(0))?;
-                ensure!(valid, "scheduled experiment is not watching");
-                None
-            }
-        };
-        let connection = self.lock()?;
-        connection.execute(
-            "INSERT INTO codex_prompt_schedules (schedule_id,project_id,session_id,trigger_json,prompt,state,grace_expires_at_unix,created_at_unix,updated_at_unix) VALUES (?1,?2,?3,?4,?5,'pending',?6,?7,?7)",
-            params![schedule_id,project_id,session_id,serde_json::to_string(&trigger)?,prompt,grace.map(as_i64).transpose()?,as_i64(now)?],
-        )?;
-        drop(connection);
-        self.enqueue_schedule_event(
-            schedule_id,
-            project_id,
-            session_id,
-            &trigger,
-            CodexScheduleState::Pending,
-            (now, now),
-        )?;
-        Ok(schedule_id.to_owned())
-    }
-
-    pub fn cancel_schedule(&self, schedule_id: &str, now: u64) -> Result<()> {
-        let connection = self.lock()?;
-        let row: Option<(String,String,String,u64)> = connection.query_row(
-            "SELECT project_id,session_id,trigger_json,created_at_unix FROM codex_prompt_schedules WHERE schedule_id=?1 AND state IN ('pending','queued')",
-            [schedule_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row_u64(row,3)?))
-        ).optional()?;
-        let (project, session, encoded, created) = row.context("schedule is not cancellable")?;
-        connection.execute("UPDATE codex_prompt_schedules SET state='cancelled',updated_at_unix=?1 WHERE schedule_id=?2",params![as_i64(now)?,schedule_id])?;
-        drop(connection);
-        self.enqueue_schedule_event(
-            schedule_id,
-            &project,
-            &session,
-            &serde_json::from_str(&encoded)?,
-            CodexScheduleState::Cancelled,
-            (created, now),
-        )
-    }
-
-    pub fn schedule_detail(&self, schedule_id: &str) -> Result<Value> {
-        self.lock()?.query_row(
-            "SELECT schedule_id,project_id,session_id,trigger_json,prompt,state,created_at_unix,updated_at_unix FROM codex_prompt_schedules WHERE schedule_id=?1",
-            [schedule_id], |row| {
-                let trigger:String=row.get(3)?;
-                Ok(json!({"summary":{"schedule_id":row.get::<_,String>(0)?,"project_id":row.get::<_,String>(1)?,"session_id":row.get::<_,String>(2)?,"trigger":serde_json::from_str::<Value>(&trigger).map_err(json_conversion(3))?,"state":row.get::<_,String>(5)?,"created_at_unix":row_u64(row,6)?,"updated_at_unix":row_u64(row,7)?},"prompt":row.get::<_,String>(4)?}))
-            }
-        ).optional()?.context("schedule not found")
-    }
-
-    pub fn due_schedules(&self, now: u64) -> Result<Vec<ScheduledPrompt>> {
-        let connection = self.lock()?;
-        let mut statement = connection.prepare("SELECT schedule_id,project_id,session_id,trigger_json,prompt,grace_expires_at_unix,created_at_unix FROM codex_prompt_schedules WHERE state='pending' ORDER BY created_at_unix")?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                    row_u64(row, 6)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(statement);
-        let mut due = Vec::new();
-        let mut terminal = Vec::new();
-        for (id, project, session, encoded, prompt, grace, created) in rows {
-            let trigger: CodexScheduleTrigger = serde_json::from_str(&encoded)?;
-            match &trigger {
-                CodexScheduleTrigger::AtTime { run_at_unix } if now >= *run_at_unix => {
-                    if grace.is_some_and(|value| now > value as u64) {
-                        terminal.push((
-                            id,
-                            project,
-                            session,
-                            trigger,
-                            created,
-                            CodexScheduleState::Missed,
-                        ));
-                    } else {
-                        due.push(ScheduledPrompt {
-                            schedule_id: id,
-                            project_id: project,
-                            session_id: session,
-                            prompt,
-                        });
-                    }
-                }
-                CodexScheduleTrigger::ExperimentSucceeded { watch_id } => {
-                    let state: Option<String> = connection
-                        .query_row(
-                            "SELECT state FROM experiment_watches WHERE watch_id=?1",
-                            [watch_id],
-                            |row| row.get(0),
-                        )
-                        .optional()?;
-                    match state.as_deref() {
-                        Some("succeeded") => due.push(ScheduledPrompt {
-                            schedule_id: id,
-                            project_id: project,
-                            session_id: session,
-                            prompt,
-                        }),
-                        Some("failed" | "unknown" | "cancelled") | None => terminal.push((
-                            id,
-                            project,
-                            session,
-                            trigger,
-                            created,
-                            CodexScheduleState::Skipped,
-                        )),
-                        _ => {}
-                    }
-                }
-                _ => {}
-            }
-        }
-        for (id, _, _, _, _, state) in &terminal {
-            connection.execute("UPDATE codex_prompt_schedules SET state=?1,updated_at_unix=?2 WHERE schedule_id=?3 AND state='pending'",params![schedule_state_name(*state),as_i64(now)?,id])?;
-        }
-        drop(connection);
-        for (id, project, session, trigger, created, state) in terminal {
-            self.enqueue_schedule_event(&id, &project, &session, &trigger, state, (created, now))?;
-        }
-        Ok(due)
-    }
-
-    pub fn claim_schedule(&self, schedule_id: &str, now: u64) -> Result<bool> {
-        Ok(self.lock()?.execute("UPDATE codex_prompt_schedules SET state='running',updated_at_unix=?1 WHERE schedule_id=?2 AND state='pending'",params![as_i64(now)?,schedule_id])? == 1)
-    }
-
-    pub fn finish_schedule(
-        &self,
-        schedule_id: &str,
-        state: CodexScheduleState,
-        now: u64,
-    ) -> Result<()> {
-        ensure!(
-            matches!(
-                state,
-                CodexScheduleState::Completed
-                    | CodexScheduleState::Failed
-                    | CodexScheduleState::Orphaned
-            ),
-            "invalid schedule terminal state"
-        );
-        let connection = self.lock()?;
-        let row:(String,String,String,u64)=connection.query_row("SELECT project_id,session_id,trigger_json,created_at_unix FROM codex_prompt_schedules WHERE schedule_id=?1",[schedule_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row_u64(row,3)?)))?;
-        connection.execute("UPDATE codex_prompt_schedules SET state=?1,prompt='',updated_at_unix=?2 WHERE schedule_id=?3 AND state='running'",params![schedule_state_name(state),as_i64(now)?,schedule_id])?;
-        drop(connection);
-        self.enqueue_schedule_event(
-            schedule_id,
-            &row.0,
-            &row.1,
-            &serde_json::from_str(&row.2)?,
-            state,
-            (row.3, now),
-        )
-    }
-
-    fn enqueue_schedule_event(
-        &self,
-        schedule_id: &str,
-        project_id: &str,
-        session_id: &str,
-        trigger: &CodexScheduleTrigger,
-        state: CodexScheduleState,
-        timestamps: (u64, u64),
-    ) -> Result<()> {
-        let (created, now) = timestamps;
-        self.enqueue_event(&format!("schedule:{schedule_id}:{now}"),"codex.schedule.updated",&json!({"schedule_id":schedule_id,"project_id":project_id,"session_id":session_id,"trigger":trigger,"state":state,"created_at_unix":created,"updated_at_unix":now}),now)
     }
 
     pub fn approved_projects(&self) -> Result<BTreeMap<String, ApprovedProject>> {
@@ -571,7 +304,7 @@ impl ExperimentStore {
             "invalid candidate list"
         );
         let connection = self.lock()?;
-        let transaction = connection.unchecked_transaction()?;
+        let transaction = crate::migrations::write_transaction(&connection)?;
         let mut approved = Vec::new();
         for candidate_id in candidate_ids {
             let candidate = transaction.query_row(
@@ -652,7 +385,7 @@ impl ExperimentStore {
             now,
         );
         let connection = self.lock()?;
-        let transaction = connection.unchecked_transaction()?;
+        let transaction = crate::migrations::write_transaction(&connection)?;
         transaction.execute(
             "INSERT INTO experiment_watches (
                 watch_id, project_id, project_root, name, pid, proc_start_time, uid, log_path,
@@ -699,7 +432,7 @@ impl ExperimentStore {
 
     pub fn cancel(&self, watch_id: &str, now: u64) -> Result<bool> {
         let connection = self.lock()?;
-        let transaction = connection.unchecked_transaction()?;
+        let transaction = crate::migrations::write_transaction(&connection)?;
         let changed = transaction.execute(
             "UPDATE experiment_watches SET state='cancelled', detail='monitoring cancelled', updated_at_unix=?1
               WHERE watch_id=?2 AND state='watching'",
@@ -745,7 +478,7 @@ impl ExperimentStore {
                 .context("watch references an unknown project")?;
             let (state, detail) = classify_log(&watch.log_path, patterns)?;
             let connection = self.lock()?;
-            let transaction = connection.unchecked_transaction()?;
+            let transaction = crate::migrations::write_transaction(&connection)?;
             let changed = transaction.execute(
                 "UPDATE experiment_watches SET state=?1, detail=?2, updated_at_unix=?3
                   WHERE watch_id=?4 AND state='watching' AND proc_start_time=?5",
@@ -770,6 +503,18 @@ impl ExperimentStore {
                     &payload,
                     now,
                 )?;
+                let automatic: bool = transaction.query_row(
+                    "SELECT success_prompt IS NOT NULL FROM experiment_watches WHERE watch_id=?1",
+                    [&watch.watch_id],
+                    |r| r.get(0),
+                )?;
+                if state == ExperimentState::Succeeded && automatic {
+                    execution::enqueue(
+                        &transaction,
+                        &watch.watch_id,
+                        watch.session_id.as_deref().unwrap_or(&watch.watch_id),
+                    )?;
+                }
                 completed.push(CompletedWatch {
                     watch_id: watch.watch_id.clone(),
                     state,
@@ -781,15 +526,25 @@ impl ExperimentStore {
     }
 
     pub fn claim_auto_prompt(&self, watch_id: &str) -> Result<bool> {
-        let changed = self.lock()?.execute(
-            "UPDATE experiment_watches SET auto_prompt_claimed=1 WHERE watch_id=?1 AND state='succeeded' AND success_prompt IS NOT NULL AND auto_prompt_claimed=0",
-            [watch_id],
-        )?;
+        let connection = self.lock()?;
+        let tx = crate::migrations::write_transaction(&connection)?;
+        let session:Option<Option<String>>=tx.query_row("SELECT session_id FROM experiment_watches WHERE watch_id=?1 AND auto_prompt_claimed=0 AND state='succeeded'",[watch_id],|r|r.get(0)).optional()?;
+        let Some(session) = session else {
+            return Ok(false);
+        };
+        execution::enqueue(&tx, watch_id, session.as_deref().unwrap_or(watch_id))?;
+        if !execution::claim(&tx, watch_id)? {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let changed=tx.execute("UPDATE experiment_watches SET auto_prompt_claimed=1 WHERE watch_id=?1 AND auto_prompt_claimed=0",[watch_id])?;
+        tx.commit()?;
         Ok(changed == 1)
     }
 
     pub fn pending_auto_prompts(&self, now: u64) -> Result<Vec<AutoPrompt>> {
         let connection = self.lock()?;
+        connection.execute("UPDATE execution_queue SET state='completed' WHERE state='queued' AND job_id IN (SELECT watch_id FROM experiment_watches WHERE auto_prompt_claimed=0 AND state='succeeded' AND updated_at_unix+86400<=?1)",[as_i64(now)?])?;
         let mut statement = connection.prepare(
             "SELECT watch_id,project_id,project_root,session_id,new_session_mode,success_prompt,proc_start_time
                FROM experiment_watches
@@ -821,7 +576,7 @@ impl ExperimentStore {
         now: u64,
     ) -> Result<()> {
         let connection = self.lock()?;
-        let transaction = connection.unchecked_transaction()?;
+        let transaction = crate::migrations::write_transaction(&connection)?;
         let session_id = payload.get("session_id").and_then(Value::as_str);
         let changed = transaction.execute(
             "UPDATE experiment_watches
@@ -830,6 +585,7 @@ impl ExperimentStore {
             params![as_i64(now)?, session_id, watch_id],
         )?;
         ensure!(changed == 1, "auto prompt was not running");
+        execution::finish(&transaction, watch_id)?;
         insert_event(
             &transaction,
             &format!("{watch_id}:{event_type}"),
@@ -875,7 +631,7 @@ impl ExperimentStore {
 
     pub fn orphan_running_prompts(&self, now: u64) -> Result<u64> {
         let connection = self.lock()?;
-        let transaction = connection.unchecked_transaction()?;
+        let transaction = crate::migrations::write_transaction(&connection)?;
         let mut statement = transaction.prepare(
             "SELECT w.watch_id,w.session_id,w.project_id,COALESCE(b.mode,w.new_session_mode,'inspect')
                FROM experiment_watches w
@@ -931,7 +687,10 @@ impl ExperimentStore {
         now: u64,
     ) -> Result<()> {
         let connection = self.lock()?;
-        insert_event(&connection, event_id, event_type, payload, now)
+        let tx = crate::migrations::write_transaction(&connection)?;
+        insert_event(&tx, event_id, event_type, payload, now)?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -963,7 +722,7 @@ impl ExperimentStore {
 
     pub fn link_watch_session(&self, watch_id: &str, session_id: &str, now: u64) -> Result<bool> {
         let connection = self.lock()?;
-        let transaction = connection.unchecked_transaction()?;
+        let transaction = crate::migrations::write_transaction(&connection)?;
         let changed = transaction.execute(
             "UPDATE experiment_watches SET session_id=?1,updated_at_unix=?2
               WHERE watch_id=?3 AND state='succeeded' AND session_id IS NULL",
@@ -1031,7 +790,8 @@ impl ExperimentStore {
             .payload
             .as_ref()
             .context("Codex command omitted payload")?;
-        let connection = self.lock()?;
+        let guard = self.lock()?;
+        let connection = crate::migrations::write_transaction(&guard)?;
         if let Some((action, expires, encoded)) = connection.query_row(
             "SELECT action,expires_at_unix,payload_json FROM remote_codex_commands WHERE command_id=?1",
             [&command.command_id], |row| Ok((row.get::<_,String>(0)?,row_u64(row,1)?,row.get::<_,String>(2)?)),
@@ -1043,15 +803,38 @@ impl ExperimentStore {
             "INSERT INTO remote_codex_commands (command_id,action,expires_at_unix,payload_json,state,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6)",
             params![command.command_id,action_name(command.action),as_i64(command.expires_at_unix)?,serde_json::to_string(payload)?,if now>=command.expires_at_unix{"expired"}else{"accepted"},as_i64(now)?],
         )?;
+        if command.action == CommandAction::CodexTurnStart {
+            execution::enqueue(
+                &connection,
+                &command.command_id,
+                required_payload_string(payload, "session_id")?,
+            )?;
+            if now >= command.expires_at_unix {
+                execution::finish(&connection, &command.command_id)?;
+            }
+        }
+        connection.commit()?;
         Ok(())
     }
 
     pub fn pending_remote_commands(&self) -> Result<Vec<RemoteCommand>> {
+        self.remote_candidates(false, 0)
+    }
+
+    pub fn runnable_remote_commands(&self, now: u64) -> Result<Vec<RemoteCommand>> {
+        self.remote_candidates(true, now)
+    }
+
+    fn remote_candidates(&self, runnable: bool, now: u64) -> Result<Vec<RemoteCommand>> {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
-            "SELECT command_id,action,expires_at_unix,payload_json,accepted_reported FROM remote_codex_commands WHERE state='accepted' ORDER BY updated_at_unix,command_id LIMIT 8",
+            "SELECT command_id,action,expires_at_unix,payload_json,accepted_reported FROM remote_codex_commands r WHERE state='accepted'
+             AND (?1=0 OR expires_at_unix<=?2 OR (accepted_reported=1 AND (action!='codex.turn.start' OR EXISTS(
+               SELECT 1 FROM execution_queue q WHERE q.job_id=r.command_id AND q.state='queued'
+               AND NOT EXISTS(SELECT 1 FROM execution_queue older WHERE older.session_id=q.session_id AND (older.state='running' OR (older.state='queued' AND older.sequence<q.sequence)))))))
+             ORDER BY accepted_reported,CASE WHEN ?1=1 AND action!='codex.turn.start' THEN 0 ELSE 1 END,updated_at_unix,command_id LIMIT 8",
         )?;
-        let rows = statement.query_map([], |row| {
+        let rows = statement.query_map(params![runnable, as_i64(now)?], |row| {
             let encoded: String = row.get(3)?;
             Ok(RemoteCommand {
                 command_id: row.get(0)?,
@@ -1072,24 +855,11 @@ impl ExperimentStore {
     }
 
     pub fn remote_session_busy(&self, session_id: &str) -> Result<bool> {
-        let connection = self.lock()?;
-        let auto_busy: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM experiment_watches WHERE auto_prompt_claimed=1 AND session_id=?1)",
-            [session_id], |row| row.get(0),
-        )?;
-        if auto_busy {
-            return Ok(true);
-        }
-        let mut statement = connection
-            .prepare("SELECT payload_json FROM remote_codex_commands WHERE state='running'")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        for encoded in rows {
-            let payload: Value = serde_json::from_str(&encoded?)?;
-            if payload.get("session_id").and_then(Value::as_str) == Some(session_id) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        Ok(self.lock()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM execution_queue WHERE session_id=?1 AND state='running')",
+            [session_id],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn mark_remote_accepted_reported(&self, command_id: &str, now: u64) -> Result<()> {
@@ -1098,7 +868,29 @@ impl ExperimentStore {
     }
 
     pub fn claim_remote_command(&self, command_id: &str, now: u64) -> Result<bool> {
-        Ok(self.lock()?.execute("UPDATE remote_codex_commands SET state='running',updated_at_unix=?1 WHERE command_id=?2 AND state='accepted' AND accepted_reported=1",params![as_i64(now)?,command_id])?==1)
+        let connection = self.lock()?;
+        let tx = crate::migrations::write_transaction(&connection)?;
+        if tx.execute("UPDATE remote_codex_commands SET state='expired',updated_at_unix=?2 WHERE command_id=?1 AND state='accepted' AND expires_at_unix<=?2",params![command_id,as_i64(now)?])?==1 {
+            execution::finish(&tx,command_id)?;
+            tx.commit()?;
+            return Ok(false);
+        }
+        let row:Option<(String,String)>=tx.query_row("SELECT action,payload_json FROM remote_codex_commands WHERE command_id=?1 AND state='accepted' AND accepted_reported=1",[command_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let Some((action, encoded)) = row else {
+            return Ok(false);
+        };
+        if action == "codex.turn.start" {
+            let payload: Value = serde_json::from_str(&encoded)?;
+            let session = required_payload_string(&payload, "session_id")?;
+            execution::enqueue(&tx, command_id, session)?;
+            if !execution::claim(&tx, command_id)? {
+                tx.commit()?;
+                return Ok(false);
+            }
+        }
+        let changed=tx.execute("UPDATE remote_codex_commands SET state='running',updated_at_unix=?1 WHERE command_id=?2 AND state='accepted'",params![as_i64(now)?,command_id])?;
+        tx.commit()?;
+        Ok(changed == 1)
     }
 
     pub fn finish_remote_command(
@@ -1116,10 +908,37 @@ impl ExperimentStore {
             ),
             "remote command terminal state is invalid"
         );
-        ensure!(self.lock()?.execute(
+        let connection = self.lock()?;
+        let tx = crate::migrations::write_transaction(&connection)?;
+        ensure!(tx.execute(
             "UPDATE remote_codex_commands SET state=?1,data_json=?2,detail=?3,terminal_reported=0,updated_at_unix=?4 WHERE command_id=?5 AND state='running'",
             params![if state==farhelm_protocol::CommandState::Completed{"completed"}else{"failed"},data.map(serde_json::to_string).transpose()?,detail,as_i64(now)?,command_id]
         )?==1,"remote command was not running");
+        let (action, encoded): (String, String) = tx.query_row(
+            "SELECT action,payload_json FROM remote_codex_commands WHERE command_id=?1",
+            [command_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if action == "codex.turn.start" {
+            let payload: Value = serde_json::from_str(&encoded)?;
+            let event = if state == farhelm_protocol::CommandState::Completed {
+                "codex.turn.completed"
+            } else if data.and_then(|v| v.get("status")).and_then(Value::as_str) == Some("orphaned")
+            {
+                "codex.turn.orphaned"
+            } else {
+                "codex.turn.failed"
+            };
+            insert_event(
+                &tx,
+                &format!("{command_id}:terminal"),
+                event,
+                &json!({"operation_id":command_id,"command_id":command_id,"session_id":payload.get("session_id"),"project_id":payload.get("project_id"),"data":data}),
+                now,
+            )?;
+        }
+        execution::finish(&tx, command_id)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1127,7 +946,7 @@ impl ExperimentStore {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
             "SELECT command_id,state,data_json,detail FROM remote_codex_commands
-              WHERE state IN ('completed','failed') AND terminal_reported=0
+              WHERE state IN ('completed','failed','expired') AND terminal_reported=0
               ORDER BY updated_at_unix,command_id LIMIT 8",
         )?;
         let rows = statement.query_map([], |row| {
@@ -1137,6 +956,8 @@ impl ExperimentStore {
                 command_id: row.get(0)?,
                 state: if state == "completed" {
                     farhelm_protocol::CommandState::Completed
+                } else if state == "expired" {
+                    farhelm_protocol::CommandState::Expired
                 } else {
                     farhelm_protocol::CommandState::Failed
                 },
@@ -1153,7 +974,7 @@ impl ExperimentStore {
     pub fn mark_remote_terminal_reported(&self, command_id: &str, now: u64) -> Result<()> {
         self.lock()?.execute(
             "UPDATE remote_codex_commands SET terminal_reported=1,updated_at_unix=?1
-              WHERE command_id=?2 AND state IN ('completed','failed')",
+              WHERE command_id=?2 AND state IN ('completed','failed','expired')",
             params![as_i64(now)?, command_id],
         )?;
         Ok(())
@@ -1161,39 +982,47 @@ impl ExperimentStore {
 
     pub fn orphan_running_remote_commands(&self, now: u64) -> Result<u64> {
         let connection = self.lock()?;
-        let transaction = connection.unchecked_transaction()?;
+        let transaction = crate::migrations::write_transaction(&connection)?;
         let mut statement = transaction.prepare(
-            "SELECT command_id,payload_json FROM remote_codex_commands WHERE state='running'",
+            "SELECT command_id,payload_json,action FROM remote_codex_commands WHERE state='running'",
         )?;
         let rows = statement
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
-        for (command_id, encoded) in &rows {
+        for (command_id, encoded, action) in &rows {
             let payload: Value = serde_json::from_str(encoded)?;
             transaction.execute(
                 "UPDATE remote_codex_commands SET state='failed',detail='Agent restarted during Codex command; turn is orphaned',terminal_reported=0,updated_at_unix=?1 WHERE command_id=?2 AND state='running'",
                 params![as_i64(now)?,command_id],
             )?;
-            insert_event(
-                &transaction,
-                &format!("{command_id}:orphaned"),
-                "codex.turn.orphaned",
-                &json!({
-                    "command_id":command_id,
-                    "session_id":payload.get("session_id"),
-                    "project_id":payload.get("project_id"),
-                    "detail":"Agent restarted during Codex command"
-                }),
-                now,
-            )?;
-            if let (Some(session_id), Some(project_id), Some(mode)) = (
-                payload.get("session_id").and_then(Value::as_str),
-                payload.get("project_id").and_then(Value::as_str),
-                payload.get("mode").and_then(Value::as_str),
-            ) {
+            if action == "codex.turn.start" {
+                insert_event(
+                    &transaction,
+                    &format!("{command_id}:orphaned"),
+                    "codex.turn.orphaned",
+                    &json!({
+                        "command_id":command_id,
+                        "session_id":payload.get("session_id"),
+                        "project_id":payload.get("project_id"),
+                        "detail":"Agent restarted during Codex command"
+                    }),
+                    now,
+                )?;
+            }
+            if action == "codex.turn.start"
+                && let (Some(session_id), Some(project_id), Some(mode)) = (
+                    payload.get("session_id").and_then(Value::as_str),
+                    payload.get("project_id").and_then(Value::as_str),
+                    payload.get("mode").and_then(Value::as_str),
+                )
+            {
                 insert_event(
                     &transaction,
                     &format!("{command_id}:session-orphaned"),
@@ -1212,7 +1041,12 @@ impl ExperimentStore {
     }
 
     pub fn expire_remote_command(&self, command_id: &str, now: u64) -> Result<()> {
-        self.lock()?.execute("UPDATE remote_codex_commands SET state='expired',updated_at_unix=?1 WHERE command_id=?2 AND state='accepted'",params![as_i64(now)?,command_id])?;
+        let connection = self.lock()?;
+        let tx = crate::migrations::write_transaction(&connection)?;
+        if tx.execute("UPDATE remote_codex_commands SET state='expired',updated_at_unix=?1 WHERE command_id=?2 AND state='accepted' AND expires_at_unix<=?1",params![as_i64(now)?,command_id])?==1 {
+            execution::finish(&tx, command_id)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1250,7 +1084,7 @@ impl ExperimentStore {
 
     pub fn acknowledge_events(&self, event_ids: &[String]) -> Result<()> {
         let connection = self.lock()?;
-        let transaction = connection.unchecked_transaction()?;
+        let transaction = crate::migrations::write_transaction(&connection)?;
         for event_id in event_ids {
             transaction.execute(
                 "UPDATE event_outbox SET acknowledged=1 WHERE event_id=?1",
@@ -1380,14 +1214,41 @@ fn insert_event(
     payload: &Value,
     now: u64,
 ) -> Result<()> {
+    let payload = farhelm_protocol::public_event_payload(event_type, payload);
+    let canonical = if matches!(
+        event_type,
+        "codex.turn.completed" | "codex.turn.failed" | "codex.turn.orphaned"
+    ) {
+        payload
+            .get("operation_id")
+            .or_else(|| payload.get("command_id"))
+            .or_else(|| payload.get("watch_id"))
+            .and_then(Value::as_str)
+            .map(|id| (id, format!("execution:{id}:terminal")))
+    } else {
+        None
+    };
+    if let Some((id, _)) = &canonical {
+        let inserted = connection.execute(
+            "INSERT OR IGNORE INTO execution_results VALUES(?1,?2,?3)",
+            params![id, event_type, serde_json::to_string(&payload)?],
+        )?;
+        if inserted == 0 {
+            return Ok(());
+        }
+    }
+    let event_id = canonical
+        .as_ref()
+        .map(|(_, key)| key.as_str())
+        .unwrap_or(event_id);
     connection.execute(
         "INSERT OR IGNORE INTO event_outbox (event_id,event_type,payload_json,created_at_unix) VALUES (?1,?2,?3,?4)",
-        params![event_id,event_type,serde_json::to_string(payload)?,as_i64(now)?],
+        params![event_id,event_type,serde_json::to_string(&payload)?,as_i64(now)?],
     )?;
     Ok(())
 }
 
-fn ensure_remote_command_columns(connection: &Connection) -> Result<()> {
+pub(crate) fn ensure_remote_command_columns(connection: &Connection) -> Result<()> {
     let mut statement = connection.prepare("PRAGMA table_info(remote_codex_commands)")?;
     let columns = statement
         .query_map([], |row| row.get::<_, String>(1))?

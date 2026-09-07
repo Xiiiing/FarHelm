@@ -226,3 +226,6 @@ button, a { -webkit-tap-highlight-color: transparent; }
     transition-duration: .001ms !important;
   }
 }
+
+.session-select.ant-btn { display: flex; align-items: center; justify-content: space-between; height: auto; min-height: 44px; padding: 0; color: inherit; text-align: left; }
+.session-select.ant-btn:hover { background: transparent !important; }

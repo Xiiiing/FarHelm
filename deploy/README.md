@@ -1,4 +1,4 @@
-# FarHelm V0.6.0 部署与生命周期
+# FarHelm V0.7.0 部署与生命周期
 
 [简体中文](README.md) · [English](README.en.md)
 
@@ -21,7 +21,7 @@ sudo env \
   ./farhelm-hub install
 ```
 
-V0.5.0 可直接执行 `update` 升级；SQLite 会话、配对、项目和调度表会在重启时幂等创建。旧 TOTP 与 Token 字段保留供本机回滚，但 V0.6.0 不再要求 TOTP。V0.3.0 首次跨代安装前仍建议备份：
+V0.5.0 可直接执行 `update` 升级；SQLite 会话、配对、项目和调度表会在重启时幂等创建。旧 TOTP 与 Token 字段保留供本机回滚，但 V0.7.0 不再要求 TOTP。V0.3.0 首次跨代安装前仍建议备份：
 
 ```bash
 sudo cp /var/lib/farhelm/farhelm.db /var/lib/farhelm/farhelm.db.v0.3.bak
@@ -86,8 +86,8 @@ chmod +x farhelm-agent
 Agent 会从同版本不可变 Release 下载独立 Python 3.12/Codex runtime，并校验资产长度和 SHA-256。离线安装时，先传输同版本 runtime 资产，再提供受信任的校验元数据：
 
 ```bash
-FARHELM_CODEX_RUNTIME_ARCHIVE="$PWD/farhelm-codex-runtime-0.6.0-linux-x86_64.tar.gz" \
-FARHELM_CODEX_RUNTIME_SIZE="$(stat -c '%s' farhelm-codex-runtime-0.6.0-linux-x86_64.tar.gz)" \
+FARHELM_CODEX_RUNTIME_ARCHIVE="$PWD/farhelm-codex-runtime-0.7.0-linux-x86_64.tar.gz" \
+FARHELM_CODEX_RUNTIME_SIZE="$(stat -c '%s' farhelm-codex-runtime-0.7.0-linux-x86_64.tar.gz)" \
 FARHELM_CODEX_RUNTIME_SHA256="从受信任的SHA256SUMS复制" \
 ./farhelm-agent install
 ```
@@ -150,9 +150,9 @@ farhelm-agent uninstall --keep-data
 
 ## 从 V0.2.0 迁移
 
-已安装 `V0.3.0` 至 `V0.5.0` 的主机可以直接执行 `farhelm-hub update` 或 `farhelm-agent update`。`V0.2.0` 必须先升级到 `V0.3.0` 完成旧布局迁移，再升级到 V0.6.0。
+已安装 `V0.3.0` 至 `V0.5.0` 的主机可以直接执行 `farhelm-hub update` 或 `farhelm-agent update`。`V0.2.0` 必须先升级到 `V0.3.0` 完成旧布局迁移，再升级到 V0.7.0。
 
-旧小写 `v0.1.0/v0.2.0` 不属于正式升级序列，仍需先使用对应旧卸载器清理，再安装 V0.6.0。
+旧小写 `v0.1.0/v0.2.0` 不属于正式升级序列，仍需先使用对应旧卸载器清理，再安装 V0.7.0。
 
 ## 安全说明
 
@@ -161,3 +161,11 @@ farhelm-agent uninstall --keep-data
 - 新程序完整写入同一文件系统后才原子替换，服务健康失败自动恢复 previous。
 - 配置、数据库和 Worker runtime 不随二进制覆盖；日志进入 journald。
 - 当前只允许固定类型的实验观察和 Codex session/turn 命令；不能启动/停止训练、传入任意 cwd/argv/env/shell，Codex Worker 只通过 Agent 的本地 stdio 连接真实 SDK。
+
+## V0.7 数据升级
+
+先升级 Hub，再升级 Agent。共享数据库只通过角色迁移入口升级到 schema 7；保留现有命令和实验身份。新指令正文只短暂经过 Hub 内存，旧版本未确认交付的正文保留到 Agent 持久接收（已过期指令仅接收并报告过期，不执行）。升级前的数据库/WAL/备份可能仍含历史正文，须按私有数据保存。
+
+schema 7 会让 V0.6 及更早程序拒绝打开数据库，因此不能用旧数据库快照覆盖当前执行记录来强行降级。保留当前数据库并使用兼容 schema 7 的修复版；二进制回滚失败时恢复当前程序。恢复旧快照可能重放已执行操作，不属于支持的回滚路径。
+
+V0.7 的页面通知通过现有 SSE 和持久通知中心工作，无需 VAPID 或手机通知权限。已有 Web Push 接口保留兼容；iOS 系统推送不在本版验收范围。

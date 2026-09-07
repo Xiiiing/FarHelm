@@ -44,28 +44,7 @@ impl CommandStore {
         if path != Path::new(":memory:") {
             connection.pragma_update(None, "journal_mode", "WAL")?;
         }
-        let schema_version: i64 =
-            connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        ensure!(
-            schema_version <= 1,
-            "Agent database schema is newer than this binary"
-        );
-        connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS processed_commands (
-                command_id TEXT PRIMARY KEY,
-                agent_id TEXT NOT NULL,
-                action TEXT NOT NULL CHECK (action = 'agent.probe'),
-                expires_at_unix INTEGER NOT NULL,
-                state TEXT NOT NULL CHECK (state IN ('accepted','completed','failed','expired')),
-                result_json TEXT,
-                detail TEXT,
-                reported INTEGER NOT NULL CHECK (reported IN (0,1)),
-                updated_at_unix INTEGER NOT NULL
-            );",
-        )?;
-        if schema_version == 0 {
-            connection.pragma_update(None, "user_version", 1)?;
-        }
+        crate::migrations::apply(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })

@@ -15,7 +15,10 @@ import { Button, ConfigProvider, Drawer, Grid, Layout, Menu, Space, Spin, Typogr
 import { lazy, Suspense, useEffect, useState } from 'react'
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 
-import { EmptyFeature } from './components/EmptyFeature'
+import { AuditPage } from './components/AuditPage'
+import { SettingsPage } from './components/SettingsPage'
+import { LiveNotifications } from './components/LiveNotifications'
+import type { ColorPreference } from './hooks/useColorMode'
 import { AgentListPage } from './components/AgentListPage'
 import { ExperimentPage } from './components/ExperimentPage'
 import { LoginPage } from './components/LoginPage'
@@ -48,7 +51,7 @@ const mobileItems = [
   { key: '/more', icon: <MoreOutlined />, label: '更多' },
 ]
 
-function FeatureRoutes({ csrf }: { csrf: string }) {
+function FeatureRoutes({ csrf, preference, onPreference, onLogout }: { csrf: string; preference: ColorPreference; onPreference: (value: ColorPreference) => void; onLogout: () => void }) {
   const { health, refresh } = useHubHealth()
   const { agents, refresh: refreshAgents } = useAgents()
   const refreshOverview = () => {
@@ -63,8 +66,8 @@ function FeatureRoutes({ csrf }: { csrf: string }) {
       <Route path="/jobs" element={<Navigate to="/experiments" replace />} />
       <Route path="/codex" element={<Suspense fallback={codexFallback}><CodexPage csrf={csrf} /></Suspense>} />
       <Route path="/notifications" element={<NotificationPage csrf={csrf} />} />
-      <Route path="/audit" element={<EmptyFeature title="审计" description="命令与结果已持久化；独立审计查询界面暂未开放。" icon={<FileSearchOutlined className="empty-icon" />} />} />
-      <Route path="/settings" element={<EmptyFeature title="设置" description="配置项会在安全模型确定后开放。" icon={<SettingOutlined className="empty-icon" />} />} />
+      <Route path="/audit" element={<AuditPage />} />
+      <Route path="/settings" element={<SettingsPage csrf={csrf} preference={preference} onPreference={onPreference} onLogout={onLogout} />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   )
@@ -76,7 +79,7 @@ export default function App() {
   const navigate = useNavigate()
   const location = useLocation()
   const [drawerOpen, setDrawerOpen] = useState(false)
-  const { mode, toggleMode } = useColorMode()
+  const { mode, preference, setPreference, toggleMode } = useColorMode()
   const [session, setSession] = useState<BrowserSession | null | undefined>(undefined)
   useEffect(() => { void readSession().then(setSession).catch(() => setSession(null)) }, [])
   const mobileSelection = ['/agents', '/notifications', '/audit', '/settings'].includes(location.pathname)
@@ -94,10 +97,11 @@ export default function App() {
 
   if (session === undefined) return <ConfigProvider theme={createTheme(mode)}><div className="session-loading"><Spin /><span>正在恢复安全会话…</span></div></ConfigProvider>
   if (session === null) return <ConfigProvider theme={createTheme(mode)}><LoginPage onLogin={setSession} /></ConfigProvider>
-  if (location.pathname === '/codex') return <ConfigProvider theme={createTheme(mode)}><Suspense fallback={codexFallback}><CodexPage csrf={session.csrf_token} /></Suspense></ConfigProvider>
+  if (location.pathname === '/codex') return <ConfigProvider theme={createTheme(mode)}><LiveNotifications /><Suspense fallback={codexFallback}><CodexPage csrf={session.csrf_token} /></Suspense></ConfigProvider>
 
   return (
     <ConfigProvider theme={createTheme(mode)}>
+      <LiveNotifications />
       <Layout className="app-layout">
         {isDesktop && (
           <Sider width={240} className="app-sider">
@@ -106,7 +110,7 @@ export default function App() {
               <div><strong>FarHelm</strong><span>远程训练控制台</span></div>
             </div>
             <Menu mode="inline" selectedKeys={[location.pathname]} items={desktopItems} onClick={({ key }) => go(key)} />
-            <div className="sider-footer"><Typography.Text type="secondary">V0.6.0 · Codex workspace</Typography.Text></div>
+            <div className="sider-footer"><Typography.Text type="secondary">V0.7.0 · Codex workspace</Typography.Text></div>
           </Sider>
         )}
 
@@ -124,7 +128,7 @@ export default function App() {
               {!isDesktop && <Button type="text" icon={<MenuOutlined />} onClick={() => setDrawerOpen(true)} aria-label="打开更多导航" />}
             </Space>
           </Header>
-          <Content className="app-content"><FeatureRoutes csrf={session.csrf_token} /></Content>
+          <Content className="app-content"><FeatureRoutes csrf={session.csrf_token} preference={preference} onPreference={setPreference} onLogout={() => void logout(session.csrf_token).then(() => setSession(null))} /></Content>
         </Layout>
 
         {!isDesktop && (

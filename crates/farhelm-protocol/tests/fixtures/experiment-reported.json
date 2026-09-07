@@ -1,0 +1,14 @@
+{
+  "protocol": "farhelm/1",
+  "event_id": "report:stable-id",
+  "agent_id": "gpu-a",
+  "sequence": 1,
+  "event_type": "experiment.reported",
+  "created_at_unix": 100,
+  "payload": {
+    "report_id": "stable-id", "run_id": "batch-8", "project_id": "cc08",
+    "source": "script_report", "name": "8 rounds", "state": "succeeded",
+    "message": "Complete", "session_id": null, "followup_schedule_id": null,
+    "updated_at_unix": 100
+  }
+}

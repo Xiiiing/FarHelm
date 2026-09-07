@@ -1,6 +1,9 @@
 import { CheckCircleOutlined, DisconnectOutlined, ReloadOutlined } from '@ant-design/icons'
 import { Alert, Button, Card, Col, Row, Space, Spin, Tag, Typography } from 'antd'
 
+import { useEffect, useState } from 'react'
+import { json } from '../api/features'
+
 import type { HealthResponse } from '../api/health'
 import type { AgentsState } from '../hooks/useAgents'
 
@@ -10,6 +13,9 @@ type HubHealth =
   | { state: 'offline'; data?: undefined; message: string }
 
 export function Overview({ health, agents, onRefresh }: { health: HubHealth; agents: AgentsState; onRefresh: () => void }) {
+  const [countsError, setCountsError] = useState(false)
+  const [counts, setCounts] = useState<{ active_experiments: number; active_sessions: number; unread_notifications: number; failed_tasks: number }>()
+  useEffect(() => { let active = true; const load = () => { void json<typeof counts>('/api/v1/overview').then((value) => { if (active) { setCounts(value); setCountsError(false) } }).catch(() => { if (active) setCountsError(true) }) }; load(); const timer = setInterval(load, 15000); return () => { active = false; clearInterval(timer) } }, [])
   const onlineAgents = agents.state === 'ready' ? agents.data.agents.filter((agent) => agent.online).length : undefined
   return (
     <section aria-labelledby="overview-title" className="feature-page">
@@ -68,8 +74,7 @@ export function Overview({ health, agents, onRefresh }: { health: HubHealth; age
               {onlineAgents === undefined && <Tag>Agent 状态不可用</Tag>}
               {onlineAgents === 0 && <Tag>尚无 Agent 心跳</Tag>}
               {onlineAgents !== undefined && onlineAgents > 0 && <Tag color="success">{onlineAgents} 台 Agent 在线</Tag>}
-              <Tag>PID 实验监视</Tag>
-              <Tag>Codex 闭环已启用</Tag>
+              {counts ? <><Tag>{counts.active_experiments} 个活动实验</Tag><Tag>{counts.active_sessions} 个活动会话</Tag><Tag>{counts.unread_notifications} 条未读通知</Tag><Tag>{counts.failed_tasks} 项失败或未知结果</Tag></> : <Tag>{countsError ? '业务统计暂时不可用' : '正在读取业务统计'}</Tag>}
             </Space>
           </Card>
         </Col>

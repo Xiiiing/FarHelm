@@ -83,7 +83,7 @@ class CodexBackend:
                 sessions.append(
                     {
                         "session_id": thread.id,
-                        "title": thread.name or thread.preview,
+                        "title": thread.name or "Codex session",
                         "cwd": cwd,
                         "archived": archived,
                         "updated_at_unix": thread.updated_at,
@@ -126,7 +126,7 @@ class CodexBackend:
                 sessions.append(
                     {
                         "session_id": thread.id,
-                        "title": thread.name or thread.preview,
+                        "title": thread.name or "Codex session",
                         "cwd": thread_cwd,
                         "archived": is_archived,
                         "created_at_unix": thread.created_at,
@@ -159,19 +159,20 @@ class CodexBackend:
             data: list[dict[str, Any]]
             next_cursor: str | None = Field(default=None, alias="nextCursor")
 
+        from .history import bounded_page, decode_cursor
+
+        upstream, resume = decode_cursor(session_id, cursor)
         request: dict[str, Any] = {
             "threadId": session_id,
             "limit": limit,
             "itemsView": "full",
         }
-        if cursor is not None:
-            request["cursor"] = cursor
+        if upstream is not None:
+            request["cursor"] = upstream
         response = self._client.request("thread/turns/list", request, response_model=TurnsPage)
-        return {
-            "session_id": session_id,
-            "turns": [_normalise_turn(turn) for turn in response.data],
-            "next_cursor": response.next_cursor,
-        }
+        return bounded_page(
+            session_id, response.data, upstream, response.next_cursor, resume, _normalise_turn
+        )
 
     def turn_start(
         self, session_id: str, prompt: str, idempotency_key: str, emit: Emit
@@ -207,12 +208,19 @@ class CodexBackend:
                             {"session_id": session_id, "turn_id": turn_id, "delta": delta_buffer},
                         )
                     )
-                emit(_event("codex.turn.completed", data))
                 completed_turn = data.get("turn")
                 status = (
                     completed_turn.get("status", "completed")
                     if isinstance(completed_turn, dict)
                     else "completed"
+                )
+                event_type = (
+                    "codex.turn.completed" if status == "completed" else "codex.turn.failed"
+                )
+                emit(
+                    _event(
+                        event_type, {"session_id": session_id, "turn_id": turn_id, "status": status}
+                    )
                 )
                 return {"session_id": session_id, "turn_id": turn_id, "status": status}
 
@@ -250,7 +258,14 @@ def _summary(value: Any, limit: int = 2048) -> str:
     encoded = text.encode("utf-8")
     if len(encoded) <= limit:
         return text
-    return encoded[:limit].decode("utf-8", errors="ignore") + "…"
+    return encoded[: max(0, limit - 3)].decode("utf-8", errors="ignore") + "…"
+
+
+def _redact_paths(text: str) -> str:
+    # Most prose has no path; avoid a per-character regex scan of every complete message.
+    if "/" not in text:
+        return text
+    return re.sub(r"/(?<!\w/)[^\s'\"]+", "[local path]", text)
 
 
 def _normalise_turn(value: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -302,13 +317,15 @@ def _normalise_turn(value: Mapping[str, Any]) -> Mapping[str, Any]:
                 {
                     "item_id": str(item.get("id") or f"item-{index}"),
                     "kind": kind,
-                    "text": _summary(text),
+                    "text": _summary(text)
+                    if kind in {"command_summary", "file_change_summary"}
+                    else _redact_paths(text),
                 }
             )
     error = value.get("error")
     if error:
         detail = error.get("message", "turn failed") if isinstance(error, Mapping) else error
-        detail = re.sub(r"(?<!\w)/(?:[^\s'\"]+)", "[local path]", str(detail))
+        detail = _redact_paths(str(detail))
         items.append(
             {
                 "item_id": f"{value.get('id', 'turn')}-error",
@@ -329,7 +346,7 @@ def _thread_result(thread: Any) -> Mapping[str, Any]:
     return {
         "session_id": str(thread.id),
         "cwd": _absolute_path(thread.cwd),
-        "title": thread.name or thread.preview,
+        "title": thread.name or "Codex session",
         "updated_at_unix": int(thread.updated_at),
     }
 

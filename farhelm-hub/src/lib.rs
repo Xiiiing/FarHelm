@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
     Json, Router,
@@ -54,6 +54,8 @@ pub const ONLINE_WINDOW_SECS: u64 = 45;
 
 mod command_store;
 mod event_store;
+mod migrations;
+mod notification_routes;
 mod typed_command_store;
 
 use command_store::{CommandStore, CreateCommandError, ReportCommandError};
@@ -90,15 +92,24 @@ pub struct AppState {
     transient_bus: broadcast::Sender<StoredEvent>,
     typed_commands: Arc<TypedCommandStore>,
     push_client: Client,
+    push_notify: Arc<Notify>,
     command_notify: Arc<Notify>,
     read_broker: Arc<AsyncMutex<ReadBroker>>,
+    db_permits: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Default)]
 struct ReadBroker {
     queues: HashMap<String, VecDeque<AgentReadRequest>>,
     notifies: HashMap<String, Arc<Notify>>,
-    waiters: HashMap<String, oneshot::Sender<AgentReadReportRequest>>,
+    waiters: HashMap<
+        String,
+        (
+            String,
+            oneshot::Sender<AgentReadReportRequest>,
+            std::time::Instant,
+        ),
+    >,
 }
 
 #[derive(Clone)]
@@ -109,6 +120,7 @@ enum AgentIdentity {
 
 #[derive(Clone)]
 struct StoredAgent {
+    capabilities: Vec<String>,
     hostname: String,
     agent_version: String,
     last_seen_unix: u64,
@@ -146,18 +158,53 @@ impl AppState {
             transient_bus,
             typed_commands: Arc::new(typed_commands),
             push_client,
+            push_notify: Arc::new(Notify::new()),
             command_notify: Arc::new(Notify::new()),
             read_broker: Arc::new(AsyncMutex::new(ReadBroker::default())),
+            db_permits: Arc::new(tokio::sync::Semaphore::new(8)),
         })
     }
 
     pub fn spawn_background_tasks(&self) {
+        let maintenance = self.clone();
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                timer.tick().await;
+                if let Err(error) =
+                    database(&maintenance, |s| s.typed_commands.maintain_legacy_privacy()).await
+                {
+                    tracing::warn!(%error,"Hub privacy maintenance will retry");
+                }
+            }
+        });
+        let relay = self.typed_commands.clone();
+        let reads = self.read_broker.clone();
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                timer.tick().await;
+                relay.purge_bodies();
+                let mut broker = reads.lock().await;
+                broker.waiters.retain(|_, (_, sender, created)| {
+                    !sender.is_closed() && created.elapsed() < Duration::from_secs(20)
+                });
+                let active = broker
+                    .waiters
+                    .keys()
+                    .cloned()
+                    .collect::<std::collections::HashSet<_>>();
+                for queue in broker.queues.values_mut() {
+                    queue.retain(|item| active.contains(&item.request_id));
+                }
+            }
+        });
         let state = self.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(10));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                ticker.tick().await;
+                tokio::select! {_=ticker.tick()=>{},_=state.push_notify.notified()=>{}}
                 if let Err(error) = deliver_pending_pushes(&state).await {
                     tracing::warn!(%error, "Web Push delivery cycle failed; retrying");
                 }
@@ -255,6 +302,39 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/api/v1/agent/events", post(agent_events))
         .route("/api/v1/experiments", get(list_experiments))
+        .route("/api/v1/experiment-runs", get(notification_routes::runs))
+        .route("/api/v1/overview", get(notification_routes::overview))
+        .route("/api/v1/audit", get(notification_routes::audits))
+        .route("/api/v1/notifications", get(notification_routes::list))
+        .route(
+            "/api/v1/notifications/preferences",
+            get(notification_routes::preferences).post(notification_routes::set_preferences),
+        )
+        .route(
+            "/api/v1/notifications/test",
+            post(notification_routes::browser_test),
+        )
+        .route(
+            "/api/v1/notifications/read-all",
+            post(notification_routes::read_all),
+        )
+        .route(
+            "/api/v1/notifications/{id}",
+            get(notification_routes::detail),
+        )
+        .route(
+            "/api/v1/notifications/{id}/read",
+            post(notification_routes::read),
+        )
+        .route("/api/v1/push/devices", get(notification_routes::devices))
+        .route(
+            "/api/v1/push/devices/{id}",
+            post(notification_routes::update_device).delete(notification_routes::remove_device),
+        )
+        .route(
+            "/api/v1/push/devices/{id}/test",
+            post(notification_routes::test),
+        )
         .route("/api/v1/projects", get(list_projects))
         .route("/api/v1/projects/import", post(import_projects))
         .route(
@@ -325,15 +405,40 @@ async fn deliver_pending_pushes(state: &AppState) -> Result<()> {
     let private = URL_SAFE_NO_PAD.decode(&push.private_key)?;
     let key_pair = SigningKey::from_slice(&private)
         .map_err(|error| anyhow::anyhow!("invalid configured VAPID key: {error}"))?;
+    let pending = database(state, |s| s.events.pending_notifications(unix_time())).await?;
+    let mut deliveries = tokio::task::JoinSet::new();
+    for delivery in pending {
+        if deliveries.len() >= 4 {
+            deliveries
+                .join_next()
+                .await
+                .context("Push task missing")???;
+        }
+        let state = state.clone();
+        let push = push.clone();
+        let key_pair = key_pair.clone();
+        deliveries.spawn(async move {
+            let n=&delivery.notification;
+            let label=match n.state.as_str(){"succeeded"=>"已完成","failed"=>"失败",_=>"结果未知"};
+            let payload=serde_json::json!({"summary":format!("{} · {} · {}",n.agent_id,n.title,label),"event_id":n.event_id,"notification_id":n.id,"url":format!("/notifications?id={}",n.id)});
+            let wire=PushDelivery{event_sequence:n.id as u64,event_id:n.event_id.clone(),event_type:n.category.clone(),payload:serde_json::Value::Null,endpoint:delivery.endpoint.clone(),p256dh:delivery.p256dh.clone(),auth:delivery.auth.clone(),attempts:delivery.attempts};
+            let ttl=(n.created_at_unix+86400).saturating_sub(unix_time()).min(300);
+            let result=if ttl==0 { Err((false,"notification expired".to_owned(),None)) } else {send_push(&state,&push,&key_pair,&wire,payload,ttl).await};
+            database(&state,move |s|s.events.finish_notification_delivery(&delivery,result.as_ref().err().map(|(permanent,detail,retry)|(*permanent,detail.as_str(),*retry)),unix_time())).await
+        });
+    }
+    while let Some(result) = deliveries.join_next().await {
+        result??;
+    }
     for delivery in state.events.pending_push_deliveries(unix_time(), 32)? {
         let Some(payload) = push_payload(&delivery) else {
             state.events.mark_push_sent(&delivery)?;
             continue;
         };
-        let result = send_push(state, push, &key_pair, &delivery, payload).await;
+        let result = send_push(state, push, &key_pair, &delivery, payload, 300).await;
         match result {
             Ok(()) => state.events.mark_push_sent(&delivery)?,
-            Err((permanent, detail)) => {
+            Err((permanent, detail, _)) => {
                 state
                     .events
                     .mark_push_failed(&delivery, permanent, &detail, unix_time())?;
@@ -349,36 +454,50 @@ async fn send_push(
     key_pair: &SigningKey,
     delivery: &PushDelivery,
     payload: serde_json::Value,
-) -> std::result::Result<(), (bool, String)> {
+    ttl: u64,
+) -> std::result::Result<(), (bool, String, Option<u64>)> {
     let public = URL_SAFE_NO_PAD
         .decode(&delivery.p256dh)
-        .map_err(|_| (true, "invalid subscription public key".to_owned()))?;
+        .map_err(|_| (true, "invalid subscription public key".to_owned(), None))?;
     let auth = URL_SAFE_NO_PAD
         .decode(&delivery.auth)
-        .map_err(|_| (true, "invalid subscription auth key".to_owned()))?;
+        .map_err(|_| (true, "invalid subscription auth key".to_owned(), None))?;
     if auth.len() != 16 {
-        return Err((true, "invalid subscription auth key length".to_owned()));
+        return Err((
+            true,
+            "invalid subscription auth key length".to_owned(),
+            None,
+        ));
     }
     let request = WebPushBuilder::new(
         delivery
             .endpoint
             .parse()
-            .map_err(|_| (true, "invalid subscription endpoint".to_owned()))?,
+            .map_err(|_| (true, "invalid subscription endpoint".to_owned(), None))?,
         PublicKey::from_sec1_bytes(&public)
-            .map_err(|_| (true, "invalid subscription public key".to_owned()))?,
+            .map_err(|_| (true, "invalid subscription public key".to_owned(), None))?,
         Auth::clone_from_slice(&auth),
     )
-    .with_valid_duration(Duration::from_secs(300))
-    .build(
-        serde_json::to_vec(&payload)
-            .map_err(|error| (false, format!("failed to encode Push payload: {error}")))?,
-    )
-    .map_err(|error| (true, format!("failed to encrypt Push payload: {error}")))?;
+    .with_valid_duration(Duration::from_secs(ttl))
+    .build(serde_json::to_vec(&payload).map_err(|error| {
+        (
+            false,
+            format!("failed to encode Push payload: {error}"),
+            None,
+        )
+    })?)
+    .map_err(|error| {
+        (
+            true,
+            format!("failed to encrypt Push payload: {error}"),
+            None,
+        )
+    })?;
     let (parts, body) = request.into_parts();
     let endpoint = reqwest::Url::parse(&parts.uri.to_string())
-        .map_err(|_| (true, "invalid subscription endpoint".to_owned()))?;
+        .map_err(|_| (true, "invalid subscription endpoint".to_owned(), None))?;
     let authorization =
-        vapid_authorization(&endpoint, push, key_pair).map_err(|detail| (true, detail))?;
+        vapid_authorization(&endpoint, push, key_pair).map_err(|detail| (true, detail, None))?;
     let mut outgoing = state
         .push_client
         .post(endpoint)
@@ -387,17 +506,37 @@ async fn send_push(
     for (name, value) in &parts.headers {
         outgoing = outgoing.header(name, value);
     }
-    let response = outgoing
-        .send()
-        .await
-        .map_err(|error| (false, format!("Push transport failed: {error}")))?;
+    let response = outgoing.send().await.map_err(|error| {
+        (
+            false,
+            {
+                let _ = error;
+                "Push transport failed".to_owned()
+            },
+            None,
+        )
+    })?;
     if response.status().is_success() {
         return Ok(());
     }
     let code = response.status().as_u16();
+    let retry = response
+        .headers()
+        .get(header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.parse::<u64>().ok().or_else(|| {
+                httpdate::parse_http_date(v)
+                    .ok()?
+                    .duration_since(SystemTime::now())
+                    .ok()
+                    .map(|d| d.as_secs())
+            })
+        });
     Err((
         matches!(code, 404 | 410),
         format!("Push service returned HTTP {code}"),
+        retry,
     ))
 }
 
@@ -586,13 +725,16 @@ async fn authorize(State(state): State<AppState>, mut request: Request, next: Ne
         || path.starts_with("/api/v1/agent/commands/")
         || path.starts_with("/api/v1/agent/reads/")
     {
-        if let Some(agent_id) = bearer_token(request.headers()).and_then(|token| {
-            state
-                .events
-                .agent_for_token_hash(&secret_hash(token))
+        let identity = if let Some(token) = bearer_token(request.headers()) {
+            let hash = secret_hash(token);
+            database(&state, move |s| s.events.agent_for_token_hash(&hash))
+                .await
                 .ok()
                 .flatten()
-        }) {
+        } else {
+            None
+        };
+        if let Some(agent_id) = identity {
             request
                 .extensions_mut()
                 .insert(AgentIdentity::Dedicated(agent_id));
@@ -696,14 +838,24 @@ async fn auth_login(State(state): State<AppState>, Json(request): Json<LoginRequ
         }
         _ => {}
     }
-    let password_ok = verify_secret(&request.password, &state.config.admin_password);
+    let password = request.password.clone();
+    let hash = state.config.admin_password.clone();
+    let password_ok = tokio::task::spawn_blocking(move || verify_secret(&password, &hash))
+        .await
+        .unwrap_or(false);
     let user_ok = secure_eq(&request.username, &state.config.admin_user);
     if !(password_ok && user_ok) {
         if let Err(error) = state.events.record_login_failure(now) {
             tracing::error!(%error, "failed to persist login failure");
         }
+        let _ = state
+            .events
+            .record_audit("auth.login", "administrator", "failed", now);
         return unauthorized(false);
     }
+    let _ = state
+        .events
+        .record_audit("auth.login", "administrator", "succeeded", now);
     if let Err(error) = state.events.clear_login_failures() {
         tracing::error!(%error, "failed to clear login failures");
         return api_error(StatusCode::INTERNAL_SERVER_ERROR, "auth_store_failed");
@@ -739,6 +891,11 @@ async fn auth_login(State(state): State<AppState>, Json(request): Json<LoginRequ
 }
 
 async fn auth_logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let _ = database(&state, |s| {
+        s.events
+            .record_audit("auth.logout", "administrator", "succeeded", unix_time())
+    })
+    .await;
     if let Some(token) = cookie_value(&headers, "farhelm_session") {
         let _ = state.events.delete_browser_session(&secret_hash(token));
     }
@@ -767,9 +924,9 @@ async fn auth_session(State(state): State<AppState>, headers: HeaderMap) -> Resp
 
 async fn browser_session(headers: &HeaderMap, state: &AppState) -> Option<StoredBrowserSession> {
     let token = cookie_value(headers, "farhelm_session")?;
-    state
-        .events
-        .browser_session(&secret_hash(token), unix_time())
+    let hash = secret_hash(token);
+    database(state, move |s| s.events.browser_session(&hash, unix_time()))
+        .await
         .ok()
         .flatten()
 }
@@ -948,6 +1105,7 @@ async fn agent_heartbeat(
     state.agents.write().await.insert(
         heartbeat.agent_id,
         StoredAgent {
+            capabilities: heartbeat.capabilities,
             hostname: heartbeat.hostname,
             agent_version: heartbeat.agent_version,
             last_seen_unix: now,
@@ -1038,7 +1196,8 @@ async fn agent_events(
         .iter()
         .cloned()
         .partition(|event| event.event_type == "codex.message.delta");
-    let inserted = match state.events.ingest(&batch.agent_id, &durable) {
+    let agent = batch.agent_id.clone();
+    let inserted = match database(&state, move |s| s.events.ingest(&agent, &durable)).await {
         Ok(inserted) => inserted,
         Err(error) => {
             tracing::warn!(%error, agent_id = %batch.agent_id, "Agent event batch rejected");
@@ -1051,6 +1210,7 @@ async fn agent_events(
                 .into_response();
         }
     };
+    state.push_notify.notify_one();
     for event in inserted {
         let _ = state.event_bus.send(event);
     }
@@ -1058,8 +1218,8 @@ async fn agent_events(
         let _ = state.transient_bus.send(StoredEvent {
             sequence: 0,
             event_id: event.event_id,
-            event_type: event.event_type,
-            payload: event.payload,
+            event_type: event.event_type.clone(),
+            payload: farhelm_protocol::public_event_payload(&event.event_type, &event.payload),
         });
     }
     Json(AgentEventAck {
@@ -1074,7 +1234,7 @@ async fn agent_events(
 }
 
 async fn list_experiments(State(state): State<AppState>) -> Response {
-    match state.events.experiments() {
+    match database(&state, |s| s.events.experiments()).await {
         Ok(experiments) => Json(experiments).into_response(),
         Err(error) => {
             tracing::error!(%error, "failed to list experiments");
@@ -1090,7 +1250,7 @@ async fn list_experiments(State(state): State<AppState>) -> Response {
 }
 
 async fn list_projects(State(state): State<AppState>) -> Response {
-    match state.events.projects() {
+    match database(&state, |s| s.events.projects()).await {
         Ok(projects) => Json(projects).into_response(),
         Err(error) => {
             tracing::error!(%error, "failed to list project candidates");
@@ -1135,10 +1295,12 @@ async fn import_projects(
         key,
         24 * 60 * 60,
     )
+    .await
 }
 
 #[derive(Debug, Deserialize)]
 struct SessionQuery {
+    agent: Option<String>,
     project: Option<String>,
     archived: Option<String>,
     cursor: Option<String>,
@@ -1163,14 +1325,18 @@ async fn list_codex_sessions(
     if !(1..=50).contains(&limit) {
         return api_error(StatusCode::BAD_REQUEST, "invalid_session_limit");
     }
-    match state.events.sessions(query.project.as_deref(), archived) {
-        Ok(mut page) => {
-            let total = page.sessions.len();
-            page.sessions = page.sessions.into_iter().skip(offset).take(limit).collect();
-            page.next_cursor = (offset + page.sessions.len() < total)
-                .then(|| (offset + page.sessions.len()).to_string());
-            Json(page).into_response()
-        }
+    match database(&state, move |s| {
+        s.events.sessions(
+            query.project.as_deref(),
+            archived,
+            query.agent.as_deref(),
+            offset,
+            limit,
+        )
+    })
+    .await
+    {
+        Ok(page) => Json(page).into_response(),
         Err(error) => {
             tracing::error!(%error, "failed to list Codex sessions");
             (
@@ -1204,13 +1370,19 @@ async fn create_codex_session(
         key,
         300,
     )
+    .await
 }
 
 async fn get_codex_session(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Response {
-    match state.events.session(&session_id) {
+    match database(&state, {
+        let id = session_id.clone();
+        move |s| s.events.session(&id)
+    })
+    .await
+    {
         Ok(Some(session)) => Json(session).into_response(),
         Ok(None) => api_error(StatusCode::NOT_FOUND, "session_not_found"),
         Err(error) => {
@@ -1232,7 +1404,12 @@ async fn send_codex_message(
     let Some(key) = idempotency_header(&headers) else {
         return api_error(StatusCode::BAD_REQUEST, "missing_idempotency_key");
     };
-    let session = match state.events.session(&session_id) {
+    let session = match database(&state, {
+        let id = session_id.clone();
+        move |s| s.events.session(&id)
+    })
+    .await
+    {
         Ok(Some(session)) => session,
         Ok(None) => return api_error(StatusCode::NOT_FOUND, "session_not_found"),
         Err(error) => {
@@ -1253,18 +1430,25 @@ async fn send_codex_message(
         "session_id":session_id,"project_id":session.project_id,"mode":session.mode,
         "turn_id":turn_id,"prompt":request.prompt,"delivery":request.delivery
     });
-    create_typed_response(&state, &session.agent_id, action, payload, key, 300)
+    drop(request);
+    create_typed_response(&state, &session.agent_id, action, payload, key, 300).await
 }
 
 async fn interrupt_codex_session(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     headers: HeaderMap,
+    Json(request): Json<serde_json::Value>,
 ) -> Response {
     let Some(key) = idempotency_header(&headers) else {
         return api_error(StatusCode::BAD_REQUEST, "missing_idempotency_key");
     };
-    let session = match state.events.session(&session_id) {
+    let session = match database(&state, {
+        let id = session_id.clone();
+        move |s| s.events.session(&id)
+    })
+    .await
+    {
         Ok(Some(session)) => session,
         Ok(None) => return api_error(StatusCode::NOT_FOUND, "session_not_found"),
         Err(error) => {
@@ -1275,6 +1459,9 @@ async fn interrupt_codex_session(
     let Some(turn_id) = session.active_turn_id else {
         return api_error(StatusCode::CONFLICT, "session_is_not_running");
     };
+    if request.get("turn_id").and_then(serde_json::Value::as_str) != Some(&turn_id) {
+        return api_error(StatusCode::CONFLICT, "visible_turn_changed");
+    }
     create_typed_response(
         &state,
         &session.agent_id,
@@ -1282,7 +1469,7 @@ async fn interrupt_codex_session(
         serde_json::json!({"session_id":session_id,"project_id":session.project_id,"turn_id":turn_id}),
         key,
         300,
-    )
+    ).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -1294,7 +1481,11 @@ async fn list_codex_schedules(
     State(state): State<AppState>,
     Query(query): Query<ScheduleQuery>,
 ) -> Response {
-    match state.events.schedules(query.session.as_deref()) {
+    match database(&state, move |s| {
+        s.events.schedules(query.session.as_deref())
+    })
+    .await
+    {
         Ok(value) => Json(value).into_response(),
         Err(error) => {
             tracing::error!(%error, "failed to list Codex schedules");
@@ -1330,7 +1521,12 @@ async fn create_codex_schedule(
     let Some(key) = idempotency_header(&headers) else {
         return api_error(StatusCode::BAD_REQUEST, "missing_idempotency_key");
     };
-    let session = match state.events.session(&session_id) {
+    let session = match database(&state, {
+        let id = session_id.clone();
+        move |s| s.events.session(&id)
+    })
+    .await
+    {
         Ok(Some(value)) => value,
         Ok(None) => return api_error(StatusCode::NOT_FOUND, "session_not_found"),
         Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "event_store_failed"),
@@ -1338,33 +1534,39 @@ async fn create_codex_schedule(
     if let farhelm_protocol::CodexScheduleTrigger::ExperimentSucceeded { watch_id } =
         &request.trigger
     {
-        let valid = state.events.experiments().ok().is_some_and(|page| {
-            page.experiments.iter().any(|watch| {
-                watch.watch_id == *watch_id
-                    && watch.agent_id == session.agent_id
-                    && watch.project_id == session.project_id
-                    && watch.state == farhelm_protocol::ExperimentState::Watching
-            })
-        });
+        let valid = database(&state, |s| s.events.experiments())
+            .await
+            .ok()
+            .is_some_and(|page| {
+                page.experiments.iter().any(|watch| {
+                    watch.watch_id == *watch_id
+                        && watch.agent_id == session.agent_id
+                        && watch.project_id == session.project_id
+                        && watch.state == farhelm_protocol::ExperimentState::Watching
+                })
+            });
         if !valid {
             return api_error(StatusCode::CONFLICT, "experiment_not_watching");
         }
     }
-    let schedule_id = format!("sch_{}", &random_token()[..20]);
+    let schedule_id = format!("sch_{}", &secret_hash(&format!("{session_id}:{key}"))[..32]);
     let ttl = match request.trigger {
         farhelm_protocol::CodexScheduleTrigger::AtTime { run_at_unix } => {
             run_at_unix.saturating_sub(now).saturating_add(24 * 60 * 60)
         }
         _ => 365 * 24 * 60 * 60,
     };
+    let payload = serde_json::json!({"schedule_id":schedule_id,"session_id":session_id,"project_id":session.project_id,"trigger":request.trigger,"prompt":request.prompt});
+    drop(request);
     create_typed_response(
         &state,
         &session.agent_id,
         CommandAction::CodexScheduleCreate,
-        serde_json::json!({"schedule_id":schedule_id,"session_id":session_id,"project_id":session.project_id,"trigger":request.trigger,"prompt":request.prompt}),
+        payload,
         key,
         ttl,
     )
+    .await
 }
 
 async fn cancel_codex_schedule(
@@ -1375,7 +1577,12 @@ async fn cancel_codex_schedule(
     let Some(key) = idempotency_header(&headers) else {
         return api_error(StatusCode::BAD_REQUEST, "missing_idempotency_key");
     };
-    let schedule = match state.events.schedule(&schedule_id) {
+    let schedule = match database(&state, {
+        let id = schedule_id.clone();
+        move |s| s.events.schedule(&id)
+    })
+    .await
+    {
         Ok(Some(value)) => value,
         Ok(None) => return api_error(StatusCode::NOT_FOUND, "schedule_not_found"),
         Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "event_store_failed"),
@@ -1395,13 +1602,19 @@ async fn cancel_codex_schedule(
         key,
         300,
     )
+    .await
 }
 
 async fn get_codex_schedule(
     State(state): State<AppState>,
     Path(schedule_id): Path<String>,
 ) -> Response {
-    let schedule = match state.events.schedule(&schedule_id) {
+    let schedule = match database(&state, {
+        let id = schedule_id.clone();
+        move |s| s.events.schedule(&id)
+    })
+    .await
+    {
         Ok(Some(value)) => value,
         Ok(None) => return api_error(StatusCode::NOT_FOUND, "schedule_not_found"),
         Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "event_store_failed"),
@@ -1410,7 +1623,13 @@ async fn get_codex_schedule(
     let (sender, receiver) = oneshot::channel();
     let notify = {
         let mut broker = state.read_broker.lock().await;
-        broker.waiters.insert(request_id.clone(), sender);
+        if broker.waiters.len() >= 128 {
+            return api_error(StatusCode::SERVICE_UNAVAILABLE, "read_capacity_exceeded");
+        }
+        broker.waiters.insert(
+            request_id.clone(),
+            (schedule.agent_id.clone(), sender, std::time::Instant::now()),
+        );
         broker
             .queues
             .entry(schedule.agent_id.clone())
@@ -1466,7 +1685,12 @@ async fn get_codex_transcript(
     {
         return api_error(StatusCode::BAD_REQUEST, "invalid_transcript_query");
     }
-    let session = match state.events.session(&session_id) {
+    let session = match database(&state, {
+        let id = session_id.clone();
+        move |s| s.events.session(&id)
+    })
+    .await
+    {
         Ok(Some(session)) => session,
         Ok(None) => return api_error(StatusCode::NOT_FOUND, "session_not_found"),
         Err(error) => {
@@ -1496,7 +1720,13 @@ async fn get_codex_transcript(
     let (sender, receiver) = oneshot::channel();
     let notify = {
         let mut broker = state.read_broker.lock().await;
-        broker.waiters.insert(request_id.clone(), sender);
+        if broker.waiters.len() >= 128 {
+            return api_error(StatusCode::SERVICE_UNAVAILABLE, "read_capacity_exceeded");
+        }
+        broker.waiters.insert(
+            request_id.clone(),
+            (session.agent_id.clone(), sender, std::time::Instant::now()),
+        );
         broker
             .queues
             .entry(session.agent_id.clone())
@@ -1603,15 +1833,23 @@ async fn report_agent_read(
     {
         return api_error(StatusCode::BAD_REQUEST, "invalid_read_report");
     }
-    let sender = state.read_broker.lock().await.waiters.remove(&request_id);
-    let Some(sender) = sender else {
+    let mut broker = state.read_broker.lock().await;
+    if broker
+        .waiters
+        .get(&request_id)
+        .is_some_and(|(agent, _, _)| agent != &report.agent_id)
+    {
+        return api_error(StatusCode::FORBIDDEN, "read_agent_scope");
+    }
+    let sender = broker.waiters.remove(&request_id);
+    let Some((_, sender, _)) = sender else {
         return api_error(StatusCode::NOT_FOUND, "read_request_not_found");
     };
     let _ = sender.send(report);
     StatusCode::NO_CONTENT.into_response()
 }
 
-fn create_typed_response(
+async fn create_typed_response(
     state: &AppState,
     agent_id: &str,
     action: CommandAction,
@@ -1619,16 +1857,93 @@ fn create_typed_response(
     idempotency_key: &str,
     ttl: u64,
 ) -> Response {
-    match state.typed_commands.create(
-        agent_id,
-        action,
-        &payload,
-        idempotency_key,
-        ttl,
-        unix_time(),
-    ) {
-        Ok(command) => {
+    let has_body = payload.get("prompt").is_some();
+    let saved = if has_body {
+        let agent = agent_id.to_owned();
+        let key = idempotency_key.to_owned();
+        let request = payload.clone();
+        match database(state, move |s| {
+            s.typed_commands
+                .saved_receipt(&agent, action, &request, &key)
+        })
+        .await
+        {
+            Ok(saved) => saved,
+            Err(_) => return api_error(StatusCode::CONFLICT, "idempotency_conflict"),
+        }
+    } else {
+        None
+    };
+    if has_body && saved.is_none() {
+        let agents = state.agents.read().await;
+        let Some(agent) = agents
+            .get(agent_id)
+            .filter(|a| is_online(unix_time(), a.last_seen_unix))
+        else {
+            return api_error(StatusCode::SERVICE_UNAVAILABLE, "agent_offline");
+        };
+        if !agent
+            .capabilities
+            .iter()
+            .any(|c| c == "codex.ephemeral_submit")
+        {
+            return api_error(StatusCode::CONFLICT, "agent_upgrade_required");
+        }
+    }
+    let agent_id = agent_id.to_owned();
+    let key = idempotency_key.to_owned();
+    let result = if let Some(saved) = saved {
+        drop(payload);
+        Ok(saved)
+    } else {
+        database(state, move |s| {
+            s.typed_commands
+                .create(&agent_id, action, &payload, &key, ttl, unix_time())
+        })
+        .await
+    };
+    match result {
+        Ok(mut command) => {
             state.command_notify.notify_waiters();
+            if has_body {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+                while matches!(
+                    command.state,
+                    farhelm_protocol::CommandState::Queued
+                        | farhelm_protocol::CommandState::Delivered
+                ) && tokio::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    if let Ok(Some(latest)) = database(state, {
+                        let id = command.command_id.clone();
+                        move |s| s.typed_commands.get(&id)
+                    })
+                    .await
+                    {
+                        command = latest;
+                    }
+                }
+                state.typed_commands.forget_body(&command.command_id);
+                if matches!(
+                    command.state,
+                    farhelm_protocol::CommandState::Queued
+                        | farhelm_protocol::CommandState::Delivered
+                ) {
+                    return api_error(StatusCode::GATEWAY_TIMEOUT, "agent_save_unconfirmed");
+                }
+            }
+            if has_body && command.state == farhelm_protocol::CommandState::Expired {
+                return api_error(StatusCode::GONE, "operation_expired");
+            }
+            if has_body && command.state == farhelm_protocol::CommandState::Failed {
+                return api_error(StatusCode::CONFLICT, "operation_failed");
+            }
+            let _ = state.events.record_audit(
+                "command.created",
+                &command.command_id,
+                "accepted",
+                unix_time(),
+            );
             (
                 StatusCode::ACCEPTED,
                 Json(CommandAccepted {
@@ -1670,7 +1985,7 @@ async fn event_stream(State(state): State<AppState>, headers: HeaderMap) -> Resp
     // removes the resulting overlap.
     let mut receiver = state.event_bus.subscribe();
     let mut transient_receiver = state.transient_bus.subscribe();
-    let replay = match state.events.replay(after, 1000) {
+    let replay = match database(&state, move |s| s.events.replay(after, 1000)).await {
         Ok(replay) => replay,
         Err(error) => {
             tracing::error!(%error, "failed to replay events");
@@ -1690,7 +2005,7 @@ async fn event_stream(State(state): State<AppState>, headers: HeaderMap) -> Resp
             yield Ok::<Event, Infallible>(sse_event(&event));
         }
         loop {
-            let page = match state.events.replay(cursor, 1000) {
+            let page = match database(&state,move |s|s.events.replay(cursor,1000)).await {
                 Ok(page) => page,
                 Err(error) => {
                     tracing::warn!(%error, "failed to continue SSE replay");
@@ -1721,7 +2036,7 @@ async fn event_stream(State(state): State<AppState>, headers: HeaderMap) -> Resp
                 }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(_)) => loop {
-                    let page = match state.events.replay(cursor, 1000) {
+                    let page = match database(&state,move |s|s.events.replay(cursor,1000)).await {
                         Ok(page) => page,
                         Err(error) => {
                             tracing::warn!(%error, "failed to recover lagged SSE stream");
@@ -1880,7 +2195,7 @@ async fn command_status(State(state): State<AppState>, Path(command_id): Path<St
         return api_error(StatusCode::BAD_REQUEST, "invalid_command_id");
     }
     if command_id.starts_with("cmd_cdx_") {
-        return match state.typed_commands.get(&command_id) {
+        return match database(&state, move |s| s.typed_commands.get(&command_id)).await {
             Ok(Some(command)) => Json(command).into_response(),
             Ok(None) => api_error(StatusCode::NOT_FOUND, "command_not_found"),
             Err(error) => {
@@ -1912,7 +2227,7 @@ async fn claim_command(
     }
     let wait = request.wait_secs.unwrap_or(0).min(25);
     let notified = state.command_notify.notified();
-    let mut command = match claim_command_now(&state, &identity, &request.agent_id) {
+    let mut command = match claim_command_now(&state, &identity, &request.agent_id).await {
         Ok(value) => value,
         Err(error) => {
             tracing::error!(%error, agent_id=%request.agent_id, "failed to claim command");
@@ -1921,7 +2236,7 @@ async fn claim_command(
     };
     if command.is_none() && wait > 0 {
         let _ = tokio::time::timeout(Duration::from_secs(wait), notified).await;
-        command = match claim_command_now(&state, &identity, &request.agent_id) {
+        command = match claim_command_now(&state, &identity, &request.agent_id).await {
             Ok(value) => value,
             Err(error) => {
                 tracing::error!(%error, agent_id=%request.agent_id, "failed to claim command after wake");
@@ -1936,17 +2251,20 @@ async fn claim_command(
     .into_response()
 }
 
-fn claim_command_now(
+async fn claim_command_now(
     state: &AppState,
     identity: &AgentIdentity,
     agent_id: &str,
 ) -> Result<Option<farhelm_protocol::AgentCommand>> {
-    if matches!(identity, AgentIdentity::Dedicated(_))
-        && let Some(command) = state.typed_commands.claim(agent_id, unix_time())?
-    {
-        return Ok(Some(command));
-    }
-    state.commands.claim(agent_id, unix_time())
+    let dedicated = matches!(identity, AgentIdentity::Dedicated(_));
+    let agent_id = agent_id.to_owned();
+    database(state, move |s| {
+        if dedicated && let Some(command) = s.typed_commands.claim(&agent_id, unix_time())? {
+            return Ok(Some(command));
+        }
+        s.commands.claim(&agent_id, unix_time())
+    })
+    .await
 }
 
 async fn report_command(
@@ -1967,7 +2285,12 @@ async fn report_command(
         if matches!(identity, AgentIdentity::Legacy) {
             return api_error(StatusCode::FORBIDDEN, "dedicated_agent_token_required");
         }
-        return match state.typed_commands.report(&report, unix_time()) {
+        return match database(&state, {
+            let report = report.clone();
+            move |s| s.typed_commands.report(&report, unix_time())
+        })
+        .await
+        {
             Ok(command) => Json(command).into_response(),
             Err(error) => {
                 tracing::warn!(%error, command_id=%report.command_id, "typed command report rejected");
@@ -1987,6 +2310,19 @@ async fn report_command(
             api_error(StatusCode::INTERNAL_SERVER_ERROR, "command_store_failed")
         }
     }
+}
+
+async fn database<T: Send + 'static>(
+    state: &AppState,
+    f: impl FnOnce(AppState) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let permit = state.db_permits.clone().acquire_owned().await?;
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f(state)
+    })
+    .await?
 }
 
 fn api_error(status: StatusCode, error: &'static str) -> Response {
@@ -2035,6 +2371,10 @@ fn unix_time() -> u64 {
 }
 
 #[cfg(test)]
+#[path = "notification_http_tests.rs"]
+mod notification_http_tests;
+
+#[cfg(test)]
 mod tests {
     use axum::{
         body::{Body, to_bytes},
@@ -2049,7 +2389,7 @@ mod tests {
 
     use super::*;
 
-    fn test_state() -> AppState {
+    pub(super) fn test_state() -> AppState {
         let state = AppState::new(HubConfig {
             admin_user: "admin".to_owned(),
             admin_password: "correct-horse".to_owned(),
@@ -2338,7 +2678,7 @@ mod tests {
         assert_eq!(value["experiments"][0]["state"], "succeeded");
     }
 
-    fn browser_cookie() -> String {
+    pub(super) fn browser_cookie() -> String {
         "farhelm_session=test-session".to_owned()
     }
 
@@ -2819,8 +3159,48 @@ mod tests {
     async fn schedule_endpoint_queues_validated_typed_command() {
         let state = test_state();
         state.events.ingest("gpu-a", &[AgentEvent { protocol:FARHELM_PROTOCOL.into(),event_id:"session-for-schedule".into(),agent_id:"gpu-a".into(),sequence:1,event_type:"codex.session.updated".into(),created_at_unix:unix_time(),payload:serde_json::json!({"session_id":"ses-a","project_id":"cc08","mode":"inspect","state":"idle","title":"Task","active_turn_id":null,"updated_at_unix":unix_time()}) }]).unwrap();
+        state.agents.write().await.insert(
+            "gpu-a".into(),
+            StoredAgent {
+                capabilities: vec!["codex.ephemeral_submit".into()],
+                hostname: "gpu-a".into(),
+                agent_version: PRODUCT_VERSION.into(),
+                last_seen_unix: unix_time(),
+                credential_state: AgentCredentialState::Paired,
+            },
+        );
+        let agent_state = state.clone();
+        let agent = tokio::spawn(async move {
+            loop {
+                if let Some(command) = agent_state
+                    .typed_commands
+                    .claim("gpu-a", unix_time())
+                    .unwrap()
+                {
+                    assert_eq!(command.payload.as_ref().unwrap()["prompt"], "continue");
+                    agent_state
+                        .typed_commands
+                        .report(
+                            &CommandReportRequest {
+                                protocol: FARHELM_PROTOCOL.into(),
+                                agent_id: "gpu-a".into(),
+                                command_id: command.command_id,
+                                state: CommandState::Accepted,
+                                result: None,
+                                data: None,
+                                detail: None,
+                            },
+                            unix_time(),
+                        )
+                        .unwrap();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
         let response=app(state.clone()).oneshot(Request::builder().method("POST").uri("/api/v1/codex/sessions/ses-a/schedules").header(header::COOKIE,browser_cookie()).header("x-csrf-token","test-csrf").header("idempotency-key","schedule-test-key-0001").header(header::CONTENT_TYPE,"application/json").body(Body::from(serde_json::json!({"prompt":"continue","trigger":{"type":"at_time","run_at_unix":unix_time()+120}}).to_string())).unwrap()).await.unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+        agent.await.unwrap();
         let accepted: CommandAccepted =
             serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
         assert_eq!(

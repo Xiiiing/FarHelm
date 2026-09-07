@@ -4,14 +4,14 @@
   <p><strong>面向个人科研与 GPU 训练环境的远程控制平面</strong></p>
   <p>从手机查看训练服务器状态，并在不开放训练机入站端口的前提下安全扩展远程控制能力。</p>
   <p>
-    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.6.0">V0.6.0</a> ·
+    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.7.0">V0.7.0</a> ·
     <a href="./deploy/README.md">部署文档</a> ·
     <a href="./README.en.md">English</a>
   </p>
 </div>
 
 > [!IMPORTANT]
-> 当前 `V0.6.0` 提供沉浸式 Codex 工作区、分页完整对话、一次性定时发送与训练成功后发送，并缩短会话同步和实时输出路径。Codex 正文只保留在 Agent，本项目仍不提供远程训练启停、自动训练进程扫描、GPU/TensorBoard 图表或任意 shell。
+> `V0.7.0` 加入训练脚本结果上报、统一通知中心和页面提醒，完善 Codex 排队、长消息续读与重启恢复。Codex 正文由 Agent 持久化，Hub 仅短暂中转。训练继续在本地运行。
 
 ## 快速安装
 
@@ -88,6 +88,32 @@ farhelm-agent experiment list
 
 如果当前 shell 尚未包含 `~/.local/bin`，暂时使用完整路径 `~/.local/bin/farhelm-agent`。升级会验证不可变 Release、长度、SHA-256、角色和版本；激活失败会自动恢复本地 previous。
 
+## 训练结束上报与通知
+
+在训练循环外调用一次，记录整批结果；每轮记录请把调用放到循环内，并给每轮不同的 `--run-id`：
+
+```bash
+farhelm-agent experiment report --project cc08 --run-id batch-20260907 \
+  --name "8 轮训练" --status succeeded --message "全部训练完成"
+
+# 只在成功时向同项目的会话排队；指令文件只在 Agent 本地读取
+farhelm-agent experiment report --project cc08 --run-id batch-with-followup \
+  --name "8 轮训练" --exit-code 0 --session ses_xxx \
+  --on-success-prompt-file next-step.txt
+
+# 从 stdin 读取最多 2 KiB 的自定义消息
+printf '训练失败，请登录查看详情' | farhelm-agent experiment report \
+  --project cc08 --name "训练结果" --status failed --message -
+```
+
+成功返回 `run_id`、`event_id` 和 `stored_locally: true`，表示 Agent 本地事务已提交。Agent 服务停止或 Hub 断网时也可保存，服务恢复后补发；浏览器页面收到提醒是后续独立步骤。同 Agent、项目和显式 run ID 的相同内容重试返回原收据，内容改变则冲突。省略 run ID 会创建新记录。名称最多 128 字符；结果支持 succeeded、failed、unknown，或互斥的退出码（0 成功）。
+
+[Bash 示例](examples/experiment-report.sh)和 [Python 示例](examples/experiment-report.py)通过退出捕获报告失败，保留训练退出码，不要求安装 Python SDK。脚本未运行到上报、机器断电或 SIGKILL 无法由单次上报推断结果，仍可使用 PID watch 兜底。成功续话有效期 24 小时，失败与 unknown 只通知。
+
+通知中心支持分页、类型/Agent/结果筛选、未读同步和结果详情。设置页支持系统/浅色/深色主题、实验/Codex 页面提醒开关及页面测试通知。保持 FarHelm 页面打开即可接收完成提醒，点击提醒进入对应详情；初次进入与重连补历史不会批量弹出旧提醒。本版范围为浏览器页面通知，iOS 系统推送留待后续版本。
+
+网页指令和调度在 Agent 保存后才确认提交；失败时当前页面保留草稿并沿用操作身份重试。运行中的任务在 Agent 重启后按已保存的终态收据恢复；无终态收据时标记 orphaned，不自动重放。升级先 Hub 后 Agent，新正文交付要求 Agent 的 V0.7 能力标识。
+
 ## 当前实现
 
 - `farhelm-hub`：Rust 控制平面、密码登录、SQLite 30 天会话、短码配对、Secure HttpOnly Cookie、CSRF、登录限速、可靠事件、SSE 补发和 Web Push。
@@ -142,8 +168,8 @@ make test-release
 
 ## 路线图
 
-1. 在 A6000/CC08、Titan/work831 与 3090/work832 完成 V0.5 零配置 canary。
-2. 在 iPhone 主屏幕 PWA 上完成后台 Web Push 的生产验证。
+1. 在 A6000/CC08、Titan/work831 与 3090/work832 完成 V0.7 部署 canary。
+2. 开发 iOS 客户端并补充系统通知与真机后台验收。
 3. 按实际实验需求评估 GPU 指标与 TensorBoard；不加入远程训练控制。
 
 ## 许可证

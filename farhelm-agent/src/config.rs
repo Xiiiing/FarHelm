@@ -238,10 +238,8 @@ impl AgentFileConfig {
                 project.path.is_absolute(),
                 "project {project_id} path must be absolute"
             );
-            ensure!(
-                !project.success_patterns.is_empty() && !project.failure_patterns.is_empty(),
-                "project {project_id} must configure success and failure patterns"
-            );
+            // Script reports and Codex-only projects need no PID log matching rules.
+            // The watch command requires both rules before registering a PID.
             for pattern in project
                 .success_patterns
                 .iter()
@@ -355,7 +353,7 @@ mod tests {
             config: PathBuf::from("/tmp/config/farhelm/agent.toml"),
             data: PathBuf::from("/tmp/data/farhelm"),
             database: PathBuf::from("/tmp/data/farhelm/state/agent.db"),
-            worker: PathBuf::from("/tmp/data/farhelm/runtime/codex-worker/0.6.0"),
+            worker: PathBuf::from("/tmp/data/farhelm/runtime/codex-worker/0.7.0"),
             unit: PathBuf::from("/tmp/config/systemd/user/farhelm-agent.service"),
             legacy_root: PathBuf::from("/tmp/data/farhelm-agent"),
         };

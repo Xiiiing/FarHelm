@@ -31,7 +31,9 @@ mod command_store;
 mod config;
 mod experiment_store;
 mod management;
+mod migrations;
 mod resources;
+mod runtime_tasks;
 
 use command_store::CommandStore;
 use config::{AgentFileConfig, AgentPaths};
@@ -115,7 +117,7 @@ enum CommandKind {
         /// Only report whether an update is available.
         #[arg(long)]
         check: bool,
-        /// Install one exact formal version, such as V0.6.0.
+        /// Install one exact formal version, such as V0.7.0.
         #[arg(long)]
         version: Option<String>,
         /// Permit a user-approved first-number version change.
@@ -134,6 +136,28 @@ enum CommandKind {
 
 #[derive(Subcommand)]
 enum ExperimentCommand {
+    /// Persist an explicit training result locally; the service delivers it to Hub.
+    Report {
+        #[arg(long, env = "FARHELM_AGENT_CONFIG")]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        name: String,
+        #[arg(long, value_parser=["succeeded","failed","unknown"], conflicts_with="exit_code", required_unless_present="exit_code")]
+        status: Option<String>,
+        #[arg(long, conflicts_with = "status", allow_negative_numbers = true)]
+        exit_code: Option<i32>,
+        /// Use '-' to read the message from stdin.
+        #[arg(long, default_value = "")]
+        message: String,
+        #[arg(long, requires = "on_success_prompt_file")]
+        session: Option<String>,
+        #[arg(long, requires = "session")]
+        on_success_prompt_file: Option<String>,
+    },
     /// Watch one existing PID. FarHelm never starts or stops the process.
     Watch {
         #[arg(long, env = "FARHELM_AGENT_CONFIG")]
@@ -241,6 +265,7 @@ impl std::error::Error for WorkerTurnOrphaned {}
 
 #[derive(Clone)]
 struct WorkerRuntime {
+    tasks: runtime_tasks::RuntimeTasks,
     python: String,
     root: PathBuf,
     registry: WorkerRegistry,
@@ -419,11 +444,13 @@ async fn run(
     let experiment_store = ExperimentStore::open(database)?;
     experiment_store.import_config_projects(projects, unix_time())?;
     let worker_runtime = WorkerRuntime {
+        tasks: runtime_tasks::RuntimeTasks::new(),
         python: worker_python.to_owned(),
         root: worker_root.to_owned(),
         registry: WorkerRegistry::default(),
         idle: Arc::new(AsyncMutex::new(HashMap::new())),
     };
+    experiment_store.recover_recorded_turns(unix_time())?;
     let orphaned = experiment_store.orphan_running_prompts(unix_time())?;
     if orphaned > 0 {
         warn!(
@@ -438,85 +465,80 @@ async fn run(
             "remote Codex commands interrupted by the previous Agent exit were marked orphaned"
         );
     }
-    let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut command_ticker = tokio::time::interval(Duration::from_secs(command_interval_secs));
-    command_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut session_ticker = tokio::time::interval(Duration::from_secs(30));
-    session_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
-
-    info!(
-        version = PRODUCT_VERSION,
-        agent_id = %hub.agent_id,
-        interval_secs,
-        command_interval_secs,
-        "FarHelm Agent is running"
-    );
-    loop {
-        tokio::select! {
-            _ = ticker.tick() => {
-                match send_heartbeat(&client, endpoint.clone(), &hub.token, &heartbeat).await {
-                    Ok(()) => info!(agent_id = %hub.agent_id, "heartbeat accepted"),
-                    Err(error) => warn!(agent_id = %hub.agent_id, %error, "heartbeat failed; retrying"),
-                }
-            }
-            _ = command_ticker.tick() => {
-                let live_projects = approved_project_sections(&experiment_store)?;
-                if let Err(error) = process_command_cycle(&client, &hub, &command_store, &experiment_store, &live_projects, &worker_runtime).await {
-                    warn!(agent_id = %hub.agent_id, %error, "command cycle failed; retrying");
-                }
-                if let Err(error) = process_read_once(&client, &hub, &worker_runtime, &experiment_store).await {
-                    warn!(agent_id = %hub.agent_id, %error, "transient Codex read failed; retrying");
-                }
-                let project_matchers = live_projects.iter().map(|(id, project)| (id.clone(), ProjectMatchers { success: project.success_patterns.clone(), failure: project.failure_patterns.clone() })).collect::<BTreeMap<_, _>>();
-                match experiment_store.inspect(&project_matchers, unix_time()) {
-                    Ok(completed) => for watch in completed {
-                        info!(watch_id = %watch.watch_id, state = ?watch.state, "experiment finished");
-                    },
-                    Err(error) => warn!(%error, "experiment inspection failed; retrying"),
-                }
-                for prompt in experiment_store.pending_auto_prompts(unix_time())? {
-                    if let Some(session_id) = prompt.session_id.as_deref()
-                        && experiment_store.remote_session_busy(session_id)? { continue; }
-                    if experiment_store.claim_auto_prompt(&prompt.watch_id)? {
-                        let database = database.to_owned();
-                        let worker_runtime = worker_runtime.clone();
-                        tokio::spawn(async move {
-                            if let Err(error) = run_auto_prompt(&database, &worker_runtime, prompt).await {
-                                warn!(%error, "automatic Codex prompt failed");
-                            }
-                        });
+    experiment_store.orphan_running_schedules(unix_time())?;
+    let command_store = Arc::new(command_store);
+    let experiment_store = Arc::new(experiment_store);
+    for lane in 0..7 {
+        let client = client.clone();
+        let hub = hub.clone();
+        let endpoint = endpoint.clone();
+        let heartbeat = heartbeat.clone();
+        let commands = command_store.clone();
+        let experiments = experiment_store.clone();
+        let worker = worker_runtime.clone();
+        let database = database.to_owned();
+        worker_runtime.tasks.spawn(async move {
+            let period = match lane {
+                0 => interval_secs,
+                6 => 30,
+                _ => command_interval_secs,
+            };
+            let mut ticker = tokio::time::interval(Duration::from_secs(period));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let result: Result<()> = async {
+                    match lane {
+                        0 => {
+                            send_heartbeat(&client, endpoint.clone(), &hub.token, &heartbeat).await
+                        }
+                        1 => {
+                            let projects = approved_project_sections(&experiments)?;
+                            process_command_cycle(
+                                &client,
+                                &hub,
+                                &commands,
+                                &experiments,
+                                &projects,
+                                &worker,
+                            )
+                            .await
+                            .map(|_| ())
+                        }
+                        2 => process_read_once(&client, &hub, &worker, &experiments).await,
+                        3 => {
+                            let projects = approved_project_sections(&experiments)?;
+                            let matchers = projects
+                                .into_iter()
+                                .map(|(id, p)| {
+                                    (
+                                        id,
+                                        ProjectMatchers {
+                                            success: p.success_patterns,
+                                            failure: p.failure_patterns,
+                                        },
+                                    )
+                                })
+                                .collect();
+                            for watch in experiments.inspect(&matchers, unix_time())? { info!(watch_id=%watch.watch_id,state=?watch.state,"experiment finished"); }
+                            Ok(())
+                        }
+                        4 => dispatch_work(&client, &hub, &experiments, &worker).await,
+                        5 => upload_events(&client, &hub, &experiments).await,
+                        _ => discover_projects(&database, &worker.python, &worker.root).await,
                     }
                 }
-                for prompt in experiment_store.due_schedules(unix_time())? {
-                    if experiment_store.remote_session_busy(&prompt.session_id)? { continue; }
-                    if experiment_store.claim_schedule(&prompt.schedule_id, unix_time())? {
-                        let database = database.to_owned();
-                        let worker_runtime = worker_runtime.clone();
-                        let project = live_projects.get(&prompt.project_id).cloned();
-                        tokio::spawn(async move {
-                            if let Err(error) = run_scheduled_prompt(&database,&worker_runtime,project,prompt).await {
-                                warn!(%error, "scheduled Codex prompt failed");
-                            }
-                        });
-                    }
-                }
-                if let Err(error) = upload_events(&client, &hub, &experiment_store).await {
-                    warn!(agent_id = %hub.agent_id, %error, "event outbox upload failed; retrying");
+                .await;
+                if let Err(error) = result {
+                    warn!(lane, %error, "Agent service cycle failed; retrying");
                 }
             }
-            _ = session_ticker.tick() => {
-                if let Err(error) = discover_projects(database, &worker_runtime.python, &worker_runtime.root).await {
-                    warn!(%error, "Codex project discovery failed");
-                }
-            }
-            () = &mut shutdown => {
-                break;
-            }
-        }
+        });
     }
+    info!(version=PRODUCT_VERSION,agent_id=%hub.agent_id,"FarHelm Agent is running");
+    shutdown_signal().await;
+    worker_runtime.tasks.shutdown().await;
+    worker_runtime.idle.lock().await.clear();
     info!("FarHelm Agent stopped");
     Ok(())
 }
@@ -704,6 +726,54 @@ fn load_local_config(path: Option<PathBuf>) -> Result<AgentFileConfig> {
 
 fn experiment_command(command: ExperimentCommand) -> Result<()> {
     match command {
+        ExperimentCommand::Report {
+            config,
+            project,
+            run_id,
+            name,
+            status,
+            exit_code,
+            mut message,
+            session,
+            on_success_prompt_file,
+        } => {
+            let config = load_local_config(config)?;
+            ensure!(
+                !(on_success_prompt_file.as_deref() == Some("-") && message == "-"),
+                "message and prompt cannot share stdin"
+            );
+            if message == "-" {
+                message.clear();
+                std::io::stdin().take(2049).read_to_string(&mut message)?;
+            }
+            let store = ExperimentStore::open(&config.agent.database)?;
+            store.import_config_projects(&config.projects, unix_time())?;
+            let report = experiment_store::ScriptReport {
+                agent_id: config.agent.id.clone(),
+                project_id: project,
+                run_id,
+                name,
+                status: status.unwrap_or_else(|| {
+                    if exit_code == Some(0) {
+                        "succeeded"
+                    } else {
+                        "failed"
+                    }
+                    .to_owned()
+                }),
+                message,
+                session_id: session,
+                prompt: on_success_prompt_file
+                    .as_deref()
+                    .map(read_prompt)
+                    .transpose()?,
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&store.report_experiment(&report, unix_time())?)?
+            );
+            Ok(())
+        }
         ExperimentCommand::Watch {
             config,
             project,
@@ -900,6 +970,7 @@ async fn command_poll_once(runtime: &RuntimeArgs) -> Result<()> {
     experiments.import_config_projects(&runtime.projects, unix_time())?;
     let live_projects = approved_project_sections(&experiments)?;
     let worker_runtime = WorkerRuntime {
+        tasks: runtime_tasks::RuntimeTasks::new(),
         python: runtime.worker_python.clone(),
         root: runtime.worker_root.clone(),
         registry: WorkerRegistry::default(),
@@ -1108,6 +1179,26 @@ async fn drain_remote_work(
     worker_runtime: &WorkerRuntime,
     processed: &mut u64,
 ) -> Result<()> {
+    let _ = (projects, worker_runtime, processed);
+    for command in store.pending_remote_commands()? {
+        if unix_time() >= command.expires_at_unix {
+            store.expire_remote_command(&command.command_id, unix_time())?;
+            continue;
+        }
+        if !command.accepted_reported {
+            let report = farhelm_protocol::CommandReportRequest {
+                protocol: FARHELM_PROTOCOL.to_owned(),
+                agent_id: hub.agent_id.clone(),
+                command_id: command.command_id.clone(),
+                state: CommandState::Accepted,
+                result: None,
+                detail: None,
+                data: None,
+            };
+            send_command_report(client, hub, &report).await?;
+            store.mark_remote_accepted_reported(&command.command_id, unix_time())?;
+        }
+    }
     for terminal in store.pending_remote_reports()? {
         send_command_report(
             client,
@@ -1125,71 +1216,84 @@ async fn drain_remote_work(
         .await?;
         store.mark_remote_terminal_reported(&terminal.command_id, unix_time())?;
     }
-    for command in store.pending_remote_commands()? {
-        if command.action == CommandAction::CodexTurnStart
-            && let Some(session_id) = command
-                .payload
-                .get("session_id")
-                .and_then(serde_json::Value::as_str)
-            && store.remote_session_busy(session_id)?
-        {
-            continue;
-        }
-        if unix_time() >= command.expires_at_unix {
-            let report = farhelm_protocol::CommandReportRequest {
-                protocol: FARHELM_PROTOCOL.to_owned(),
-                agent_id: hub.agent_id.clone(),
-                command_id: command.command_id.clone(),
-                state: CommandState::Expired,
-                result: None,
-                detail: None,
-                data: None,
-            };
-            send_command_report(client, hub, &report).await?;
-            store.expire_remote_command(&command.command_id, unix_time())?;
-            continue;
-        }
-        if !command.accepted_reported {
-            let report = farhelm_protocol::CommandReportRequest {
-                protocol: FARHELM_PROTOCOL.to_owned(),
-                agent_id: hub.agent_id.clone(),
-                command_id: command.command_id.clone(),
-                state: CommandState::Accepted,
-                result: None,
-                detail: None,
-                data: None,
-            };
-            send_command_report(client, hub, &report).await?;
-            store.mark_remote_accepted_reported(&command.command_id, unix_time())?;
-        }
-        if store.claim_remote_command(&command.command_id, unix_time())? {
-            let client = client.clone();
-            let hub = hub.clone();
-            let database = store_path_for_task(store)?;
-            let projects = projects.clone();
-            let worker_runtime = worker_runtime.clone();
-            tokio::spawn(async move {
-                if let Err(error) = execute_remote_command(
-                    &client,
-                    &hub,
-                    &database,
-                    &projects,
-                    &worker_runtime,
-                    command,
-                )
-                .await
-                {
-                    warn!(%error, "Codex command execution failed");
-                }
-            });
-            *processed += 1;
-        }
-    }
     Ok(())
 }
 
-fn store_path_for_task(_store: &ExperimentStore) -> Result<PathBuf> {
-    Ok(_store.path().to_owned())
+async fn dispatch_work(
+    client: &Client,
+    hub: &HubArgs,
+    store: &ExperimentStore,
+    worker: &WorkerRuntime,
+) -> Result<()> {
+    let projects = approved_project_sections(store)?;
+    for command in store.runnable_remote_commands(unix_time())? {
+        if unix_time() >= command.expires_at_unix {
+            store.expire_remote_command(&command.command_id, unix_time())?;
+            continue;
+        }
+        let control = command.action != CommandAction::CodexTurnStart;
+        if !control
+            && let Some(session) = command
+                .payload
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+            && store.remote_session_busy(session)?
+        {
+            continue;
+        }
+        let Some(permit) = worker.tasks.permit(control) else {
+            continue;
+        };
+        if store.claim_remote_command(&command.command_id, unix_time())? {
+            let database = store.path().to_owned();
+            let projects = projects.clone();
+            let runtime = worker.clone();
+            let client = client.clone();
+            let hub = hub.clone();
+            worker.tasks.spawn(async move {
+                let _permit = permit;
+                if let Err(error) =
+                    execute_remote_command(&client, &hub, &database, &projects, &runtime, command)
+                        .await
+                {
+                    warn!(%error,"Codex command failed");
+                }
+            });
+        }
+    }
+    for prompt in store.pending_auto_prompts(unix_time())? {
+        let Some(permit) = worker.tasks.permit(false) else {
+            break;
+        };
+        if store.claim_auto_prompt(&prompt.watch_id)? {
+            let database = store.path().to_owned();
+            let runtime = worker.clone();
+            worker.tasks.spawn(async move {
+                let _permit = permit;
+                if let Err(error) = run_auto_prompt(&database, &runtime, prompt).await {
+                    warn!(%error,"automatic Codex prompt failed");
+                }
+            });
+        }
+    }
+    for prompt in store.due_schedules(unix_time())? {
+        let Some(permit) = worker.tasks.permit(false) else {
+            break;
+        };
+        if store.claim_schedule(&prompt.schedule_id, unix_time())? {
+            let database = store.path().to_owned();
+            let runtime = worker.clone();
+            let project = projects.get(&prompt.project_id).cloned();
+            worker.tasks.spawn(async move {
+                let _permit = permit;
+                if let Err(error) = run_scheduled_prompt(&database, &runtime, project, prompt).await
+                {
+                    warn!(%error,"scheduled Codex prompt failed");
+                }
+            });
+        }
+    }
+    Ok(())
 }
 
 async fn execute_remote_command(
@@ -1210,19 +1314,18 @@ async fn execute_remote_command(
             } else {
                 "codex.turn.failed"
             };
-            let error_detail: String = error.to_string().chars().take(512).collect();
-            if command.action != CommandAction::ProjectApprove {
-                store.enqueue_event(
-                    &format!("{}:terminal", command.command_id),
-                    event_type,
-                    &serde_json::json!({
-                        "command_id":command.command_id,"project_id":command.payload.get("project_id"),
-                        "session_id":command.payload.get("session_id"),"detail":error_detail.clone()
-                    }),
-                    unix_time(),
-                )?;
-            }
-            (CommandState::Failed, None, Some(error_detail))
+            let error_detail =
+                "Codex operation failed; inspect the local Agent diagnostics".to_owned();
+            let status = if event_type == "codex.turn.orphaned" {
+                "orphaned"
+            } else {
+                "failed"
+            };
+            (
+                CommandState::Failed,
+                Some(serde_json::json!({"status":status})),
+                Some(error_detail),
+            )
         }
     };
     store.finish_remote_command(
@@ -1360,7 +1463,7 @@ async fn execute_remote_command_inner(
                 .unwrap_or(cwd);
             store.bind_session(session_id, project_id, &session_cwd, mode, unix_time())?;
             store.enqueue_event(&format!("{}:session",command.command_id),"codex.session.updated",&serde_json::json!({"session_id":session_id,"project_id":project_id,"mode":mode,"state":"idle","title":value.get("title"),"active_turn_id":null,"updated_at_unix":unix_time()}),unix_time())?;
-            Ok(value)
+            Ok(serde_json::json!({"session_id":session_id}))
         }
         CommandAction::CodexTurnStart => {
             let session_id = command
@@ -1805,7 +1908,7 @@ async fn run_auto_prompt_inner(
                         .unwrap_or(serde_json::Value::Null);
                     store.enqueue_event(
                         &format!("{}:worker:{event_number}", job.watch_id), event_type,
-                        &serde_json::json!({"watch_id":job.watch_id,"project_id":job.project_id,"session_id":session_id,"data":data}), unix_time(),
+                        &serde_json::json!({"operation_id":job.watch_id,"watch_id":job.watch_id,"project_id":job.project_id,"session_id":session_id,"data":data}), unix_time(),
                     )?;
                     if event_type == "codex.turn.started" {
                         let turn_id = data.get("turn_id").and_then(serde_json::Value::as_str);
@@ -1821,7 +1924,8 @@ async fn run_auto_prompt_inner(
                         complete_worker_waiter(&active_worker, response)?;
                         continue;
                     }
-                    ensure!(response.ok, "Worker turn failed: {:?}", response.error);
+                    ensure!(response.ok, "Worker turn failed");
+                    ensure!(response.result.as_ref().and_then(|v|v.get("status")).and_then(serde_json::Value::as_str).is_none_or(|v|v=="completed"),"Codex turn did not complete successfully");
                     return response
                         .result
                         .as_ref()
@@ -1835,6 +1939,20 @@ async fn run_auto_prompt_inner(
         }
     }
     .await;
+    let turn_result = if turn_result.is_err() {
+        match store.recorded_turn(&job.watch_id)? {
+            Some((event, payload)) if event == "codex.turn.completed" => payload
+                .get("data")
+                .unwrap_or(&payload)
+                .get("turn_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .context("completed turn receipt omitted ID"),
+            _ => turn_result,
+        }
+    } else {
+        turn_result
+    };
     match turn_result {
         Ok(turn_id) => {
             enqueue_session_state(store, job, &session_id, &mode, "idle", "session-idle")?;

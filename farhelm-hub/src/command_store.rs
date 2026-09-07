@@ -50,35 +50,7 @@ impl CommandStore {
         if path != Path::new(":memory:") {
             connection.pragma_update(None, "journal_mode", "WAL")?;
         }
-        let schema_version: i64 =
-            connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        anyhow::ensure!(
-            schema_version <= 1,
-            "Hub database schema is newer than this binary"
-        );
-        connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS commands (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                command_id TEXT NOT NULL UNIQUE,
-                agent_id TEXT NOT NULL,
-                action TEXT NOT NULL CHECK (action = 'agent.probe'),
-                state TEXT NOT NULL CHECK (
-                    state IN ('queued','delivered','accepted','completed','failed','expired','cancelled','unknown')
-                ),
-                idempotency_key TEXT NOT NULL UNIQUE,
-                ttl_secs INTEGER NOT NULL,
-                created_at_unix INTEGER NOT NULL,
-                expires_at_unix INTEGER NOT NULL,
-                updated_at_unix INTEGER NOT NULL,
-                result_json TEXT,
-                detail TEXT
-            );
-            CREATE INDEX IF NOT EXISTS commands_agent_delivery
-                ON commands(agent_id, state, id);",
-        )?;
-        if schema_version == 0 {
-            connection.pragma_update(None, "user_version", 1)?;
-        }
+        crate::migrations::apply(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })

@@ -1,3 +1,5 @@
+#[path = "notification_store.rs"]
+pub mod notifications;
 use std::{
     path::Path,
     sync::{Mutex, MutexGuard},
@@ -70,111 +72,7 @@ impl EventStore {
         if path != Path::new(":memory:") {
             connection.pragma_update(None, "journal_mode", "WAL")?;
         }
-        connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS agent_events (
-                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id TEXT NOT NULL UNIQUE,
-                agent_id TEXT NOT NULL,
-                agent_sequence INTEGER NOT NULL,
-                event_type TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                created_at_unix INTEGER NOT NULL,
-                UNIQUE(agent_id, agent_sequence)
-            );
-            CREATE TABLE IF NOT EXISTS experiments (
-                watch_id TEXT PRIMARY KEY,
-                agent_id TEXT NOT NULL,
-                project_id TEXT NOT NULL,
-                name TEXT NOT NULL,
-                pid INTEGER NOT NULL,
-                state TEXT NOT NULL CHECK (state IN ('watching','succeeded','failed','unknown','cancelled')),
-                session_id TEXT,
-                detail TEXT,
-                updated_at_unix INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS codex_sessions (
-                session_id TEXT PRIMARY KEY,
-                agent_id TEXT NOT NULL,
-                project_id TEXT NOT NULL,
-                mode TEXT NOT NULL CHECK (mode IN ('inspect','edit')),
-                state TEXT NOT NULL CHECK (state IN ('creating','idle','queued','running','interrupting','failed','orphaned','archived')),
-                title TEXT,
-                active_turn_id TEXT,
-                updated_at_unix INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS codex_schedules (
-                schedule_id TEXT PRIMARY KEY,
-                agent_id TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                project_id TEXT NOT NULL,
-                trigger_json TEXT NOT NULL,
-                state TEXT NOT NULL,
-                created_at_unix INTEGER NOT NULL,
-                updated_at_unix INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS push_subscriptions (
-                endpoint TEXT PRIMARY KEY,
-                p256dh TEXT NOT NULL,
-                auth TEXT NOT NULL,
-                created_at_unix INTEGER NOT NULL,
-                updated_at_unix INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS push_deliveries (
-                event_sequence INTEGER NOT NULL,
-                endpoint TEXT NOT NULL,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                next_attempt_unix INTEGER NOT NULL,
-                state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','failed')),
-                last_error TEXT,
-                PRIMARY KEY(event_sequence,endpoint),
-                FOREIGN KEY(event_sequence) REFERENCES agent_events(sequence) ON DELETE CASCADE,
-                FOREIGN KEY(endpoint) REFERENCES push_subscriptions(endpoint) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS auth_recovery_codes (
-                hash TEXT PRIMARY KEY,
-                consumed INTEGER NOT NULL DEFAULT 0 CHECK (consumed IN (0,1))
-            );
-            CREATE TABLE IF NOT EXISTS browser_sessions (
-                token_hash TEXT PRIMARY KEY,
-                user TEXT NOT NULL,
-                csrf_token TEXT NOT NULL,
-                created_at_unix INTEGER NOT NULL,
-                expires_at_unix INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS login_failures (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                occurred_at_unix INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS agent_credentials (
-                agent_id TEXT PRIMARY KEY,
-                token_hash TEXT NOT NULL UNIQUE,
-                created_at_unix INTEGER NOT NULL,
-                updated_at_unix INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS pairing_codes (
-                pairing_id TEXT PRIMARY KEY,
-                agent_id TEXT NOT NULL,
-                code_hash TEXT NOT NULL UNIQUE,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                expires_at_unix INTEGER NOT NULL,
-                consumed INTEGER NOT NULL DEFAULT 0 CHECK (consumed IN (0,1)),
-                created_at_unix INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS pairing_failures (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                occurred_at_unix INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS project_candidates (
-                candidate_id TEXT PRIMARY KEY,
-                agent_id TEXT NOT NULL,
-                display_name TEXT NOT NULL,
-                suggested_project_id TEXT NOT NULL,
-                session_count INTEGER NOT NULL,
-                state TEXT NOT NULL CHECK (state IN ('discovered','approved')),
-                updated_at_unix INTEGER NOT NULL,
-                UNIQUE(agent_id,candidate_id)
-            );",
-        )?;
+        crate::migrations::apply(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -293,7 +191,7 @@ impl EventStore {
         expires_at_unix: u64,
     ) -> Result<()> {
         let connection = self.lock()?;
-        let transaction = connection.unchecked_transaction()?;
+        let transaction = crate::migrations::write_transaction(&connection)?;
         transaction.execute(
             "DELETE FROM pairing_codes WHERE agent_id=?1 AND consumed=0",
             [agent_id],
@@ -323,7 +221,7 @@ impl EventStore {
         now: u64,
     ) -> Result<bool> {
         let connection = self.lock()?;
-        let transaction = connection.unchecked_transaction()?;
+        let transaction = crate::migrations::write_transaction(&connection)?;
         let consumed = transaction.execute(
             "UPDATE pairing_codes SET consumed=1 WHERE pairing_id=?1 AND agent_id=?2 AND consumed=0 AND attempts<5 AND expires_at_unix>?3",
             params![pairing_id,agent_id,as_i64(now)?],
@@ -410,9 +308,13 @@ impl EventStore {
     pub fn ingest(&self, agent_id: &str, events: &[AgentEvent]) -> Result<Vec<StoredEvent>> {
         ensure!(events.len() <= 100, "event batch exceeds 100 items");
         let connection = self.lock()?;
-        let transaction = connection.unchecked_transaction()?;
+        let transaction = crate::migrations::write_transaction(&connection)?;
         let mut inserted = Vec::new();
-        for event in events {
+        for original in events {
+            let mut sanitized = original.clone();
+            sanitized.payload =
+                farhelm_protocol::public_event_payload(&original.event_type, &original.payload);
+            let event = &sanitized;
             ensure!(
                 event.protocol == FARHELM_PROTOCOL,
                 "event protocol mismatch"
@@ -431,7 +333,12 @@ impl EventStore {
                 let sequence = u64::try_from(transaction.last_insert_rowid())
                     .context("invalid event sequence")?;
                 apply_materialized_view(&transaction, agent_id, event)?;
-                if pushworthy(event) {
+                let notified = notifications::ingest(&transaction, agent_id, event)?;
+                if !notified
+                    && pushworthy(event)
+                    && !event.event_type.starts_with("codex.")
+                    && event.event_type != "experiment.updated"
+                {
                     transaction.execute(
                         "INSERT OR IGNORE INTO push_deliveries (event_sequence,endpoint,next_attempt_unix)
                          SELECT ?1,endpoint,?2 FROM push_subscriptions",
@@ -478,6 +385,9 @@ impl EventStore {
         &self,
         project: Option<&str>,
         archived: ArchiveFilter,
+        agent: Option<&str>,
+        offset: usize,
+        limit: usize,
     ) -> Result<CodexSessionListResponse> {
         let connection = self.lock()?;
         let archive_clause = match archived {
@@ -486,25 +396,36 @@ impl EventStore {
             ArchiveFilter::All => "",
         };
         let sql = format!(
-            "SELECT session_id,agent_id,project_id,mode,state,title,active_turn_id,updated_at_unix FROM codex_sessions WHERE (?1 IS NULL OR project_id=?1){archive_clause} ORDER BY updated_at_unix DESC,session_id DESC"
+            "SELECT session_id,agent_id,project_id,mode,state,title,active_turn_id,updated_at_unix FROM codex_sessions WHERE (?1 IS NULL OR project_id=?1) AND (?2 IS NULL OR agent_id=?2){archive_clause} ORDER BY updated_at_unix DESC,session_id DESC LIMIT ?3 OFFSET ?4"
         );
         let mut statement = connection.prepare(&sql)?;
-        let rows = statement.query_map([project], |row| {
-            Ok(CodexSessionSummary {
-                session_id: row.get(0)?,
-                agent_id: row.get(1)?,
-                project_id: row.get(2)?,
-                mode: parse_mode(&row.get::<_, String>(3)?)?,
-                state: parse_session_state(&row.get::<_, String>(4)?)?,
-                title: row.get(5)?,
-                active_turn_id: row.get(6)?,
-                updated_at_unix: row_u64(row, 7)?,
-            })
-        })?;
+        let rows = statement.query_map(
+            params![
+                project,
+                agent,
+                i64::try_from(limit + 1)?,
+                i64::try_from(offset)?
+            ],
+            |row| {
+                Ok(CodexSessionSummary {
+                    session_id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    project_id: row.get(2)?,
+                    mode: parse_mode(&row.get::<_, String>(3)?)?,
+                    state: parse_session_state(&row.get::<_, String>(4)?)?,
+                    title: row.get(5)?,
+                    active_turn_id: row.get(6)?,
+                    updated_at_unix: row_u64(row, 7)?,
+                })
+            },
+        )?;
+        let mut sessions = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let next_cursor = (sessions.len() > limit).then(|| (offset + limit).to_string());
+        sessions.truncate(limit);
         Ok(CodexSessionListResponse {
             protocol: FARHELM_PROTOCOL.to_owned(),
-            sessions: rows.collect::<rusqlite::Result<Vec<_>>>()?,
-            next_cursor: None,
+            sessions,
+            next_cursor,
         })
     }
 
@@ -592,7 +513,8 @@ impl EventStore {
 
     pub fn delete_push_subscription(&self, endpoint: &str) -> Result<bool> {
         let connection = self.lock()?;
-        let transaction = connection.unchecked_transaction()?;
+        let transaction = crate::migrations::write_transaction(&connection)?;
+        transaction.execute("UPDATE notification_deliveries SET state='failed',last_error='subscription revoked' WHERE endpoint=?1 AND state='pending'",[endpoint])?;
         transaction.execute("DELETE FROM push_deliveries WHERE endpoint=?1", [endpoint])?;
         let changed = transaction.execute(
             "DELETE FROM push_subscriptions WHERE endpoint=?1",
@@ -645,7 +567,7 @@ impl EventStore {
         now: u64,
     ) -> Result<()> {
         let connection = self.lock()?;
-        let transaction = connection.unchecked_transaction()?;
+        let transaction = crate::migrations::write_transaction(&connection)?;
         if permanent {
             transaction.execute(
                 "DELETE FROM push_deliveries WHERE endpoint=?1",
@@ -742,6 +664,22 @@ fn apply_materialized_view(
             )?;
         }
         "codex.schedule.updated" => {
+            let id = format!(
+                "{agent_id}:{}",
+                required_string(&event.payload, "schedule_id")?
+            );
+            if let Some(revision) = event.payload.get("revision").and_then(Value::as_u64) {
+                let changed=connection.execute("INSERT INTO projection_revisions VALUES(?1,?2) ON CONFLICT(entity_id) DO UPDATE SET revision=excluded.revision WHERE excluded.revision>projection_revisions.revision",params![id,as_i64(revision)?])?;
+                if changed == 0 {
+                    return Ok(());
+                }
+            } else if connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM projection_revisions WHERE entity_id=?1)",
+                [id],
+                |r| r.get::<_, bool>(0),
+            )? {
+                return Ok(());
+            }
             let mut value = event.payload.clone();
             if let Value::Object(ref mut map) = value {
                 map.insert("agent_id".to_owned(), Value::String(agent_id.to_owned()));
@@ -757,6 +695,15 @@ fn apply_materialized_view(
             )?;
         }
         "project.discovered" | "project.updated" => {
+            if event.event_type == "project.updated" {
+                notifications::audit(
+                    connection,
+                    "project.authorization",
+                    required_string(&event.payload, "candidate_id")?,
+                    "approved",
+                    event.created_at_unix,
+                )?;
+            }
             let candidate_id = required_string(&event.payload, "candidate_id")?;
             let display_name = required_string(&event.payload, "display_name")?;
             let suggested_project_id = required_string(&event.payload, "suggested_project_id")?;
@@ -976,14 +923,14 @@ mod tests {
         store.ingest("agent-a", &[event]).unwrap();
         let mut now = 10;
         for attempt in 1..=8 {
-            let delivery = store.pending_push_deliveries(now, 1).unwrap().remove(0);
+            let delivery = store.pending_notifications(now).unwrap().remove(0);
             assert_eq!(delivery.attempts, attempt - 1);
             store
-                .mark_push_failed(&delivery, false, "temporary", now)
+                .finish_notification_delivery(&delivery, Some((false, "temporary", None)), now)
                 .unwrap();
-            now += 4000;
+            now += (30_u64 * (1 << attempt.min(7))).min(3600);
         }
-        assert!(store.pending_push_deliveries(now, 1).unwrap().is_empty());
+        assert!(store.pending_notifications(now).unwrap().is_empty());
     }
 
     #[test]

@@ -26,3 +26,10 @@ class ResizeObserverMock {
 }
 
 globalThis.ResizeObserver = ResizeObserverMock
+
+class EventSourceMock extends EventTarget {
+  url: string
+  constructor(url: string) { super(); this.url = url }
+  close() {}
+}
+Object.defineProperty(globalThis, 'EventSource', { configurable: true, writable: true, value: EventSourceMock })

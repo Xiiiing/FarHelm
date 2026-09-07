@@ -37,7 +37,7 @@ def test_worker_hello_advertises_implemented_capabilities() -> None:
     assert response["request_id"] == "req_test"
     assert response["result"] == {
         "worker": "farhelm-worker-codex",
-        "version": "0.6.0",
+        "version": "0.7.0",
         "capabilities": CAPABILITIES,
     }
 
@@ -185,7 +185,7 @@ def test_sdk_absolute_path_root_model_is_used_for_session_filtering() -> None:
         "sessions": [
             {
                 "session_id": "ses_sdk",
-                "title": "Existing task",
+                "title": "Codex session",
                 "cwd": "/srv/project",
                 "archived": False,
                 "created_at_unix": 10,
@@ -225,14 +225,14 @@ def test_project_discovery_deduplicates_current_and_archived_thread_cwds() -> No
         "sessions": [
             {
                 "session_id": "archived",
-                "title": "Task",
+                "title": "Codex session",
                 "cwd": "/srv/project",
                 "archived": True,
                 "updated_at_unix": 30,
             },
             {
                 "session_id": "current",
-                "title": "Task",
+                "title": "Codex session",
                 "cwd": "/srv/project",
                 "archived": False,
                 "updated_at_unix": 20,

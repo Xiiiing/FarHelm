@@ -4,16 +4,16 @@ export type ExperimentState = 'watching' | 'succeeded' | 'failed' | 'unknown' | 
 export type Experiment = { watch_id: string; agent_id: string; project_id: string; name: string; pid: number; state: ExperimentState; session_id?: string; detail?: string; updated_at_unix: number }
 export type SessionState = 'creating' | 'idle' | 'queued' | 'running' | 'interrupting' | 'failed' | 'orphaned' | 'archived'
 export type CodexSession = { session_id: string; agent_id: string; project_id: string; mode: 'inspect' | 'edit'; state: SessionState; title?: string; active_turn_id?: string; updated_at_unix: number }
-export type TranscriptItem = { item_id: string; kind: 'user_message' | 'assistant_message' | 'command_summary' | 'file_change_summary' | 'error'; text: string }
+export type TranscriptItem = { item_id: string; kind: 'user_message' | 'assistant_message' | 'command_summary' | 'file_change_summary' | 'error'; text: string; text_offset?: number; text_complete?: boolean }
 export type TranscriptTurn = { turn_id: string; status: string; started_at_unix?: number; completed_at_unix?: number; items: TranscriptItem[] }
 export type TranscriptPage = { protocol?: string; session_id: string; turns: TranscriptTurn[]; next_cursor?: string }
 export type ScheduleTrigger = { type: 'at_time'; run_at_unix: number } | { type: 'experiment_succeeded'; watch_id: string }
 export type CodexSchedule = { schedule_id: string; agent_id: string; session_id: string; project_id: string; trigger: ScheduleTrigger; state: 'pending' | 'queued' | 'running' | 'completed' | 'cancelled' | 'skipped' | 'missed' | 'failed' | 'orphaned'; created_at_unix: number; updated_at_unix: number }
 export type ProjectCandidate = { candidate_id: string; agent_id: string; display_name: string; suggested_project_id: string; session_count: number; state: 'discovered' | 'approved'; updated_at_unix: number }
 
-async function json<T>(url: string): Promise<T> {
+export async function json<T>(url: string): Promise<T> {
   const response = await fetch(url, { credentials: 'same-origin', headers: { Accept: 'application/json' } })
-  if (!response.ok) throw new Error(`Hub returned HTTP ${response.status}`)
+  if (!response.ok) throw await apiError(response)
   return response.json() as Promise<T>
 }
 
@@ -23,15 +23,14 @@ export async function fetchExperiments(): Promise<Experiment[]> {
   return value.experiments
 }
 
-export async function fetchSessions(project?: string, archived: 'false' | 'true' | 'all' = 'false'): Promise<CodexSession[]> {
-  const sessions: CodexSession[] = []; let cursor: string | undefined
-  do {
-    const params = new URLSearchParams({ archived, limit: '50' }); if (project) params.set('project', project); if (cursor) params.set('cursor', cursor)
-    const value = await json<{ protocol: string; sessions: CodexSession[]; next_cursor?: string }>(`/api/v1/codex/sessions?${params}`)
-    if (value.protocol !== PROTOCOL_VERSION || !Array.isArray(value.sessions)) throw new Error('Hub returned invalid sessions')
-    sessions.push(...value.sessions); cursor = value.next_cursor
-  } while (cursor && sessions.length < 1000)
-  return sessions
+export async function fetchSessionPage(project?: string, archived: 'false' | 'true' | 'all' = 'false', cursor?: string) {
+  const params = new URLSearchParams({ archived, limit: '50' }); if (project) params.set('project', project); if (cursor) params.set('cursor', cursor)
+  const value = await json<{ protocol: string; sessions: CodexSession[]; next_cursor?: string }>(`/api/v1/codex/sessions?${params}`)
+  if (value.protocol !== PROTOCOL_VERSION || !Array.isArray(value.sessions)) throw new Error('Hub returned invalid sessions')
+  return value
+}
+export async function fetchSessions(project?: string, archived: 'false' | 'true' | 'all' = 'false') {
+  return (await fetchSessionPage(project, archived)).sessions
 }
 
 export async function fetchTranscript(sessionId: string, cursor?: string): Promise<TranscriptPage> {
@@ -54,15 +53,43 @@ export async function fetchProjects(): Promise<ProjectCandidate[]> {
   return value.projects
 }
 
-function idempotencyKey() { return `${Date.now()}-${crypto.randomUUID()}` }
-
-async function mutate(url: string, csrf: string, body?: unknown): Promise<void> {
-  const response = await fetch(url, {
-    method: 'POST', credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf, 'Idempotency-Key': idempotencyKey() },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  })
-  if (!response.ok) throw new Error(`Hub returned HTTP ${response.status}`)
+const pendingOperations = new Map<string, string>()
+const savedReceipts = new Map<string, { identity: string; key: string }>()
+export type Operation = { command_id?: string; state?: string; status_url?: string }
+async function apiError(response: Response) {
+  const value = await response.json().catch(() => ({})) as { error?: string }
+  const errors: Record<string, string> = { operation_expired: '这次操作已过期，草稿已保留；核对状态后可修改指令重新提交', operation_failed: '这次操作已失败，草稿已保留；请先核对执行结果', agent_offline: 'Agent 离线，指令尚未保存；连接恢复后重试', agent_upgrade_required: '请先升级 Agent 至 V0.7.0', agent_save_unconfirmed: '尚未确认 Agent 保存，重试会核对同一次操作', invalid_schedule_time: '时间必须在 60 秒至 365 天之间', session_is_not_running: '当前会话已没有活动对话', visible_turn_changed: '活动对话已改变，请刷新后再操作', idempotency_conflict: '操作身份与之前的请求冲突' }
+  return new Error(errors[value.error ?? ''] ?? (response.status === 401 ? '登录已过期，请重新登录' : `请求失败（HTTP ${response.status}）${value.error ? `：${value.error}` : ''}`))
+}
+export async function mutate(url: string, csrf: string, body?: unknown, method = 'POST'): Promise<Operation> {
+  const identity = `${method}:${url}:${JSON.stringify(body)}`
+  const key = pendingOperations.get(identity) ?? crypto.randomUUID()
+  pendingOperations.set(identity, key)
+  const response = await fetch(url, { method, credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf, 'Idempotency-Key': key }, body: body === undefined ? undefined : JSON.stringify(body) })
+  if (!response.ok) {
+    if ([400, 401, 403, 404].includes(response.status)) pendingOperations.delete(identity)
+    throw await apiError(response)
+  }
+  const result = response.status === 204 ? {} : await response.json().catch(() => ({})) as Operation
+  pendingOperations.delete(identity)
+  if (result.command_id) { savedReceipts.set(result.command_id, { identity, key }); if (savedReceipts.size > 256) savedReceipts.delete(savedReceipts.keys().next().value!) }
+  return result
+}
+export async function waitForCommand(operation: Operation): Promise<void> {
+  if (!operation.command_id) return
+  try {
+    for (let count = 0; count < 60; count++) {
+      const status = await json<{ state: string; detail?: string }>(`/api/v1/commands/${encodeURIComponent(operation.command_id)}`)
+      if (status.state === 'completed') { savedReceipts.delete(operation.command_id); return }
+      if (['failed', 'expired', 'unknown'].includes(status.state)) throw new Error(status.detail || `操作结果：${status.state}`)
+      await new Promise((resolve) => setTimeout(resolve, 500))
+    }
+    throw new Error('Agent 已接收，操作仍在进行；重试会核对原操作')
+  } catch (error) {
+    const receipt = savedReceipts.get(operation.command_id)
+    if (receipt) pendingOperations.set(receipt.identity, receipt.key)
+    throw error
+  }
 }
 
 export function createSession(csrf: string, agentId: string, projectId: string, mode: 'inspect' | 'edit') {
@@ -71,8 +98,8 @@ export function createSession(csrf: string, agentId: string, projectId: string, 
 export function sendMessage(csrf: string, sessionId: string, prompt: string, delivery: 'queue' | 'steer') {
   return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/messages`, csrf, { prompt, delivery })
 }
-export function interruptSession(csrf: string, sessionId: string) {
-  return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/interrupt`, csrf)
+export function interruptSession(csrf: string, sessionId: string, turnId?: string) {
+  return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/interrupt`, csrf, { turn_id: turnId })
 }
 export function createSchedule(csrf: string, sessionId: string, prompt: string, trigger: ScheduleTrigger) {
   return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/schedules`, csrf, { prompt, trigger })

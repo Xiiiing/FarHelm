@@ -4,14 +4,14 @@
   <p><strong>A remote control plane for personal research and GPU training environments</strong></p>
   <p>See training-host status from your phone and safely extend remote control without exposing inbound ports on training machines.</p>
   <p>
-    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.6.0">V0.6.0</a> ·
+    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.7.0">V0.7.0</a> ·
     <a href="./deploy/README.en.md">Deployment guide</a> ·
     <a href="./README.md">简体中文</a>
   </p>
 </div>
 
 > [!IMPORTANT]
-> The current `V0.6.0` release adds an immersive Codex workspace, paginated complete conversations, one-time scheduling, experiment-success triggers, and shorter session-sync and streaming paths. Codex content remains on the Agent. It still does not provide remote training control, automatic training-process discovery, GPU/TensorBoard charts, or arbitrary shell execution.
+> `V0.7.0` adds training-script reports, a unified notification center, and in-page alerts, with improved Codex queues, large-message continuation, and restart recovery. The Agent persists Codex content; Hub only relays it temporarily. Training continues to run locally.
 
 ## Quick install
 
@@ -88,6 +88,32 @@ farhelm-agent experiment list
 
 If the current shell does not yet include `~/.local/bin`, temporarily use the complete path `~/.local/bin/farhelm-agent`. Updates verify the immutable Release, length, SHA-256, role, and version; activation failure automatically restores the local previous program.
 
+## Training reports and notifications
+
+Call once outside the training loop to report the whole batch. For one report per round, call inside the loop with a distinct `--run-id` each time:
+
+```bash
+farhelm-agent experiment report --project cc08 --run-id batch-20260907 \
+  --name "8 rounds of training" --status succeeded --message "All training completed"
+
+# Queue a follow-up only on success, in a session of the same project
+farhelm-agent experiment report --project cc08 --run-id batch-with-followup \
+  --name "8 rounds of training" --exit-code 0 --session ses_xxx \
+  --on-success-prompt-file next-step.txt
+
+# Read a custom message of at most 2 KiB from stdin
+printf 'Training failed; sign in for details' | farhelm-agent experiment report \
+  --project cc08 --name "Training result" --status failed --message -
+```
+
+A successful command returns `run_id`, `event_id`, and `stored_locally: true`: the Agent committed a local transaction. Reports can be saved with the Agent service stopped or Hub offline and are delivered when service resumes. Browser alert delivery is a separate step. Retrying identical content with the same Agent, project, and explicit run ID returns the original receipt; different content conflicts. Omitting the run ID creates a new record. Names allow 128 characters; results are succeeded, failed, or unknown, or a mutually exclusive exit code (0 means success).
+
+The [Bash example](examples/experiment-report.sh) and [Python example](examples/experiment-report.py) report failures through exit handling and preserve the training exit code, without a Python SDK. A single final call cannot infer a result if never reached, after power loss, or after SIGKILL; use PID watch for that fallback. Success follow-ups expire after 24 hours; failed and unknown reports only notify. Prompt files remain on the Agent.
+
+The notification center provides pagination, type/Agent/result filters, synchronized unread state, and details. Settings include system/light/dark themes, experiment/Codex in-page alert switches, and a browser test notification. Keep FarHelm open to receive completion alerts and click through to details. Initial loading and reconnect history do not trigger a burst of old alerts. This release covers browser in-page notifications; iOS system notifications are planned for a later version.
+
+Browser commands and schedules are acknowledged after Agent persistence. Failed submissions retain the current-page draft and operation identity for retries. On restart, saved terminal receipts reconcile completed work; running tasks without a terminal receipt become orphaned and are not replayed. Upgrade Hub before Agent; the new content relay requires the Agent's V0.7 capability.
+
 ## What is implemented
 
 - `farhelm-hub`: Rust control plane with password login, SQLite-backed 30-day sessions, short-code pairing, Secure HttpOnly cookies, CSRF, login throttling, reliable events, SSE replay, and Web Push.
@@ -142,8 +168,8 @@ make test-release
 
 ## Roadmap
 
-1. Complete the V0.5 zero-configuration canary on A6000/CC08, Titan/work831, and 3090/work832.
-2. Production-validate background Web Push from the iPhone home-screen PWA.
+1. Complete the V0.7 deployment canary on A6000/CC08, Titan/work831, and 3090/work832.
+2. Develop the iOS client, system notifications, and real-device background validation.
 3. Evaluate GPU metrics and TensorBoard from real experiment needs, without adding remote training control.
 
 ## License

@@ -45,6 +45,10 @@ const WORKER_FILES: &[(&str, &[u8])] = &[
         "src/farhelm_worker_codex/worker.py",
         include_bytes!("../../farhelm-worker-codex/src/farhelm_worker_codex/worker.py"),
     ),
+    (
+        "src/farhelm_worker_codex/history.py",
+        include_bytes!("../../farhelm-worker-codex/src/farhelm_worker_codex/history.py"),
+    ),
 ];
 
 pub fn materialize_worker(root: &Path) -> Result<()> {

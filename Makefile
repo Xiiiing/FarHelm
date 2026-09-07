@@ -6,6 +6,7 @@ check:
 	cargo clippy --workspace --all-targets -- -D warnings
 	corepack pnpm@10.17.1 --dir farhelm-console lint
 	corepack pnpm@10.17.1 --dir farhelm-console typecheck
+	cd farhelm-worker-codex && uv run ruff check . && uv run mypy src
 
 test:
 	cargo test --workspace

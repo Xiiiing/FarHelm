@@ -37,6 +37,8 @@ impl HealthResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentHeartbeat {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
     pub protocol: String,
     pub agent_id: String,
     pub hostname: String,
@@ -51,6 +53,7 @@ impl AgentHeartbeat {
         agent_version: impl Into<String>,
     ) -> Self {
         Self {
+            capabilities: vec!["codex.ephemeral_submit".to_owned()],
             protocol: FARHELM_PROTOCOL.to_owned(),
             agent_id: agent_id.into(),
             hostname: hostname.into(),
@@ -621,6 +624,113 @@ where
     Ok(serde_json::from_slice(&payload)?)
 }
 
+/// Only this metadata crosses into durable Hub events. Transcript content uses the read relay.
+#[must_use]
+pub fn public_event_payload(event_type: &str, payload: &serde_json::Value) -> serde_json::Value {
+    use serde_json::{Map, Value};
+    let keys: &[&str] = match event_type {
+        "experiment.reported" => &[
+            "run_id",
+            "report_id",
+            "project_id",
+            "name",
+            "state",
+            "message",
+            "session_id",
+            "followup_schedule_id",
+            "source",
+            "updated_at_unix",
+        ],
+        "experiment.updated" => &[
+            "watch_id",
+            "project_id",
+            "name",
+            "pid",
+            "state",
+            "session_id",
+            "updated_at_unix",
+        ],
+        "codex.session.updated" => &[
+            "session_id",
+            "project_id",
+            "mode",
+            "state",
+            "title",
+            "active_turn_id",
+            "updated_at_unix",
+            "revision",
+        ],
+        "codex.schedule.updated" => &[
+            "schedule_id",
+            "session_id",
+            "project_id",
+            "trigger",
+            "state",
+            "created_at_unix",
+            "updated_at_unix",
+            "revision",
+        ],
+        "project.discovered" | "project.updated" => &[
+            "candidate_id",
+            "display_name",
+            "suggested_project_id",
+            "session_count",
+            "state",
+            "updated_at_unix",
+        ],
+        _ => &[
+            "operation_id",
+            "command_id",
+            "watch_id",
+            "project_id",
+            "session_id",
+            "turn_id",
+            "status",
+        ],
+    };
+    let mut result = Map::new();
+    for key in keys {
+        if let Some(value) = payload.get(*key) {
+            let safe = match *key {
+                "trigger" => serde_json::from_value::<CodexScheduleTrigger>(value.clone())
+                    .ok()
+                    .and_then(|trigger| serde_json::to_value(trigger).ok()),
+                "revision" | "pid" | "session_count" | "updated_at_unix" | "created_at_unix" => {
+                    value.as_u64().map(Value::from)
+                }
+                _ if value.is_string() || value.is_null() => Some(value.clone()),
+                _ => None,
+            };
+            if let Some(value) = safe {
+                result.insert((*key).to_owned(), value);
+            }
+        }
+    }
+    if event_type.starts_with("codex.turn.") || event_type == "codex.message.delta" {
+        let data = payload.get("data").unwrap_or(payload);
+        let mut safe = Map::new();
+        for key in ["session_id", "turn_id", "item_id", "status"] {
+            if let Some(v) = data.get(key).filter(|v| v.is_string() || v.is_null()) {
+                safe.insert(key.to_owned(), v.clone());
+            }
+        }
+        if let Some(turn) = data.get("turn") {
+            for (source, target) in [("id", "turn_id"), ("status", "status")] {
+                if let Some(v) = turn.get(source).filter(|v| v.is_string() || v.is_null()) {
+                    safe.insert(target.to_owned(), v.clone());
+                }
+            }
+        }
+        if event_type == "codex.message.delta"
+            && let Some(delta) = data.get("delta").filter(|v| v.is_string())
+        {
+            safe.insert("delta".to_owned(), delta.clone());
+        }
+        result.insert("data".to_owned(), Value::Object(safe));
+    }
+    Value::Object(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,9 +759,31 @@ mod tests {
                 "protocol": "farhelm/1",
                 "agent_id": "gpu-a",
                 "hostname": "trainer-a",
-                "agent_version": "0.1.0"
+                "agent_version": "0.1.0",
+                "capabilities": ["codex.ephemeral_submit"]
             })
         );
+    }
+
+    #[test]
+    fn older_heartbeats_and_script_report_contract_remain_compatible() {
+        let older:AgentHeartbeat=serde_json::from_value(serde_json::json!({"protocol":"farhelm/1","agent_id":"a","hostname":"host","agent_version":"0.6.0"})).unwrap();
+        assert!(older.capabilities.is_empty());
+        let event: AgentEvent =
+            serde_json::from_str(include_str!("../tests/fixtures/experiment-reported.json"))
+                .unwrap();
+        assert_eq!(event.event_type, "experiment.reported");
+        assert_eq!(
+            public_event_payload(&event.event_type, &event.payload),
+            event.payload
+        );
+        assert!(event.payload.get("pid").is_none());
+        let data = public_event_payload(
+            "codex.turn.completed",
+            &serde_json::json!({"operation_id":"job","session_id":"session","data":{"turn":{"id":"t","status":"completed","items":[{"text":"PRIVATE"}]},"cwd":"PRIVATE"}}),
+        );
+        assert!(!data.to_string().contains("PRIVATE"));
+        assert_eq!(data["data"]["turn_id"], "t");
     }
 
     #[test]
