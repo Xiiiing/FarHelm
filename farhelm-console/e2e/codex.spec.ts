@@ -128,7 +128,7 @@ for (const cancelled of [false, true]) test(`created session follows its receipt
   await page.getByRole('button', { name: '新建会话' }).filter({ visible: true }).click()
   await page.getByLabel('项目', { exact: true }).click(); await page.getByLabel('项目', { exact: true }).press('Enter')
   await page.getByRole('button', { name: /创\s*建/, exact: true }).click(); await expect.poll(() => reads).toBeGreaterThan(0)
-  if (cancelled) { await page.keyboard.press('Escape'); await expect(page.getByRole('dialog', { name: '创建 Codex 会话' })).toBeHidden() }
+  if (cancelled) { const dialog = page.getByRole('dialog', { name: '创建 Codex 会话' }); await dialog.getByRole('button', { name: 'Close', exact: true }).press('Enter'); await expect(dialog).toBeHidden() }
   model.sessions.push({ ...session('ses-created'), title: '新建验收会话' }); ready = true
   await expect.poll(() => completed).toBe(true)
   if (cancelled) { await expect(page).toHaveURL(/session=ses-a/); await expect(page.getByLabel('给 Codex 发送指令')).toHaveValue('原会话草稿') }
