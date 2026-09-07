@@ -32,6 +32,7 @@ export function createTheme(mode: ColorMode): ThemeConfig {
       colorBorder: dark ? '#283441' : '#D4DEE5',
       colorText: dark ? '#F4F7FA' : '#17212B',
       colorTextSecondary: dark ? '#9AA8B6' : '#5F6F7D',
+      colorTextPlaceholder: dark ? '#9AA8B6' : '#5F6F7D',
     },
     components: {
       Layout: {

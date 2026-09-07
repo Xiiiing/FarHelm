@@ -1,23 +1,21 @@
-import { ArrowLeftOutlined, CheckCircleOutlined, ClockCircleOutlined, CloseCircleOutlined, FolderOpenOutlined, LoadingOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons'
+import { PlusOutlined, SearchOutlined } from '@ant-design/icons'
 import { Alert, Button, Drawer, Empty, Input, Segmented, Select, Skeleton } from 'antd'
 import { useEffect, useMemo, useState } from 'react'
-import { Conversations } from '@ant-design/x'
+import { SessionGroups } from './codex/SessionGroups'
 import { useQuery } from '@tanstack/react-query'
 import { flushSync } from 'react-dom'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useSearchParams } from 'react-router-dom'
 import { fetchProjects, type CodexSession } from '../api/features'
 import { Conversation } from './codex/Conversation'
 import { CreateDialog, ScheduleDialog, SchedulesDrawer } from './codex/Dialogs'
-import { errorText, sessionName, stateNames } from './codex/presentation'
+import { errorText } from './codex/presentation'
 import { useOperations } from './codex/useOperations'
 import { useSessions, type ArchiveFilter } from './codex/useSessions'
+import './codex/workspace.css'
+import './codex/markdown.css'
 
-function StateIcon({ state }: { state: string }) {
-  return state === 'running' ? <LoadingOutlined /> : ['failed', 'orphaned'].includes(state) ? <CloseCircleOutlined /> : ['queued', 'creating'].includes(state) ? <ClockCircleOutlined /> : <CheckCircleOutlined />
-}
 export function CodexPage({ csrf }: { csrf: string }) {
-  const navigate = useNavigate(); const [params, setParams] = useSearchParams(); const id = params.get('session') ?? undefined
-  const [closedGroups, setClosedGroups] = useState<Record<string, boolean>>({})
+  const [params, setParams] = useSearchParams(); const id = params.get('session') ?? undefined
   const [query, setQuery] = useState(''); const [archive, setArchive] = useState<ArchiveFilter>('false')
   const [scope, setScope] = useState<string>(); const [railOpen, setRailOpen] = useState(false); const [collapsed, setCollapsed] = useState(false)
   const projectQuery = useQuery({ queryKey: ['projects'], queryFn: fetchProjects }); const projects = useMemo(() => projectQuery.data ?? [], [projectQuery.data]); const projectError = projectQuery.error ? errorText(projectQuery.error) : undefined
@@ -35,14 +33,25 @@ export function CodexPage({ csrf }: { csrf: string }) {
     resize(); viewport?.addEventListener('resize', resize); viewport?.addEventListener('scroll', resize); window.addEventListener('resize', resize)
     return () => { viewport?.removeEventListener('resize', resize); viewport?.removeEventListener('scroll', resize); window.removeEventListener('resize', resize); document.documentElement.style.removeProperty('--codex-height'); document.documentElement.style.removeProperty('--codex-top') }
   }, [])
-  const groups = useMemo(() => {
-    const groups = new Map<string, CodexSession[]>()
-    for (const session of sessions.rows) { const key = `${session.agent_id} / ${session.project_id}`; groups.set(key, [...(groups.get(key) ?? []), session]) }
-    return [...groups]
-  }, [sessions.rows])
+  useEffect(() => {
+    const search = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'k' || event.isComposing || innerWidth < 768) return
+      event.preventDefault(); setCollapsed(false)
+      requestAnimationFrame(() => document.querySelector<HTMLInputElement>('.codex-desktop-rail input[aria-label="搜索全部会话"]')?.focus())
+    }
+    window.addEventListener('keydown', search)
+    return () => window.removeEventListener('keydown', search)
+  }, [])
   const select = (sessionId?: string) => { const next = new URLSearchParams(params); if (sessionId) next.set('session', sessionId); else next.delete('session'); flushSync(() => setParams(next)); setRailOpen(false) }
-  const rail = <aside className="codex-rail" aria-label="项目和会话"><div className="codex-rail-head"><Button type="text" icon={<ArrowLeftOutlined />} onClick={() => navigate('/')} aria-label="返回控制台" /><h1>Codex</h1><Button type="text" icon={<PlusOutlined />} onClick={() => { setCreating(true); setRailOpen(false) }} aria-label="新建会话" /></div>
-    <Input allowClear prefix={<SearchOutlined />} placeholder="搜索全部会话" aria-label="搜索全部会话" value={query} onChange={(e) => setQuery(e.target.value)} />
+  const newSession = () => { setCreating(true); setRailOpen(false) }
+  const browse = () => {
+    if (innerWidth < 768) setRailOpen(true)
+    else { setCollapsed(false); requestAnimationFrame(() => document.querySelector<HTMLInputElement>('.codex-desktop-rail input[aria-label="搜索全部会话"]')?.focus()) }
+  }
+  const rail = <aside className="codex-rail" aria-label="项目和会话">
+    <div className="codex-rail-head"><h2>会话</h2><span>CODEX</span></div>
+    <Button className="new-session-button" icon={<PlusOutlined />} onClick={newSession} block>新建会话</Button>
+    <Input className="session-search" allowClear prefix={<SearchOutlined />} suffix={<kbd className="desktop-only">{navigator.platform.includes('Mac') ? '⌘ K' : 'Ctrl K'}</kbd>} placeholder="搜索全部会话" aria-label="搜索全部会话" value={query} onChange={(e) => setQuery(e.target.value)} />
     <Segmented block value={archive} onChange={(value) => { setArchive(value as ArchiveFilter); select(undefined) }} options={[{ label: '当前', value: 'false' }, { label: '归档', value: 'true' }, { label: '全部', value: 'all' }]} />
     {projects.length > 0 && <Select aria-label="筛选项目" allowClear placeholder="全部服务器与项目" value={scope} onChange={setScope} options={scopes} />}
     {(sessions.error || projectError) && <Alert type="warning" title={sessions.error ?? projectError} action={<Button type="text" onClick={() => { void sessions.refresh(); if (projectError) void projectQuery.refetch() }}>重试</Button>} />}
@@ -50,14 +59,14 @@ export function CodexPage({ csrf }: { csrf: string }) {
     <div className="codex-session-groups" onKeyDown={(event) => {
       if (['Enter', ' '].includes(event.key) && (event.target as HTMLElement).classList.contains('session-select')) { event.preventDefault(); (event.target as HTMLElement).click(); return }
       if (!['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return
-      const buttons = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('.session-select')]; const index = buttons.indexOf(document.activeElement as HTMLButtonElement); if (index < 0) return
+      const buttons = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('.session-select')].filter((button) => button.offsetParent !== null); const index = buttons.indexOf(document.activeElement as HTMLButtonElement); if (index < 0) return
       event.preventDefault(); const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1 : Math.max(0, Math.min(buttons.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1))); buttons[next]?.focus()
-    }}>{sessions.loading && !sessions.rows.length ? <Skeleton active paragraph={{ rows: 6 }} /> : groups.length ? <Conversations className="session-conversations" activeKey={id} onActiveChange={select} groupable={{ collapsible: true, expandedKeys: groups.filter(([group]) => !closedGroups[group]).map(([group]) => group), onExpand: (keys) => setClosedGroups((old) => ({ ...old, ...Object.fromEntries(groups.map(([group]) => [group, !keys.includes(group)])) })), label: (group) => { const rows = groups.find(([key]) => key === group)![1]; return <Button type="text" className="session-group-heading" aria-expanded={!closedGroups[group]} onClick={(event) => { event.stopPropagation(); setClosedGroups((old) => ({ ...old, [group]: !old[group] })) }}><FolderOpenOutlined /><span><strong>{rows[0].project_id}</strong><small>{rows[0].agent_id} · {rows.length} 个会话</small></span></Button> } }} items={sessions.rows.map((s) => ({ key: s.session_id, group: `${s.agent_id} / ${s.project_id}`, className: 'session-row', label: <Button type="text" className="session-select" block aria-label={sessionName(s)} aria-current={s.session_id === id ? 'page' : undefined} aria-pressed={s.session_id === id}><span className="session-copy"><span title={sessionName(s)}>{sessionName(s)}</span>{['running', 'queued', 'creating', 'failed', 'orphaned'].includes(s.state) && <small><StateIcon state={s.state} /> {stateNames[s.state]}</small>}</span></Button> }))} /> : !sessions.error && <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={query ? '当前范围内没有匹配的会话' : '当前范围内没有会话'} />}{sessions.cursor && <Button block loading={sessions.loading} onClick={() => void sessions.more()}>加载更多会话</Button>}</div>
+    }}>{sessions.loading && !sessions.rows.length ? <Skeleton active paragraph={{ rows: 6 }} /> : sessions.rows.length ? <SessionGroups rows={sessions.rows} projects={projects} selected={id} onSelect={select} /> : !sessions.error && <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={query ? '当前范围内没有匹配的会话' : '当前范围内没有会话'} />}{sessions.cursor && <Button block loading={sessions.loading} onClick={() => void sessions.more()}>加载更多会话</Button>}</div>
   </aside>
-  return <main className={`codex-workspace ${collapsed ? 'rail-collapsed' : ''}`}><div className="codex-desktop-rail">{rail}</div><Drawer className="codex-mobile-drawer" placement="left" open={railOpen} onClose={() => setRailOpen(false)} size={Math.min(320, window.innerWidth - 24)} closable={false}>{rail}</Drawer>
-    <Conversation key={id ?? 'empty'} csrf={csrf} id={id} session={sessions.rows.find((s) => s.session_id === id)} draft={operations.get(id ?? '')} onDraft={(change) => { if (id) operations.update(id, change) }} onSend={(turn) => { if (id) void operations.send(id, turn) }} onRail={() => setRailOpen(true)} onCollapse={() => setCollapsed((old) => !old)} collapsed={collapsed} onSchedule={setSchedule} onSchedules={setSchedules} />
+  return <div className={`codex-workspace ${collapsed ? 'rail-collapsed' : ''}`}><div className="codex-desktop-rail">{rail}</div><Drawer className="codex-mobile-drawer" placement="left" open={railOpen} onClose={() => setRailOpen(false)} size={Math.min(320, window.innerWidth - 24)} closable={false}>{rail}</Drawer>
+    <Conversation recent={sessions.rows.slice(0, 3)} onSelect={select} onNew={newSession} onBrowse={browse} key={id ?? 'empty'} csrf={csrf} id={id} session={sessions.rows.find((s) => s.session_id === id)} draft={operations.get(id ?? '')} onDraft={(change) => { if (id) operations.update(id, change) }} onSend={(turn) => { if (id) void operations.send(id, turn) }} onRail={() => setRailOpen(true)} onCollapse={() => setCollapsed((old) => !old)} collapsed={collapsed} onSchedule={setSchedule} onSchedules={setSchedules} />
     {creating && <CreateDialog csrf={csrf} projects={projects} onClose={() => setCreating(false)} onCreated={(sessionId) => { if (sessionId) select(sessionId); void sessions.refresh() }} />}
     {schedule && <ScheduleDialog csrf={csrf} target={schedule} prompt={operations.get(schedule.session_id).text} onClose={() => setSchedule(undefined)} />}
     {schedules && <SchedulesDrawer csrf={csrf} target={schedules} onClose={() => setSchedules(undefined)} />}
-  </main>
+  </div>
 }

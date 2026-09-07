@@ -6,6 +6,7 @@ import {
   DashboardOutlined,
   DesktopOutlined,
   FileSearchOutlined,
+  LogoutOutlined,
   MenuOutlined,
   MoonOutlined,
   MoreOutlined,
@@ -15,13 +16,14 @@ import {
 } from '@ant-design/icons'
 import { QueryClientProvider } from '@tanstack/react-query'
 import { queryClient, connectCodexCache } from './api/cache'
-import { Button, ConfigProvider, Drawer, Grid, Layout, Menu, Space, Spin, Typography } from 'antd'
+import { Avatar, Button, ConfigProvider, Drawer, Grid, Layout, Menu, Space, Spin, Tooltip, Typography } from 'antd'
 import { lazy, Suspense, useEffect, useState } from 'react'
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 
 import { AuditPage } from './components/AuditPage'
 import { SettingsPage } from './components/SettingsPage'
 import { LiveNotifications } from './components/LiveNotifications'
+import { ConnectionStatus } from './components/ConnectionStatus'
 import type { ColorPreference } from './hooks/useColorMode'
 import { AgentListPage } from './components/AgentListPage'
 import { ExperimentPage } from './components/ExperimentPage'
@@ -93,6 +95,7 @@ function AppContent() {
   const mobileSelection = ['/agents', '/notifications', '/audit', '/settings'].includes(location.pathname)
     ? '/more'
     : location.pathname
+  const currentPage = desktopItems.find((item) => item.key === location.pathname)?.label ?? '控制台'
 
   const go = (key: string) => {
     if (key === '/more') {
@@ -114,24 +117,31 @@ function AppContent() {
           <Sider width={240} className="app-sider">
             <div className="brand" aria-label="FarHelm Console">
               <img src="/farhelm-mark.svg" alt="" width="36" height="36" />
-              <div><strong>FarHelm</strong><span>远程训练控制台</span></div>
+              <div><strong>FarHelm</strong><span>远程工作空间</span></div>
             </div>
-            <Menu mode="inline" selectedKeys={[location.pathname]} items={desktopItems} onClick={({ key }) => go(key)} />
-            <div className="sider-footer"><Typography.Text type="secondary">V0.8.0 · Codex workspace</Typography.Text></div>
+            <nav aria-label="系统导航"><Menu mode="inline" selectedKeys={[location.pathname]} items={[
+              { type: 'group', label: '工作空间', children: desktopItems.slice(0, 4) },
+              { type: 'group', label: '管理', children: desktopItems.slice(4) },
+            ]} onClick={({ key }) => go(key)} /></nav>
+            <div className="sider-footer"><div className="account-identity"><Avatar shape="square">{session.user.slice(0, 1).toUpperCase()}</Avatar><div><strong>{session.user}</strong><span>个人控制台</span></div></div><span className="console-version">FarHelm <span>V0.8.0</span></span></div>
           </Sider>
         )}
 
         <Layout>
           <Header className="app-header">
-            {!isDesktop && <Typography.Text className="mobile-brand">FarHelm</Typography.Text>}
+            {isDesktop ? <div className="header-location"><span>{desktopItems.slice(4).some((item) => item.key === location.pathname) ? '管理' : '工作空间'}</span><span aria-hidden="true">/</span><strong>{currentPage}</strong></div> : <Typography.Text className="mobile-brand"><img src="/farhelm-mark.svg" width="24" height="24" alt="" />FarHelm</Typography.Text>}
             <Space className="header-actions">
+              <ConnectionStatus />
+              <Tooltip title={mode === 'dark' ? '浅色主题' : '深色主题'}>
               <Button
+                className="theme-toggle"
                 type="text"
-                icon={mode === 'dark' ? <SunOutlined /> : <MoonOutlined />}
+                icon={<span key={mode} className="theme-glyph">{mode === 'dark' ? <SunOutlined /> : <MoonOutlined />}</span>}
                 onClick={toggleMode}
                 aria-label={mode === 'dark' ? '切换到浅色主题' : '切换到深色主题'}
               />
-              {isDesktop && <Button onClick={() => void logout(session.csrf_token).then(() => setSession(null))}>退出</Button>}
+              </Tooltip>
+              {isDesktop && <Tooltip title="退出登录"><Button type="text" icon={<LogoutOutlined />} aria-label="退出登录" onClick={() => void logout(session.csrf_token).then(() => setSession(null))} /></Tooltip>}
               {!isDesktop && <Button type="text" icon={<MenuOutlined />} onClick={() => setDrawerOpen(true)} aria-label="打开更多导航" />}
             </Space>
           </Header>

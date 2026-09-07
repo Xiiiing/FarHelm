@@ -38,6 +38,116 @@ async function composerFits(page: Page) {
   if (await navigation.isVisible()) { const nav = await navigation.boundingBox(); expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(nav!.y + 1) }
 }
 
+test('welcome leads to a real session and suggestions only prepare a focused draft', async ({ page }) => {
+  const model = await setup(page)
+  model.history.turns = []
+  let sends = 0
+  await page.route('**/ses-a/messages', (route) => { sends++; return route.fulfill({ json: { state: 'accepted' } }) })
+  await page.goto('/codex')
+  await expect(page.getByRole('heading', { name: '继续你的工作' })).toBeVisible()
+  await expect(page.getByRole('button', { name: '开启新会话' })).toBeVisible()
+  await expect(page.locator('.composer')).toHaveCount(0)
+  await page.locator('.recent-session').filter({ hasText: '训练结果分析' }).click()
+  await expect(page).toHaveURL(/session=ses-a/)
+  await expect(page.getByRole('heading', { name: '准备好，开始下一步' })).toBeVisible()
+  await page.getByRole('button', { name: '检查代码问题' }).click()
+  const input = page.getByLabel('给 Codex 发送指令')
+  await expect(input).toBeFocused()
+  await expect(input).toHaveValue(/检查这个项目可能存在的问题/)
+  expect(sends).toBe(0)
+  await choose(page, '另一个会话')
+  await choose(page, '训练结果分析')
+  await expect(input).toHaveValue(/检查这个项目可能存在的问题/)
+  await expect(page.getByRole('button', { name: '检查代码问题' })).toHaveCount(0)
+  await composerFits(page)
+})
+
+test('server and project disclosure preserves targets and skips hidden rows with the keyboard', async ({ page }) => {
+  const model = await setup(page)
+  model.sessions.push({ ...session('ses-c'), agent_id: 'gpu-b', title: '另一台服务器的会话' })
+  await page.goto('/codex?session=ses-a')
+  await expect(page.locator('.conversation-title')).toContainText('训练结果分析')
+  if (await page.getByRole('button', { name: '打开会话列表' }).isVisible()) await page.getByRole('button', { name: '打开会话列表' }).click()
+  const rail = page.getByRole('complementary', { name: '项目和会话' }).filter({ visible: true })
+  const first = rail.locator('.server-group').filter({ has: page.locator('.server-heading', { hasText: 'gpu-a' }) })
+  await first.locator('.ant-collapse-header').click()
+  await expect(first.getByRole('button', { name: '训练结果分析' })).toBeHidden()
+  const remote = rail.getByRole('button', { name: '另一台服务器的会话' })
+  await remote.focus(); await page.keyboard.press('Home')
+  await expect(remote).toBeFocused()
+  await first.locator('.ant-collapse-header').click()
+  await first.getByRole('button', { name: '项目 cc08', exact: true }).click()
+  await expect(first.getByRole('button', { name: '训练结果分析' })).toBeHidden()
+  await remote.focus(); await page.keyboard.press('ArrowUp')
+  await expect(remote).toBeFocused()
+  await page.keyboard.press('Enter')
+  await expect(page).toHaveURL(/session=ses-c/)
+})
+
+test('search shortcut opens the collapsed rail without changing the active draft', async ({ page }, info) => {
+  test.skip(info.project.name === 'mobile', 'Desktop keyboard shortcut')
+  await setup(page); await page.goto('/codex?session=ses-a')
+  await page.getByLabel('给 Codex 发送指令').fill('未发送的草稿')
+  await page.getByRole('button', { name: '折叠会话列表' }).click()
+  await page.keyboard.press('Control+k')
+  await expect(page.getByLabel('搜索全部会话')).toBeFocused()
+  await expect(page.getByLabel('给 Codex 发送指令')).toHaveValue('未发送的草稿')
+  await expect(page.locator('.app-sider')).toBeVisible()
+})
+
+test('short desktop windows keep system navigation reachable above the account footer', async ({ page }, info) => {
+  test.skip(info.project.name === 'mobile', 'Desktop navigation geometry')
+  await setup(page); await page.setViewportSize({ width: 1440, height: 500 })
+  await page.goto('/codex?session=ses-a')
+  const settings = page.getByRole('navigation', { name: '系统导航' }).getByRole('menuitem', { name: /设置/ })
+  await settings.scrollIntoViewIfNeeded()
+  const item = await settings.boundingBox(), footer = await page.locator('.sider-footer').boundingBox()
+  expect(item!.y).toBeGreaterThanOrEqual(0)
+  expect(item!.y + item!.height).toBeLessThanOrEqual(footer!.y)
+  await settings.click()
+  await expect(page.getByRole('heading', { name: '设置', exact: true })).toBeVisible()
+})
+
+test('connection status follows the shared stream and keeps the draft during reconnect', async ({ page }) => {
+  await setup(page); await page.goto('/codex?session=ses-a')
+  await page.getByLabel('给 Codex 发送指令').fill('断线后继续编辑')
+  await emit(page, 'open', {})
+  await expect(page.getByRole('status', { name: '实时连接' })).toBeVisible()
+  await emit(page, 'error', {})
+  await expect(page.getByRole('status', { name: '正在重连' })).toBeVisible()
+  await expect(page.getByLabel('给 Codex 发送指令')).toHaveValue('断线后继续编辑')
+  await emit(page, 'open', {})
+  await expect(page.getByRole('status', { name: '实时连接' })).toBeVisible()
+})
+
+test('motion communicates work and submission while reduced motion keeps the same controls', async ({ page }) => {
+  const model = await setup(page)
+  model.sessions[0].active_turn_id = 'turn-a'; model.sessions[0].state = 'running'
+  await page.emulateMedia({ reducedMotion: 'no-preference' })
+  await page.goto('/codex?session=ses-a')
+  await expect(page.locator('.response-activity')).toContainText('Codex 正在处理')
+  expect(await page.locator('.activity-indicator i').first().evaluate((node) => node.getAnimations().some((animation) => animation.playState === 'running'))).toBe(true)
+  const input = page.getByLabel('给 Codex 发送指令')
+  await input.fill('下一轮继续检查')
+  await expect.poll(() => page.locator('.composer').evaluate((node) => getComputedStyle(node, '::after').opacity)).toBe('1')
+  let release: () => void = () => {}
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  await page.route('**/ses-a/messages', async (route) => { await gate; return route.fulfill({ json: { command_id: 'cmd-motion', state: 'accepted' } }) })
+  await page.getByRole('button', { name: '发送指令' }).click()
+  await expect(input).toBeFocused()
+  await expect(page.locator('.pending-message')).toContainText('正在提交')
+  expect(await page.locator('.pending-message').evaluate((node) => getComputedStyle(node).animationName)).toBe('message-submit')
+  expect(await page.locator('.codex-message.assistant').first().evaluate((node) => node.getAnimations().length)).toBe(0)
+  release()
+  await expect(page.locator('.submission-status')).toContainText('Agent 已保存')
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+  await expect.poll(() => page.locator('.activity-indicator i').first().evaluate((node) => node.getAnimations().length)).toBe(0)
+  await expect(page.locator('.response-activity')).toContainText('Codex 正在处理')
+  await expect(page.getByRole('button', { name: '中断', exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: '定时发送', exact: true })).toBeVisible()
+  await composerFits(page)
+})
+
 for (const theme of ['light', 'dark'] as const) for (const size of [{ width: 390, height: 844 }, { width: 1440, height: 900 }, { width: 2550, height: 1233 }]) {
   test(`Markdown and fixed workspace ${size.width} ${theme}`, async ({ page }, info) => {
     test.skip(info.project.name !== 'desktop', 'Explicit viewport matrix runs once')
@@ -161,7 +271,7 @@ test('failed send belongs to its original session while switching', async ({ pag
 
 test('interleaved and repeated deltas retain item identity after a failed terminal refresh', async ({ page }) => {
   const model = await setup(page); model.history = { session_id: 'ses-a', turns: [] }
-  await page.goto('/codex?session=ses-a'); await expect(page.getByText(/这个会话还没有对话/)).toBeVisible()
+  await page.goto('/codex?session=ses-a'); await expect(page.getByRole('heading', { name: '准备好，开始下一步' })).toBeVisible()
   const delta = async (item_id: string, text_offset: number, delta: string) => emit(page, 'codex.message.delta', { session_id: 'ses-a', data: { turn_id: 'stream-turn', item_id, text_offset, delta } })
   await delta('a', 0, '第一条🙂'); await delta('b', 0, '第二条'); await delta('a', 4, '完成'); await delta('a', 4, '完成')
   await expect(page.locator('.codex-message.assistant')).toHaveCount(2)

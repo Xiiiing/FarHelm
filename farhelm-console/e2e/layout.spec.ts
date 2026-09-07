@@ -74,6 +74,8 @@ test('responsive navigation and validated status are visible', async ({ page }, 
 })
 
 test('keyboard navigation reaches visible controls', async ({ page }) => {
+  await expect(page.getByRole('heading', { name: '运行总览' })).toBeVisible()
+  if (page.viewportSize()!.width >= 768) await expect(page.locator('.app-sider')).toBeVisible()
   await page.keyboard.press('Tab')
   const focused = page.locator(':focus-visible')
   await expect(focused).toHaveCount(1)
