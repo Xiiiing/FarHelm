@@ -4,14 +4,14 @@
   <p><strong>面向个人科研与 GPU 训练环境的远程控制平面</strong></p>
   <p>从手机查看训练服务器状态，并在不开放训练机入站端口的前提下安全扩展远程控制能力。</p>
   <p>
-    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.8.0">V0.8.0</a> ·
+    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.9.0">V0.9.0</a> ·
     <a href="./deploy/README.md">部署文档</a> ·
     <a href="./README.en.md">English</a>
   </p>
 </div>
 
 > [!IMPORTANT]
-> `V0.8.0` 由 Rust Agent 直接管理本机已安装、已登录的 Codex，通过常驻 App Server 和主动 WSS 连接传输请求与增量。工作区使用 Ant Design X、统一内存缓存和长历史虚拟化，保留系统导航、实验、调度及页面通知。
+> `V0.9.0` 完善项目工作区、原生 Codex 模型与权限展示、浅深主题和自定义主题色，修复长会话缓存切换、通知/实验/审计分页刷新及定时任务同步。继续使用 Rust Agent、常驻本机 Codex 和出站 WSS，保留实验上报与页面通知。
 
 ## 快速安装
 
@@ -121,7 +121,7 @@ printf '训练失败，请登录查看详情' | farhelm-agent experiment report 
 
 [Bash 示例](examples/experiment-report.sh)和 [Python 示例](examples/experiment-report.py)通过退出捕获报告失败，保留训练退出码，不要求安装 Python SDK。脚本未运行到上报、机器断电或 SIGKILL 无法由单次上报推断结果，仍可使用 PID watch 兜底。成功续话有效期 24 小时，失败与 unknown 只通知。
 
-通知中心支持分页、类型/Agent/结果筛选、未读同步和结果详情。设置页支持系统/浅色/深色主题、实验/Codex 页面提醒开关及页面测试通知。保持 FarHelm 页面打开即可接收完成提醒，点击提醒进入对应详情；初次进入与重连补历史不会批量弹出旧提醒。本版范围为浏览器页面通知，iOS 系统推送留待后续版本。
+通知中心支持分页、类型/Agent/结果筛选、未读同步和结果详情。通知、实验、审计刷新保留已加载页；筛选覆盖全部登记服务器，过时请求不影响当前结果，读取失败可重试。定时任务创建和取消后即时核对列表，取消前确认具体任务。设置页支持系统/浅色/深色主题、实验/Codex 页面提醒开关及页面测试通知。保持 FarHelm 页面打开即可接收完成提醒，点击提醒进入对应详情；初次进入与重连补历史不会批量弹出旧提醒。本版范围为浏览器页面通知，iOS 系统推送留待后续版本。
 
 网页指令和调度在 Agent 保存后才确认提交；失败时当前页面保留草稿并沿用操作身份重试。运行中的任务在 Agent 重启后按已保存的终态收据恢复；无终态收据时标记 orphaned，不自动重放。升级先 Hub 后 Agent，新正文交付要求 Agent 的 V0.7 能力标识。
 

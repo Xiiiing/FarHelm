@@ -2,7 +2,7 @@ import { CheckCircleOutlined, CloseCircleOutlined, CodeOutlined, CopyOutlined, L
 import { Actions, ThoughtChain } from '@ant-design/x'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { Button, Tag, Tooltip } from 'antd'
-import { memo, useLayoutEffect, useRef, useState, type RefObject } from 'react'
+import { memo, useCallback, useLayoutEffect, useRef, useState, type RefObject } from 'react'
 import type { TranscriptItem, TranscriptPage, TranscriptTurn } from '../../api/features'
 import { Markdown } from './Markdown'
 import { stateNames } from './presentation'
@@ -24,7 +24,7 @@ const Message = memo(function Message({ item }: { item: TranscriptItem }) {
 })
 
 export type TranscriptPosition = { reveal: (turn: string) => boolean }
-type Props = { turns: TranscriptTurn[]; scroll: RefObject<HTMLDivElement | null>; position: RefObject<TranscriptPosition | undefined>; continuation?: TranscriptPage['continuation']; onContinue: () => void; loading: boolean; onAnchor: () => void }
+type Props = { turns: TranscriptTurn[]; scroll: HTMLDivElement | null; position: RefObject<TranscriptPosition | undefined>; continuation?: TranscriptPage['continuation']; onContinue: () => void; loading: boolean; onAnchor: () => void }
 const Turn = memo(function Turn({ turn, latest, continuation, loading, onContinue, onAnchor }: Omit<Props, 'turns' | 'scroll' | 'position'> & { turn: TranscriptTurn; latest: boolean }) {
   const tools = turn.items.filter(isTool)
   const firstTool = tools[0]?.item_id
@@ -38,9 +38,10 @@ export function Transcript({ turns, scroll, position, ...props }: Props) {
   const container = useRef<HTMLDivElement>(null)
   const [margin, setMargin] = useState(0)
   const enabled = turns.length > 40
+  const getItemKey = useCallback((index: number) => turns[index].turn_id, [turns])
   // Native library measurements are keyed by turn, so appending text never remounts other turns.
   // eslint-disable-next-line react-hooks/incompatible-library -- Virtualizer owns mutable measurements and must stay outside compiler memoization.
-  const virtual = useVirtualizer({ count: turns.length, getScrollElement: () => scroll.current, getItemKey: (index) => turns[index].turn_id, estimateSize: () => 480, overscan: 4, enabled, scrollMargin: margin })
+  const virtual = useVirtualizer({ count: turns.length, getScrollElement: () => scroll, getItemKey, estimateSize: () => 480, overscan: 4, enabled, scrollMargin: margin })
   useLayoutEffect(() => {
     position.current = { reveal: (turn) => {
       const index = turns.findIndex((row) => row.turn_id === turn)
@@ -49,7 +50,7 @@ export function Transcript({ turns, scroll, position, ...props }: Props) {
     } }
     return () => { position.current = undefined }
   }, [turns, position, enabled, virtual])
-  useLayoutEffect(() => { if (container.current && scroll.current) setMargin(container.current.getBoundingClientRect().top - scroll.current.getBoundingClientRect().top + scroll.current.scrollTop) }, [turns.length, scroll])
+  useLayoutEffect(() => { if (container.current && scroll) setMargin(container.current.getBoundingClientRect().top - scroll.getBoundingClientRect().top + scroll.scrollTop) }, [turns.length, scroll])
   return <div className={`codex-transcript ${enabled ? 'virtual-transcript' : ''}`} ref={container} style={enabled ? { height: virtual.getTotalSize() } : undefined}>
     {enabled ? virtual.getVirtualItems().map((row) => <div key={row.key} ref={virtual.measureElement} data-index={row.index} className="virtual-turn" style={{ transform: `translateY(${row.start - margin}px)` }}><Turn {...props} turn={turns[row.index]} latest={row.index === turns.length - 1} /></div>) : turns.map((turn, index) => <Turn key={turn.turn_id} {...props} turn={turn} latest={index === turns.length - 1} />)}
   </div>

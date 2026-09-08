@@ -218,10 +218,10 @@
 .mobile-only { display: none !important; }
 .codex-mobile-drawer .ant-drawer-body { padding: 0; }
 
-@keyframes rail-reveal { from { opacity: .5; transform: translateX(-8px); } to { opacity: 1; transform: translateX(0); } }
+@keyframes rail-reveal { from { transform: translateX(-8px); } to { transform: translateX(0); } }
 @keyframes content-reveal { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes message-submit { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
-@keyframes composer-enter { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes composer-enter { from { transform: translateY(8px); } to { transform: translateY(0); } }
 @keyframes activity-beat { 0%, 70%, 100% { transform: translateY(0); opacity: .45; } 35% { transform: translateY(-3px); opacity: 1; } }
 @keyframes jump-reveal { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 

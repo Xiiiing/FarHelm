@@ -51,9 +51,9 @@ export async function fetchTranscript(sessionId: string, cursor?: string, signal
   return value
 }
 
-export async function fetchSchedules(sessionId?: string): Promise<CodexSchedule[]> {
+export async function fetchSchedules(sessionId?: string, signal?: AbortSignal): Promise<CodexSchedule[]> {
   const suffix = sessionId ? `?session=${encodeURIComponent(sessionId)}` : ''
-  const value = await json<{ protocol: string; schedules: CodexSchedule[] }>(`/api/v1/codex/schedules${suffix}`)
+  const value = await json<{ protocol: string; schedules: CodexSchedule[] }>(`/api/v1/codex/schedules${suffix}`, signal)
   if (value.protocol !== PROTOCOL_VERSION || !Array.isArray(value.schedules)) throw new Error('Hub returned invalid schedules')
   return value.schedules
 }
@@ -74,7 +74,7 @@ export class ApiError extends Error {
 }
 async function apiError(response: Response) {
   const value = await response.json().catch(() => ({})) as { error?: string }
-  const errors: Record<string, string> = { operation_expired: '这次操作已过期，草稿已保留；核对状态后可修改指令重新提交', operation_failed: '这次操作已失败，草稿已保留；请先核对执行结果', agent_offline: 'Agent 离线，连接恢复后重试', agent_upgrade_required: '请先升级 Agent 至 V0.8.0', agent_save_unconfirmed: '尚未确认 Agent 保存，重试会核对同一次操作', invalid_schedule_time: '时间必须在 60 秒至 365 天之间', session_is_not_running: '当前会话已没有活动对话', visible_turn_changed: '活动对话已改变，请刷新后再操作', idempotency_conflict: '操作身份与之前的请求冲突' }
+  const errors: Record<string, string> = { operation_expired: '这次操作已过期，草稿已保留；核对状态后可修改指令重新提交', operation_failed: '这次操作已失败，草稿已保留；请先核对执行结果', agent_offline: 'Agent 离线，连接恢复后重试', agent_upgrade_required: '请先升级 Agent 至 V0.9.0', agent_save_unconfirmed: '尚未确认 Agent 保存，重试会核对同一次操作', invalid_schedule_time: '时间必须在 60 秒至 365 天之间', session_is_not_running: '当前会话已没有活动对话', visible_turn_changed: '活动对话已改变，请刷新后再操作', idempotency_conflict: '操作身份与之前的请求冲突' }
   return new ApiError(errors[value.error ?? ''] ?? (response.status === 401 ? '登录已过期，请重新登录' : `请求失败（HTTP ${response.status}）${value.error ? `：${value.error}` : ''}`), value.error ?? 'request_failed', response.status)
 }
 export async function mutate(url: string, csrf: string, body?: unknown, method = 'POST', operationId?: string): Promise<Operation> {

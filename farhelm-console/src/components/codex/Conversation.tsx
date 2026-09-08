@@ -32,6 +32,9 @@ export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, sess
   const [newMessages, setNewMessages] = useState(false)
   const [away, setAway] = useState(false)
   const scroll = useRef<HTMLDivElement>(null)
+  const [scrollElement, setScrollElement] = useState<HTMLDivElement | null>(null)
+  // Publish the parent DOM attachment so the child Virtualizer connects before network reconciliation.
+  const bindScroll = useCallback((node: HTMLDivElement | null) => { scroll.current = node; setScrollElement(node) }, [])
   const sender = useRef<ComponentRef<typeof Sender>>(null)
   const follow = useRef(true)
   const active = useRef(true)
@@ -65,7 +68,7 @@ export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, sess
     }
   }, [])
   useEffect(() => { active.current = true; return () => { active.current = false; continuationRead.current?.abort() } }, [])
-  useLayoutEffect(() => { restore() }, [page, draft.pending, restore])
+  useLayoutEffect(() => { restore() }, [page, draft.pending, scrollElement, restore])
   const previousPage = useRef(page)
   const hasPage = !!page
   useEffect(() => {
@@ -134,10 +137,10 @@ export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, sess
       <Space size={4}><Tooltip title="刷新对话"><Button type="text" icon={<ReloadOutlined />} disabled={!id} loading={history.isFetching} onClick={() => void load()} aria-label="刷新对话" /></Tooltip><Dropdown menu={menu} trigger={['click']}><Button type="text" icon={<EllipsisOutlined />} aria-label="会话操作" /></Dropdown></Space>
     </header>
     <div className="conversation-alerts">{codexNotice && <Alert showIcon type={codex?.state === 'starting' ? 'info' : 'warning'} title={codexNotice} />}{draft.error && <Alert showIcon closable type="warning" title="指令尚未完成提交" description={draft.error} onClose={() => onDraft((old) => ({ ...old, error: undefined }))} />}{failure && turns.length > 0 && <Alert showIcon type="warning" title="历史刷新失败，已保留当前内容" description={failure.message} action={<Button onClick={() => void load(!!moreError)}>重试</Button>} />}</div>
-    <div className="conversation-history"><div className="conversation-scroll" ref={scroll} onWheel={() => { anchorLocked.current = false }} onTouchMove={() => { anchorLocked.current = false }} onScroll={() => { const node = scroll.current; if (!node || restoring.current || anchorLocked.current) return; follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < 80; setAway(!follow.current); if (follow.current) setNewMessages(false); capture() }}>
+    <div className="conversation-history"><div className="conversation-scroll" ref={bindScroll} onWheel={() => { anchorLocked.current = false }} onTouchMove={() => { anchorLocked.current = false }} onScroll={() => { const node = scroll.current; if (!node || restoring.current || anchorLocked.current) return; follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < 80; setAway(!follow.current); if (follow.current) setNewMessages(false); capture() }}>
       {!id ? <Welcome recent={recent} hasDraft={false} onNew={onNew} onBrowse={onBrowse} onSelect={onSelect} onPrompt={prompt} /> : loading && !page ? <div className="history-loading" role="status"><span>正在读取对话历史…</span><Skeleton active paragraph={{ rows: 5 }} /></div> : failure && !turns.length ? <Empty className="codex-empty" description={<><p>{unavailable}</p><p className="conversation-meta">{failure.message}</p></>}><Button onClick={() => void load()} icon={<ReloadOutlined />}>重试读取</Button></Empty> : page && !turns.length && session ? <Welcome session={session} recent={[]} hasDraft={!!draft.text.trim()} onNew={onNew} onBrowse={onBrowse} onSelect={onSelect} onPrompt={prompt} /> : null}
       {page?.next_cursor && !needsMessage && <Button loading={loading} className="load-earlier" onClick={() => void load(true)}>加载更早对话</Button>}
-      <Transcript turns={turns} scroll={scroll} position={position} continuation={needsMessage ? continuation : undefined} loading={loading} onContinue={continueHistory} onAnchor={anchorInteraction} />
+      <Transcript turns={turns} scroll={scrollElement} position={position} continuation={needsMessage ? continuation : undefined} loading={loading} onContinue={continueHistory} onAnchor={anchorInteraction} />
       <div className="pending-messages">{pending.map((p) => <article key={p.id} className={`codex-message user pending-message ${p.state === 'submitting' ? 'is-submitting' : ''}`} data-message-key={`pending:${p.id}`}><div className="message-role">{p.state === 'submitting' ? <LoadingOutlined /> : ['failed', 'orphaned', 'unknown', 'rejected', 'expired', 'unconfirmed'].includes(p.state) ? <CloseCircleOutlined /> : p.command_id ? <CheckCircleOutlined /> : <ClockCircleOutlined />} 你 · {stateNames[p.state] ?? '处理中'}</div><div className="message-body user-text">{p.text}</div></article>)}</div>
       {visibleTurn && <div className="response-activity" role="status"><ActivityIndicator /><span>{turns.some((turn) => turn.items.some((item) => item.streaming)) ? 'Codex 正在回复' : 'Codex 正在处理'}<small>你可以继续编写下一条指令</small></span></div>}
     </div><Button className="jump-to-bottom" icon={<ArrowDownOutlined aria-hidden />} hidden={!away && !newMessages} onClick={() => { follow.current = true; anchor.current = undefined; restore(); setNewMessages(false); setAway(false) }}>{newMessages ? '有新消息 · 回到底部' : '回到底部'}</Button></div>

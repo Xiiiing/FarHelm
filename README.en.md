@@ -4,14 +4,14 @@
   <p><strong>A remote control plane for personal research and GPU training environments</strong></p>
   <p>See training-host status from your phone and safely extend remote control without exposing inbound ports on training machines.</p>
   <p>
-    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.8.0">V0.8.0</a> ·
+    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.9.0">V0.9.0</a> ·
     <a href="./deploy/README.en.md">Deployment guide</a> ·
     <a href="./README.md">简体中文</a>
   </p>
 </div>
 
 > [!IMPORTANT]
-> `V0.8.0` lets the Rust Agent manage your installed, authenticated Codex through one persistent App Server and an outbound WSS connection. The workspace uses Ant Design X, a shared memory cache, and virtualized history while preserving global navigation, experiments, schedules, and browser notifications.
+> `V0.9.0` completes the project workspace, native Codex model and permission details, light/dark appearance, and custom accent colors. It fixes cached long-history switching, notification/experiment/audit pagination, and schedule synchronization. The Rust Agent, persistent local Codex, outbound WSS, experiment reports, and browser notifications remain in place.
 
 ## Quick install
 
@@ -121,7 +121,7 @@ A successful command returns `run_id`, `event_id`, and `stored_locally: true`: t
 
 The [Bash example](examples/experiment-report.sh) and [Python example](examples/experiment-report.py) report failures through exit handling and preserve the training exit code, without a Python SDK. A single final call cannot infer a result if never reached, after power loss, or after SIGKILL; use PID watch for that fallback. Success follow-ups expire after 24 hours; failed and unknown reports only notify. Prompt files remain on the Agent.
 
-The notification center provides pagination, type/Agent/result filters, synchronized unread state, and details. Settings include system/light/dark themes, experiment/Codex in-page alert switches, and a browser test notification. Keep FarHelm open to receive completion alerts and click through to details. Initial loading and reconnect history do not trigger a burst of old alerts. This release covers browser in-page notifications; iOS system notifications are planned for a later version.
+The notification center provides pagination, type/Agent/result filters, synchronized unread state, and details. Notification, experiment, and audit refreshes retain loaded pages. Filters cover all registered servers, obsolete requests cannot replace current results, and failed reads can be retried. Schedule creation and cancellation reconcile the list immediately, with confirmation before cancelling a specific task. Settings include system/light/dark themes, experiment/Codex in-page alert switches, and a browser test notification. Keep FarHelm open to receive completion alerts and click through to details. Initial loading and reconnect history do not trigger a burst of old alerts. This release covers browser in-page notifications; iOS system notifications are planned for a later version.
 
 Browser commands and schedules are acknowledged after Agent persistence. Failed submissions retain the current-page draft and operation identity for retries. On restart, saved terminal receipts reconcile completed work; running tasks without a terminal receipt become orphaned and are not replayed. Upgrade Hub before Agent; the new content relay requires the Agent's V0.7 capability.
 

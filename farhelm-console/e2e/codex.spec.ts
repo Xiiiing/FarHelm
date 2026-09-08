@@ -464,6 +464,18 @@ test('2000 turns load through every page and retain the visible anchor when virt
   await page.getByRole('button', { name: /回到底部/ }).click()
   await expect(page.locator('[data-turn-id="long-1999"]')).toBeVisible()
   await composerFits(page)
+  await choose(page, '另一个会话')
+  await expect(page.getByText('另一会话的回复', { exact: true })).toBeVisible()
+  let resume: () => void = () => {}
+  const waiting = new Promise<void>(resolve => { resume = resolve })
+  // A cached virtual transcript must attach without a metadata/history response triggering another render.
+  await page.route('**/api/v1/**', async route => { await waiting; await route.fallback().catch(() => {}) })
+  try {
+    await choose(page, '训练结果分析')
+    await expect(page.locator('[data-turn-id="long-1999"]')).toBeVisible()
+    await expect(page.getByLabel('给 Codex 发送指令')).toHaveValue('长历史中仍可输入中文🙂')
+    expect(await page.locator('.codex-turn').count()).toBeLessThan(35)
+  } finally { resume() }
 })
 
 test('Enter submits identical prompts with independent identities and no command polling', async ({ page }, info) => {

@@ -1,3 +1,4 @@
+import { version } from '../package.json'
 import { clearMarkdownCache } from './components/codex/markdownService'
 import { clearOperationReceipts } from './api/features'
 import {
@@ -16,6 +17,7 @@ import {
 } from '@ant-design/icons'
 import { QueryClientProvider } from '@tanstack/react-query'
 import { queryClient, connectCodexCache } from './api/cache'
+import { connectMetadataCache } from './api/metadata'
 import { Avatar, Button, ConfigProvider, Drawer, Grid, Layout, Menu, Space, Spin, Tooltip, Typography } from 'antd'
 import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
@@ -91,7 +93,8 @@ function AppContent() {
   useEffect(() => { void readSession().then(setSession).catch(() => setSession(null)) }, [])
   useEffect(() => {
     if (!session) { queryClient.clear(); clearMarkdownCache(); clearOperationReceipts(); return }
-    return connectCodexCache()
+    const codex = connectCodexCache(), metadata = connectMetadataCache()
+    return () => { codex(); metadata() }
   }, [session])
   const mobileSelection = ['/agents', '/notifications', '/audit', '/settings'].includes(location.pathname)
     ? '/more'
@@ -124,7 +127,7 @@ function AppContent() {
               { type: 'group', label: '工作空间', children: desktopItems.slice(0, 4) },
               { type: 'group', label: '管理', children: desktopItems.slice(4) },
             ]} onClick={({ key }) => go(key)} /></nav>
-            <div className="sider-footer"><Tooltip title={`${session.user} · 账户设置`}><Button type="text" className="account-identity" aria-label={`账户：${session.user}，打开设置`} onClick={() => go('/settings')}><Avatar shape="square">{session.user.slice(0, 1).toUpperCase()}</Avatar></Button></Tooltip><span className="console-version">V0.8.0</span></div>
+            <div className="sider-footer"><Tooltip title={`${session.user} · 账户设置`}><Button type="text" className="account-identity" aria-label={`账户：${session.user}，打开设置`} onClick={() => go('/settings')}><Avatar shape="square">{session.user.slice(0, 1).toUpperCase()}</Avatar></Button></Tooltip><span className="console-version">V{version}</span></div>
           </Sider>
         )}
 

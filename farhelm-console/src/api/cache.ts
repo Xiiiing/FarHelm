@@ -120,7 +120,7 @@ export function connectCodexCache() {
       if (opened || event.type === 'codex.stream.resync') {
         flush()
         reconcileLists()
-        for (const query of queryClient.getQueryCache().findAll({ queryKey: ['codex'], type: 'active' })) if (['history', 'session', 'operation'].includes(String(query.queryKey[1]))) void queryClient.invalidateQueries({ queryKey: query.queryKey, exact: true })
+        for (const query of queryClient.getQueryCache().findAll({ queryKey: ['codex'], type: 'active' })) if (['history', 'session', 'operation', 'schedules'].includes(String(query.queryKey[1]))) void queryClient.invalidateQueries({ queryKey: query.queryKey, exact: true })
       }
       opened = true; return
     }
