@@ -1,10 +1,12 @@
+.markdown-body :is(h2, h3, h4) { font-weight: 500; text-wrap: pretty; }
+.markdown-body strong { font-weight: 600; }
 .markdown-body > :first-child, .markdown-body > div > :first-child { margin-top: 0; }
 .markdown-body > :last-child, .markdown-body > div > :last-child { margin-bottom: 0; }
 .markdown-body p { margin: 0 0 16px; }
 .markdown-body p.long-paragraph-chunk { margin: 0; content-visibility: auto; contain-intrinsic-size: auto 1600px; }
 .markdown-body p.markdown-chunk { content-visibility: auto; contain-intrinsic-size: auto 1600px; }
-.markdown-body h2 { font-size: 22px; line-height: 32px; margin: 28px 0 16px; }
-.markdown-body h3 { font-size: 20px; line-height: 28px; margin: 24px 0 12px; }
+.markdown-body h2 { font-size: 20px; line-height: 30px; margin: 28px 0 16px; }
+.markdown-body h3 { font-size: 20px; line-height: 30px; margin: 24px 0 12px; }
 .markdown-body h4 { font-size: 18px; line-height: 26px; margin: 20px 0 12px; }
 .markdown-body ul, .markdown-body ol { padding-left: 24px; margin: 12px 0 16px; }
 .markdown-body li { margin: 6px 0; }
@@ -13,7 +15,7 @@
 .markdown-body a { color: var(--farhelm-accent); text-decoration: underline; text-underline-offset: 3px; }
 .markdown-body code, .execution-summary pre { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 14px; }
 .markdown-body :not(pre) > code { background: var(--farhelm-raised); border-radius: 4px; padding: 2px 4px; }
-.markdown-code { overflow: hidden; border: 1px solid var(--farhelm-border); border-radius: 8px; margin: 16px 0; background: var(--farhelm-surface); }
+.markdown-code { overflow: hidden; border: 1px solid var(--farhelm-border); border-radius: var(--radius-control); margin: 16px 0; background: var(--farhelm-surface); }
 .code-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 8px 0 16px; background: var(--farhelm-raised); color: var(--farhelm-muted); font-size: 12px; }
 .markdown-code pre { overflow: auto; max-width: 100%; padding: 16px; margin: 0; line-height: 24px; white-space: pre; }
 .markdown-table { max-width: 100%; overflow: auto; margin: 16px 0; }

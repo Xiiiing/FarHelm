@@ -17,14 +17,14 @@ import {
 import { QueryClientProvider } from '@tanstack/react-query'
 import { queryClient, connectCodexCache } from './api/cache'
 import { Avatar, Button, ConfigProvider, Drawer, Grid, Layout, Menu, Space, Spin, Tooltip, Typography } from 'antd'
-import { lazy, Suspense, useEffect, useState } from 'react'
+import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 
 import { AuditPage } from './components/AuditPage'
 import { SettingsPage } from './components/SettingsPage'
 import { LiveNotifications } from './components/LiveNotifications'
 import { ConnectionStatus } from './components/ConnectionStatus'
-import type { ColorPreference } from './hooks/useColorMode'
+import type { AppearanceProps } from './components/AppearanceSettings'
 import { AgentListPage } from './components/AgentListPage'
 import { ExperimentPage } from './components/ExperimentPage'
 import { LoginPage } from './components/LoginPage'
@@ -57,7 +57,7 @@ const mobileItems = [
   { key: '/more', icon: <MoreOutlined aria-hidden />, label: '更多' },
 ]
 
-function FeatureRoutes({ csrf, preference, onPreference, onLogout }: { csrf: string; preference: ColorPreference; onPreference: (value: ColorPreference) => void; onLogout: () => void }) {
+function FeatureRoutes({ csrf, onLogout, ...appearance }: AppearanceProps & { csrf: string; onLogout: () => void }) {
   const { health, refresh } = useHubHealth()
   const { agents, refresh: refreshAgents } = useAgents()
   const refreshOverview = () => {
@@ -73,7 +73,7 @@ function FeatureRoutes({ csrf, preference, onPreference, onLogout }: { csrf: str
       <Route path="/codex" element={<Suspense fallback={codexFallback}><CodexPage csrf={csrf} agents={agents.data?.agents ?? []} /></Suspense>} />
       <Route path="/notifications" element={<NotificationPage csrf={csrf} />} />
       <Route path="/audit" element={<AuditPage />} />
-      <Route path="/settings" element={<SettingsPage csrf={csrf} preference={preference} onPreference={onPreference} onLogout={onLogout} />} />
+      <Route path="/settings" element={<SettingsPage csrf={csrf} {...appearance} onLogout={onLogout} />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   )
@@ -85,7 +85,8 @@ function AppContent() {
   const navigate = useNavigate()
   const location = useLocation()
   const [drawerOpen, setDrawerOpen] = useState(false)
-  const { mode, preference, setPreference, toggleMode } = useColorMode()
+  const { mode, preference, setPreference, accent, setAccent, toggleMode } = useColorMode()
+  const appearanceTheme = useMemo(() => createTheme(mode, accent), [mode, accent])
   const [session, setSession] = useState<BrowserSession | null | undefined>(undefined)
   useEffect(() => { void readSession().then(setSession).catch(() => setSession(null)) }, [])
   useEffect(() => {
@@ -106,11 +107,11 @@ function AppContent() {
     setDrawerOpen(false)
   }
 
-  if (session === undefined) return <ConfigProvider theme={createTheme(mode)}><div className="session-loading"><Spin /><span>正在恢复安全会话…</span></div></ConfigProvider>
-  if (session === null) return <ConfigProvider theme={createTheme(mode)}><LoginPage onLogin={setSession} /></ConfigProvider>
+  if (session === undefined) return <ConfigProvider theme={appearanceTheme}><div className="session-loading"><Spin /><span>正在恢复安全会话…</span></div></ConfigProvider>
+  if (session === null) return <ConfigProvider theme={appearanceTheme}><LoginPage onLogin={setSession} /></ConfigProvider>
 
   return (
-    <ConfigProvider theme={createTheme(mode)}>
+    <ConfigProvider theme={appearanceTheme}>
       <LiveNotifications />
       <Layout className={location.pathname === '/codex' ? 'app-layout codex-shell' : 'app-layout'}>
         {isDesktop && (
@@ -145,7 +146,7 @@ function AppContent() {
               {!isDesktop && <Button type="text" icon={<MenuOutlined />} onClick={() => setDrawerOpen(true)} aria-label="打开更多导航" />}
             </Space>
           </Header>
-          <Content className={location.pathname === '/codex' ? 'app-content codex-content' : 'app-content'}><FeatureRoutes csrf={session.csrf_token} preference={preference} onPreference={setPreference} onLogout={() => void logout(session.csrf_token).then(() => setSession(null))} /></Content>
+          <Content className={location.pathname === '/codex' ? 'app-content codex-content' : 'app-content'}><FeatureRoutes csrf={session.csrf_token} preference={preference} onPreference={setPreference} accent={accent} onAccent={setAccent} onLogout={() => void logout(session.csrf_token).then(() => setSession(null))} /></Content>
         </Layout>
 
         {!isDesktop && (

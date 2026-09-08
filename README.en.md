@@ -131,6 +131,8 @@ Desktop global navigation and mobile bottom navigation remain visible in Codex. 
 
 Assistant replies support Markdown tables, code copying, math, and safe HTTPS links. Execution details in each turn form a collapsed group with visible failures. The composer stays visible, and reading older content does not jump to the bottom on new messages. Large-message continuation is separate from loading earlier conversations. Switching sessions immediately displays cached history and retains each draft; failed refreshes preserve visible content. Inactive body and parsing caches total at most 32 MiB, with at most 20 inactive histories, and are cleared on logout. Steer and interrupt target the visible active turn.
 
+The appearance uses neutral black, white, and gray surfaces. Settings offer separate light/dark mode and accent choices (graphite, blue, green, violet, rose, orange, or a custom color), applied immediately and saved in the current browser. The rounded composer stays visible; locally served Manrope and Noto Sans SC fonts share a consistent reading column. Submission and expanding execution details use brief animations that respect the system’s reduced-motion preference; cached session switches do not replay the entry animation.
+
 Upgrade Hub before Agent when moving from V0.7.1. SQLite schema remains 7. Older Agents retain HTTP compatibility; upgraded Agents use WSS without also claiming work over HTTP. Existing Python directories remain on installed machines for rollback validation and are never invoked by the new version.
 
 ## What is implemented

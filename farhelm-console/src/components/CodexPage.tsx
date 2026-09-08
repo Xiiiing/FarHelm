@@ -33,6 +33,12 @@ export function CodexPage({ csrf, agents }: { csrf: string; agents: AgentSummary
   const scoped = scopes.find((option) => option.value === scope)
   const sessions = useSessions(csrf, query, archive, scoped?.agent_id, scoped?.project_id)
   const operations = useOperations(csrf)
+  const [entering, setEntering] = useState(true)
+  useEffect(() => {
+    // Only the first workspace entry moves the composer; cached session switches stay immediate.
+    const timer = window.setTimeout(() => setEntering(false), 280)
+    return () => window.clearTimeout(timer)
+  }, [])
   useEffect(() => {
     const viewport = window.visualViewport
     const resize = () => { document.documentElement.style.setProperty('--codex-height', `${viewport?.height ?? innerHeight}px`); document.documentElement.style.setProperty('--codex-top', `${viewport?.offsetTop ?? 0}px`) }
@@ -70,7 +76,7 @@ export function CodexPage({ csrf, agents }: { csrf: string; agents: AgentSummary
       event.preventDefault(); const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1 : Math.max(0, Math.min(buttons.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1))); buttons[next]?.focus()
     }}>{sessions.loading && !sessions.rows.length ? <Skeleton active paragraph={{ rows: 6 }} /> : sessions.rows.length ? <SessionGroups rows={sessions.rows} projects={projects} agents={agents} selected={id} onSelect={select} /> : !sessions.error && <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={query ? '当前范围内没有匹配的会话' : '当前范围内没有会话'} />}{sessions.cursor && <Button block loading={sessions.loading} onClick={() => void sessions.more()}>加载更多会话</Button>}</div>
   </aside>
-  return <div className={`codex-workspace ${collapsed ? 'rail-collapsed' : ''}`}><div className="codex-desktop-rail">{rail}</div><Drawer className="codex-mobile-drawer" aria-label="项目和会话" placement="left" open={railOpen} onClose={() => setRailOpen(false)} size={Math.min(320, window.innerWidth - 24)} closable={false}>{rail}</Drawer>
+  return <div className={`codex-workspace ${collapsed ? 'rail-collapsed' : ''} ${entering ? 'workspace-entering' : ''}`}><div className="codex-desktop-rail">{rail}</div><Drawer className="codex-mobile-drawer" aria-label="项目和会话" placement="left" open={railOpen} onClose={() => setRailOpen(false)} size={Math.min(320, window.innerWidth - 24)} closable={false}>{rail}</Drawer>
     <Conversation recent={sessions.rows.slice(0, 3)} onSelect={select} onNew={newSession} onBrowse={browse} key={id ?? 'empty'} csrf={csrf} id={id} session={sessions.rows.find((s) => s.session_id === id)} draft={operations.get(id ?? '')} onDraft={(change) => { if (id) operations.update(id, change) }} onSend={(turn) => { if (id) void operations.send(id, turn) }} onRail={() => setRailOpen(true)} onCollapse={() => setCollapsed((old) => !old)} collapsed={collapsed} onSchedule={setSchedule} onSchedules={setSchedules} />
     {creating && <CreateDialog csrf={csrf} projects={projects} onClose={() => setCreating(false)} onCreated={(sessionId) => { if (sessionId) select(sessionId); void sessions.refresh() }} />}
     {schedule && <ScheduleDialog csrf={csrf} target={schedule} prompt={operations.get(schedule.session_id).text} onClose={() => setSchedule(undefined)} />}
