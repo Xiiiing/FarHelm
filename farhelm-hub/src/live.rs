@@ -239,7 +239,7 @@ fn validate_readiness(status: &CodexReadiness) -> Result<()> {
 }
 pub(super) async fn broadcast_agent(state: &AppState, agent: &str) {
     if let Some(stored) = state.agents.read().await.get(agent) {
-        let _=state.event_bus.send(StoredEvent {sequence:0,event_id:format!("agent:{agent}"),event_type:"agent.status".into(),payload:serde_json::json!({"agent_id":agent,"hostname":stored.hostname,"agent_version":stored.agent_version,"last_seen_unix":stored.last_seen_unix,"online":is_online(unix_time(),stored.last_seen_unix),"credential_state":stored.credential_state,"codex":stored.codex})});
+        let _=state.event_bus.send(StoredEvent {sequence:0,event_id:format!("agent:{agent}"),event_type:"agent.status".into(),payload:serde_json::json!({"agent_id":agent,"hostname":stored.hostname,"agent_version":stored.agent_version,"last_seen_unix":stored.last_seen_unix,"online":is_online(unix_time(),stored.last_seen_unix),"credential_state":stored.credential_state,"codex":stored.codex,"capabilities":stored.capabilities})});
     }
 }
 pub(super) fn broadcast_command(

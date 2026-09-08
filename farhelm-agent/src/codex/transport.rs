@@ -313,13 +313,32 @@ pub fn discover(explicit: Option<&Path>) -> Result<PathBuf> {
 }
 
 #[cfg(test)]
+pub(super) fn write_fixture_executable(path: &Path, script: &str) {
+    use std::io::Write;
+    // Other test threads can fork between a parent-side write and close,
+    // inheriting a writable fd until exec and causing ETXTBSY. Keep that fd
+    // entirely inside a writer process and wait for it to exit before exec.
+    let mut writer = std::process::Command::new("/bin/sh")
+        .args(["-c", "umask 077; cat > \"$1\" && chmod 700 \"$1\"", "--"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writer
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    assert!(writer.wait().unwrap().success());
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     fn executable(directory: &Path, name: &str, script: &str) -> PathBuf {
         let path = directory.join(name);
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_fixture_executable(&path, script);
         path
     }
     #[tokio::test]
@@ -386,13 +405,17 @@ done
             "codex",
             "#!/usr/bin/env farhelm-fixture-node\n",
         );
-        let interpreter = executable(
+        executable(
             directory.path(),
             "farhelm-fixture-node",
             "#!/bin/sh\nprintf 'codex-cli 0.153.4\\n'\n",
         );
         assert_eq!(version(&bin).await.unwrap(), "0.153.4");
-        std::fs::write(&interpreter, "#!/bin/sh\nprintf 'codex-cli 0.147.0\\n'\n").unwrap();
+        executable(
+            directory.path(),
+            "farhelm-fixture-node",
+            "#!/bin/sh\nprintf 'codex-cli 0.147.0\\n'\n",
+        );
         assert_eq!(version(&bin).await.unwrap(), "0.147.0");
         let malformed = executable(
             directory.path(),

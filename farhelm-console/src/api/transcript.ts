@@ -38,6 +38,39 @@ export function mergeTurns(current: TranscriptTurn[], incoming: TranscriptTurn[]
   return [...new Set(order.map((turn) => turn.turn_id))].map((id) => merged.get(id)!)
 }
 
-export function mergeDelta(current: TranscriptTurn[], data: { turn_id: string; item_id: string; delta: string; text_offset: number }): TranscriptTurn[] {
-  return mergeTurns(current, [{ turn_id: data.turn_id, status: 'inProgress', items: [{ item_id: data.item_id, kind: 'assistant_message', text: data.delta, text_offset: data.text_offset, text_complete: false, streaming: true }] }])
+export type TranscriptDelta = { turn_id: string; item_id: string; delta: string; text_offset: number }
+
+/** Apply one received batch in order, copying only the turns/items that it changes. */
+export function mergeDeltas(current: TranscriptTurn[], chunks: readonly TranscriptDelta[]): TranscriptTurn[] {
+  if (!chunks.length) return current
+  const positions = new Map<string, number>()
+  current.forEach((turn, index) => positions.set(turn.turn_id, index))
+  const edited = new Map<string, { turn: TranscriptTurn; items: Map<string, number> }>()
+  let result = current
+  for (const data of chunks) {
+    const position = positions.get(data.turn_id)
+    const previous = position === undefined ? undefined : result[position]
+    if (previous && terminal(previous.status)) continue
+    let edit = edited.get(data.turn_id)
+    const itemPosition = edit ? edit.items.get(data.item_id) : previous?.items.findIndex((item) => item.item_id === data.item_id)
+    const old = itemPosition !== undefined && itemPosition >= 0 ? previous?.items[itemPosition] : undefined
+    const item = mergeItem(old, { item_id: data.item_id, kind: 'assistant_message', text: data.delta, text_offset: data.text_offset, text_complete: false, streaming: true })
+    if (old === item && previous?.status === 'inProgress') continue
+    if (!edit) {
+      const turn: TranscriptTurn = { ...previous, turn_id: data.turn_id, status: 'inProgress', items: previous ? [...previous.items] : [] }
+      edit = { turn, items: new Map(turn.items.map((value, index) => [value.item_id, index])) }
+      edited.set(data.turn_id, edit)
+      if (result === current) result = [...current]
+      if (position === undefined) { positions.set(data.turn_id, result.length); result.push(turn) }
+      else result[position] = turn
+    }
+    const index = edit.items.get(data.item_id)
+    if (index === undefined) { edit.items.set(data.item_id, edit.turn.items.length); edit.turn.items.push(item) }
+    else edit.turn.items[index] = item
+  }
+  return result
+}
+
+export function mergeDelta(current: TranscriptTurn[], data: TranscriptDelta): TranscriptTurn[] {
+  return mergeDeltas(current, [data])
 }

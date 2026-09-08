@@ -112,7 +112,7 @@ enum CommandKind {
         /// Only report whether an update is available.
         #[arg(long)]
         check: bool,
-        /// Install one exact formal version, such as V0.8.0.
+        /// Install one exact formal version, such as V0.9.0.
         #[arg(long)]
         version: Option<String>,
         /// Permit a user-approved first-number version change.
@@ -1571,7 +1571,7 @@ async fn execute_remote_command_inner(
             } else {
                 project_root.clone()
             };
-            let value = worker_runtime.codex.call(method, serde_json::json!({"session_id":command.payload.get("session_id"),"cwd":cwd.clone(),"mode":mode})).await?;
+            let value = worker_runtime.codex.call(method, serde_json::json!({"session_id":command.payload.get("session_id"),"cwd":cwd.clone(),"mode":mode,"inherit_permissions":command.payload.get("inherit_permissions").and_then(serde_json::Value::as_bool).unwrap_or(false)})).await?;
             let session_id = value
                 .get("session_id")
                 .and_then(serde_json::Value::as_str)

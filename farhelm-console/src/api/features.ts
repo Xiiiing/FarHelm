@@ -8,7 +8,8 @@ export type SessionState = 'creating' | 'idle' | 'queued' | 'running' | 'interru
 export type CodexSession = { session_id: string; agent_id: string; project_id: string; mode: 'inspect' | 'edit'; state: SessionState; title?: string; display_label?: string; active_turn_id?: string; updated_at_unix: number; revision?: number }
 export type TranscriptItem = { item_id: string; kind: 'user_message' | 'assistant_message' | 'command_summary' | 'file_change_summary' | 'error'; text: string; text_offset?: number; text_complete?: boolean; status?: string; exit_code?: number; duration_ms?: number; streaming?: boolean }
 export type TranscriptTurn = { turn_id: string; status: string; started_at_unix?: number; completed_at_unix?: number; items: TranscriptItem[] }
-export type TranscriptPage = { older_loaded?: boolean; protocol?: string; session_id: string; turns: TranscriptTurn[]; next_cursor?: string; continuation?: { kind: 'message' | 'history'; turn_id: string; item_id: string; text_offset: number } }
+export type SessionContext = { model?: string; reasoning_effort?: string; sandbox?: string; approval_policy?: string; approvals_reviewer?: string }
+export type TranscriptPage = { older_loaded?: boolean; protocol?: string; session_id: string; turns: TranscriptTurn[]; context?: SessionContext; next_cursor?: string; continuation?: { kind: 'message' | 'history'; turn_id: string; item_id: string; text_offset: number } }
 export type DisplayPage = { sessions: CodexSession[]; next_cursor?: string; incomplete_agents: { agent_id: string; reason: string }[] }
 export async function fetchSessionDisplay(csrf: string, request: { mode: 'labels' | 'search'; session_ids?: string[]; query?: string; agent_id?: string; project_id?: string; archived?: 'false' | 'true' | 'all'; cursor?: string }, signal?: AbortSignal): Promise<DisplayPage> {
   const response = await fetch('/api/v1/codex/session-display', { method: 'POST', credentials: 'same-origin', signal, headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf }, body: JSON.stringify(request) })
@@ -50,9 +51,9 @@ export async function fetchTranscript(sessionId: string, cursor?: string, signal
   return value
 }
 
-export async function fetchSchedules(sessionId?: string): Promise<CodexSchedule[]> {
+export async function fetchSchedules(sessionId?: string, signal?: AbortSignal): Promise<CodexSchedule[]> {
   const suffix = sessionId ? `?session=${encodeURIComponent(sessionId)}` : ''
-  const value = await json<{ protocol: string; schedules: CodexSchedule[] }>(`/api/v1/codex/schedules${suffix}`)
+  const value = await json<{ protocol: string; schedules: CodexSchedule[] }>(`/api/v1/codex/schedules${suffix}`, signal)
   if (value.protocol !== PROTOCOL_VERSION || !Array.isArray(value.schedules)) throw new Error('Hub returned invalid schedules')
   return value.schedules
 }
@@ -73,7 +74,7 @@ export class ApiError extends Error {
 }
 async function apiError(response: Response) {
   const value = await response.json().catch(() => ({})) as { error?: string }
-  const errors: Record<string, string> = { operation_expired: '这次操作已过期，草稿已保留；核对状态后可修改指令重新提交', operation_failed: '这次操作已失败，草稿已保留；请先核对执行结果', agent_offline: 'Agent 离线，连接恢复后重试', agent_upgrade_required: '请先升级 Agent 至 V0.8.0', agent_save_unconfirmed: '尚未确认 Agent 保存，重试会核对同一次操作', invalid_schedule_time: '时间必须在 60 秒至 365 天之间', session_is_not_running: '当前会话已没有活动对话', visible_turn_changed: '活动对话已改变，请刷新后再操作', idempotency_conflict: '操作身份与之前的请求冲突' }
+  const errors: Record<string, string> = { operation_expired: '这次操作已过期，草稿已保留；核对状态后可修改指令重新提交', operation_failed: '这次操作已失败，草稿已保留；请先核对执行结果', agent_offline: 'Agent 离线，连接恢复后重试', agent_upgrade_required: '请先升级 Agent 至 V0.9.0', agent_save_unconfirmed: '尚未确认 Agent 保存，重试会核对同一次操作', invalid_schedule_time: '时间必须在 60 秒至 365 天之间', session_is_not_running: '当前会话已没有活动对话', visible_turn_changed: '活动对话已改变，请刷新后再操作', idempotency_conflict: '操作身份与之前的请求冲突' }
   return new ApiError(errors[value.error ?? ''] ?? (response.status === 401 ? '登录已过期，请重新登录' : `请求失败（HTTP ${response.status}）${value.error ? `：${value.error}` : ''}`), value.error ?? 'request_failed', response.status)
 }
 export async function mutate(url: string, csrf: string, body?: unknown, method = 'POST', operationId?: string): Promise<Operation> {
@@ -125,8 +126,8 @@ export async function waitForCommand(operation: Operation): Promise<Operation> {
   }
 }
 
-export function createSession(csrf: string, agentId: string, projectId: string, mode: 'inspect' | 'edit') {
-  return mutate('/api/v1/codex/sessions', csrf, { agent_id: agentId, project_id: projectId, mode })
+export function createSession(csrf: string, agentId: string, projectId: string, mode: 'inspect' | 'edit', inheritPermissions = false) {
+  return mutate('/api/v1/codex/sessions', csrf, { agent_id: agentId, project_id: projectId, mode, ...(inheritPermissions ? { inherit_permissions: true } : {}) })
 }
 export function sendMessage(csrf: string, sessionId: string, prompt: string, delivery: 'queue' | 'steer', turnId?: string, operationId?: string) {
   return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/messages`, csrf, { prompt, delivery, ...(delivery === 'steer' ? { turn_id: turnId } : {}) }, 'POST', operationId)

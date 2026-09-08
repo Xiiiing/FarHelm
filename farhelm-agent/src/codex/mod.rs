@@ -1,4 +1,5 @@
 //! Local Codex is the transcript/authentication authority. No vendor body is a Hub record.
+mod context;
 pub mod history;
 mod protocol;
 #[cfg(test)]
@@ -34,6 +35,8 @@ pub struct CodexStatus {
 struct Index {
     rows: HashMap<String, Value>,
     refreshed: Option<Instant>,
+    // A complete empty snapshot is distinct from an index not yet initialized.
+    snapshot_generation: u64,
     revision: u64,
     changed: HashMap<String, u64>,
 }
@@ -51,6 +54,7 @@ struct LoadedThread {
     thread: Value,
     mode: String,
     has_turns: bool,
+    context: farhelm_protocol::CodexSessionContext,
 }
 #[derive(Clone)]
 pub struct Codex {
@@ -175,6 +179,13 @@ impl Codex {
                             break;
                         }
                         let params = &event["params"];
+                        if event["method"] == "thread/settings/updated"
+                            && let Some(id) = params["threadId"].as_str()
+                            && let Some(loaded) = inner.loaded.write().await.get_mut(id)
+                        {
+                            loaded.context =
+                                context::project(&params["threadSettings"], Some(&loaded.context));
+                        }
                         let mut index = inner.index.write().await;
                         if event["method"] == "thread/started"
                             && let Some(id) = params["thread"]["id"].as_str()
@@ -235,25 +246,37 @@ impl Codex {
     }
 
     async fn index(&self, force: bool) -> Result<Vec<Value>> {
-        let _refresh = self.inner.refresh.lock().await;
-        if !force
-            && self
-                .inner
-                .index
-                .read()
-                .await
-                .refreshed
-                .is_some_and(|time| time.elapsed() < Duration::from_secs(30))
+        let generation = {
+            let index = self.inner.index.read().await;
+            if !force
+                && index
+                    .refreshed
+                    .is_some_and(|time| time.elapsed() < Duration::from_secs(30))
+            {
+                return Ok(index.rows.values().cloned().collect());
+            }
+            index.snapshot_generation
+        };
+        let _refresh = match self.inner.refresh.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                if !force {
+                    let index = self.inner.index.read().await;
+                    if index.snapshot_generation > 0 {
+                        // Names/search use the last complete projection while the
+                        // existing discovery lane prepares an atomic replacement.
+                        return Ok(index.rows.values().cloned().collect());
+                    }
+                }
+                self.inner.refresh.lock().await
+            }
+        };
         {
-            return Ok(self
-                .inner
-                .index
-                .read()
-                .await
-                .rows
-                .values()
-                .cloned()
-                .collect());
+            let index = self.inner.index.read().await;
+            if index.snapshot_generation != generation {
+                // Another caller completed the requested scan while we waited.
+                return Ok(index.rows.values().cloned().collect());
+            }
         }
         let connection = self.connection().await?;
         let revision = self.inner.index.read().await.revision;
@@ -306,6 +329,7 @@ impl Codex {
         }
         index.rows = rows;
         index.refreshed = Some(Instant::now());
+        index.snapshot_generation += 1;
         index.changed.retain(|_, changed| *changed > revision);
         Ok(index.rows.values().cloned().collect())
     }
@@ -399,7 +423,9 @@ impl Codex {
                 if let Some(loaded) = self.inner.loaded.read().await.get(&session)
                     && !loaded.has_turns
                 {
-                    return Ok(json!({"session_id":session,"turns":[],"next_cursor":null}));
+                    return Ok(
+                        json!({"session_id":session,"turns":[],"next_cursor":null,"context":loaded.context}),
+                    );
                 }
                 let limit = params["limit"].as_u64().unwrap_or(20).clamp(1, 50) as usize;
                 let legacy = self
@@ -408,7 +434,8 @@ impl Codex {
                     .as_deref()
                     .and_then(|v| semver::Version::parse(v).ok())
                     .is_some_and(|v| v < semver::Version::new(0, 153, 0));
-                let (turns, next) = if legacy {
+                let latest = params["cursor"].is_null();
+                let (turns, next, settings) = if legacy {
                     let offset = upstream
                         .as_deref()
                         .map(|cursor| {
@@ -435,6 +462,13 @@ impl Codex {
                     ensure!(offset <= data.len(), "history_changed_reload");
                     let next =
                         (offset + limit < data.len()).then(|| format!("legacy:{}", offset + limit));
+                    let loaded = self.inner.loaded.read().await;
+                    let settings = latest.then(|| {
+                        context::project(
+                            &result["thread"],
+                            loaded.get(&session).map(|thread| &thread.context),
+                        )
+                    });
                     (
                         data.iter()
                             .rev()
@@ -443,23 +477,51 @@ impl Codex {
                             .cloned()
                             .collect::<Vec<_>>(),
                         next,
+                        settings,
                     )
                 } else {
-                    let result: ThreadPage = serde_json::from_value(
-                        connection
-                            .request(
-                                "thread/turns/list",
-                                serde_json::to_value(ThreadTurnsListParams {
+                    // The metadata RPC is independent of the history page and never resumes a thread.
+                    // Continuations need no settings read and cannot overwrite the latest context.
+                    let metadata = async {
+                        if !latest {
+                            return Ok(Value::Null);
+                        }
+                        tokio::time::timeout(
+                            Duration::from_millis(250),
+                            connection.request(
+                                "thread/read",
+                                serde_json::to_value(ThreadReadParams {
                                     thread_id: &session,
-                                    cursor: upstream.as_deref(),
-                                    limit: limit as u32,
-                                    items_view: "full",
+                                    include_turns: false,
                                 })?,
-                            )
-                            .await?,
-                    )
-                    .context("codex_history_invalid")?;
-                    (result.data, result.next_cursor)
+                            ),
+                        )
+                        .await
+                        .context("codex_context_timeout")?
+                    };
+                    let (result, metadata) = tokio::join!(
+                        connection.request(
+                            "thread/turns/list",
+                            serde_json::to_value(ThreadTurnsListParams {
+                                thread_id: &session,
+                                cursor: upstream.as_deref(),
+                                limit: limit as u32,
+                                items_view: "full",
+                            })?,
+                        ),
+                        metadata
+                    );
+                    let result: ThreadPage =
+                        serde_json::from_value(result?).context("codex_history_invalid")?;
+                    let loaded = self.inner.loaded.read().await;
+                    let metadata = metadata.unwrap_or(Value::Null);
+                    let settings = latest.then(|| {
+                        context::project(
+                            &metadata["thread"],
+                            loaded.get(&session).map(|thread| &thread.context),
+                        )
+                    });
+                    (result.data, result.next_cursor, settings)
                 };
                 crate::runtime_tasks::blocking(move || {
                     history::bounded_page(
@@ -471,15 +533,17 @@ impl Codex {
                     )
                 })
                 .await
+                .and_then(|mut page| {
+                    if let Some(settings) = settings {
+                        page["context"] = serde_json::to_value(settings)?;
+                    }
+                    Ok(page)
+                })
             }
             "codex.session.start" | "codex.session.resume" => {
                 let connection = self.connection().await?;
                 let mode = params["mode"].as_str().unwrap_or("inspect");
-                let sandbox = match mode {
-                    "inspect" => "read-only",
-                    "edit" => "workspace-write",
-                    _ => bail!("invalid_session_mode"),
-                };
+                ensure!(matches!(mode, "inspect" | "edit"), "invalid_session_mode");
                 if method == "codex.session.resume"
                     && let Some(id) = params["session_id"].as_str()
                     && let Some(loaded) = self.inner.loaded.read().await.get(id)
@@ -490,8 +554,18 @@ impl Codex {
                     );
                     return Ok(thread_result(&loaded.thread));
                 }
-                let mut request =
-                    json!({"cwd":params["cwd"],"sandbox":sandbox,"approvalPolicy":"on-request"});
+                let mut request = json!({"cwd":params["cwd"]});
+                // Resuming belongs to Codex: explicit overrides here would erase the user's
+                // persisted permission profile and approval policy. Legacy explicit creation
+                // still supports inspect/edit; the Console opts into native project defaults.
+                if method == "codex.session.start" && params["inherit_permissions"] != true {
+                    request["sandbox"] = json!(if mode == "edit" {
+                        "workspace-write"
+                    } else {
+                        "read-only"
+                    });
+                    request["approvalPolicy"] = json!("on-request");
+                }
                 if method == "codex.session.resume" {
                     request["threadId"] = params["session_id"].clone();
                     if self
@@ -529,6 +603,7 @@ impl Codex {
                             thread: row.clone(),
                             mode: mode.to_owned(),
                             has_turns: method == "codex.session.resume",
+                            context: context::project(&response, None),
                         },
                     );
                     self.inner.index.write().await.rows.insert(id, row);

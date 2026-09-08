@@ -4,14 +4,14 @@
   <p><strong>A remote control plane for personal research and GPU training environments</strong></p>
   <p>See training-host status from your phone and safely extend remote control without exposing inbound ports on training machines.</p>
   <p>
-    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.8.0">V0.8.0</a> ·
+    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.9.0">V0.9.0</a> ·
     <a href="./deploy/README.en.md">Deployment guide</a> ·
     <a href="./README.md">简体中文</a>
   </p>
 </div>
 
 > [!IMPORTANT]
-> `V0.8.0` lets the Rust Agent manage your installed, authenticated Codex through one persistent App Server and an outbound WSS connection. The workspace uses Ant Design X, a shared memory cache, and virtualized history while preserving global navigation, experiments, schedules, and browser notifications.
+> `V0.9.0` completes the project workspace, native Codex model and permission details, light/dark appearance, and custom accent colors. It fixes cached long-history switching, notification/experiment/audit pagination, and schedule synchronization. The Rust Agent, persistent local Codex, outbound WSS, experiment reports, and browser notifications remain in place.
 
 ## Quick install
 
@@ -121,15 +121,17 @@ A successful command returns `run_id`, `event_id`, and `stored_locally: true`: t
 
 The [Bash example](examples/experiment-report.sh) and [Python example](examples/experiment-report.py) report failures through exit handling and preserve the training exit code, without a Python SDK. A single final call cannot infer a result if never reached, after power loss, or after SIGKILL; use PID watch for that fallback. Success follow-ups expire after 24 hours; failed and unknown reports only notify. Prompt files remain on the Agent.
 
-The notification center provides pagination, type/Agent/result filters, synchronized unread state, and details. Settings include system/light/dark themes, experiment/Codex in-page alert switches, and a browser test notification. Keep FarHelm open to receive completion alerts and click through to details. Initial loading and reconnect history do not trigger a burst of old alerts. This release covers browser in-page notifications; iOS system notifications are planned for a later version.
+The notification center provides pagination, type/Agent/result filters, synchronized unread state, and details. Notification, experiment, and audit refreshes retain loaded pages. Filters cover all registered servers, obsolete requests cannot replace current results, and failed reads can be retried. Schedule creation and cancellation reconcile the list immediately, with confirmation before cancelling a specific task. Settings include system/light/dark themes, experiment/Codex in-page alert switches, and a browser test notification. Keep FarHelm open to receive completion alerts and click through to details. Initial loading and reconnect history do not trigger a burst of old alerts. This release covers browser in-page notifications; iOS system notifications are planned for a later version.
 
 Browser commands and schedules are acknowledged after Agent persistence. Failed submissions retain the current-page draft and operation identity for retries. On restart, saved terminal receipts reconcile completed work; running tasks without a terminal receipt become orphaned and are not replayed. Upgrade Hub before Agent; the new content relay requires the Agent's V0.7 capability.
 
 ## Codex workspace
 
-Desktop global navigation and mobile bottom navigation remain visible in Codex. Project groups collapse, and sessions use formal names or a temporary first-user-message summary. Search covers all imported sessions in the selected scope; offline Agents are clearly marked as incomplete results. Summaries and search results never enter Hub databases, logs, or notification titles.
+Desktop global navigation and mobile bottom navigation remain visible in Codex. Sessions collapse by project, with the device name beside each project; same-named projects on different devices remain separate. Sessions use formal names or a temporary first-user-message summary. Search covers all imported sessions in the selected scope; offline Agents are clearly marked as incomplete results. Summaries and search results never enter Hub databases, logs, or notification titles.
 
 Assistant replies support Markdown tables, code copying, math, and safe HTTPS links. Execution details in each turn form a collapsed group with visible failures. The composer stays visible, and reading older content does not jump to the bottom on new messages. Large-message continuation is separate from loading earlier conversations. Switching sessions immediately displays cached history and retains each draft; failed refreshes preserve visible content. Inactive body and parsing caches total at most 32 MiB, with at most 20 inactive histories, and are cleared on logout. Steer and interrupt target the visible active turn.
+
+The system uses black and white base colors with one customizable theme color; the logo retains its original brand colors. Settings offer separate light/dark mode and theme color choices (graphite, blue, green, violet, rose, orange, or a custom color) for primary buttons, selected states, links, and focus, applied immediately and saved in the current browser. The rounded composer stays visible; locally served Manrope and Noto Sans SC fonts share a consistent reading column. Submission and expanding execution details use brief animations that respect the system’s reduced-motion preference; cached session switches do not replay the entry animation.
 
 Upgrade Hub before Agent when moving from V0.7.1. SQLite schema remains 7. Older Agents retain HTTP compatibility; upgraded Agents use WSS without also claiming work over HTTP. Existing Python directories remain on installed machines for rollback validation and are never invoked by the new version.
 
@@ -151,6 +153,8 @@ flowchart LR
 ```
 
 FarHelm is one monorepo, but Hub and Agent are compiled separately and retain distinct privileges and attack surfaces. Codex communicates only over local stdio. Authentication remains local; Hub relays bodies only in bounded memory for at most 20 seconds.
+
+The Codex composer displays the session model, reasoning effort, and permission details returned by the server. Resuming inherits native Codex settings; new browser sessions use project configuration, with an optional isolated Git worktree. Unconfirmed settings are marked unknown rather than inferred from legacy session modes. Adjust the model and permissions in Codex on the server. Browser approval prompts are not supported yet, so operations requiring user approval are declined. Upgrade Hub before Agent and verify that Agent advertises `codex.session_context`. Explicit inspect/edit creation through older APIs and the CLI remains compatible.
 
 ## Local development
 

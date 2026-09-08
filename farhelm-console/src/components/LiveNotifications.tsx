@@ -11,7 +11,6 @@ export function LiveNotifications() {
   useQuery({ queryKey: ['notifications', 'latest'], queryFn: () => notices() })
   useEffect(() => {
     const seen = new Set<number>()
-    let opened = false
     const show = (item: Notice) => {
       const page = queryClient.getQueryData<NoticePage>(['notifications', 'latest'])
       if (seen.has(item.id)) return
@@ -21,9 +20,7 @@ export function LiveNotifications() {
       const enabled = item.category === 'test' || (item.category === 'codex' ? page.preferences?.codex !== false : page.preferences?.experiments !== false)
       if (enabled && Date.now() / 1000 - item.created_at_unix < 30 && document.visibilityState === 'visible') api.open({ key: String(item.id), title: `${item.title} · ${stateLabel(item.state)}`, description: item.agent_id, onClick: () => navigate(`/notifications?id=${item.id}`) })
     }
-    const off = subscribeEvents(['open', 'notification.created', 'notification.changed'], (event) => {
-      if (event.type === 'open') { if (opened) void queryClient.invalidateQueries({ queryKey: ['notifications'] }); opened = true; return }
-      if (event.type === 'notification.changed') { void queryClient.invalidateQueries({ queryKey: ['notifications'] }); return }
+    const off = subscribeEvents(['notification.created'], (event) => {
       try { const { payload } = JSON.parse(event.data) as { payload: Notice }; if (Number.isSafeInteger(payload.id)) show(payload) } catch { /* Malformed notices are ignored. */ }
     })
     return off

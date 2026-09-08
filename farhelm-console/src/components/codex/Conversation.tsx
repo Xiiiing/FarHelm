@@ -1,20 +1,22 @@
-import { ArrowDownOutlined, ArrowLeftOutlined, CalendarOutlined, ClockCircleOutlined, CopyOutlined, EllipsisOutlined, MenuOutlined, ReloadOutlined, SendOutlined, StopOutlined } from '@ant-design/icons'
+import { ArrowDownOutlined, ArrowUpOutlined, CalendarOutlined, CheckCircleOutlined, ClockCircleOutlined, CloseCircleOutlined, CopyOutlined, EllipsisOutlined, FolderOpenOutlined, LoadingOutlined, MenuFoldOutlined, MenuOutlined, MenuUnfoldOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons'
 import { Sender } from '@ant-design/x'
 import { useQuery } from '@tanstack/react-query'
-import { Alert, Button, Dropdown, Empty, Input, Modal, Radio, Skeleton, Space } from 'antd'
+import { Alert, Button, Dropdown, Empty, Input, Modal, Radio, Skeleton, Space, Tooltip } from 'antd'
 import { forwardRef, useCallback, useEffect, useLayoutEffect, useRef, useState, type ComponentProps, type ComponentRef } from 'react'
 import { ApiError, fetchSessionDisplay, fetchTranscript, interruptSession, json, waitForCommand, type CodexSession, type TranscriptPage } from '../../api/features'
 import { cacheHistory, keys, queryClient, mergeSession } from '../../api/cache'
+import { ActivityIndicator, Welcome } from './Welcome'
 import { Transcript, type TranscriptPosition } from './Transcript'
 import { errorText, sessionName, stateNames } from './presentation'
 import type { SessionDraft } from './useOperations'
 import { useAgents } from '../../hooks/useAgents'
+import { ModelDetails, PermissionDetails } from './SessionSettings'
 
 const ComposerInput = forwardRef<ComponentRef<typeof Input.TextArea>, ComponentProps<typeof Input.TextArea>>((props, ref) => <Input.TextArea {...props} ref={ref} aria-label="给 Codex 发送指令" maxLength={32768} />)
 const senderComponents = { input: ComposerInput }
-type Props = { csrf: string; id?: string; session?: CodexSession; draft: SessionDraft; onDraft: (change: (old: SessionDraft) => SessionDraft) => void; onSend: (turn?: string) => void; onRail: () => void; onCollapse: () => void; collapsed: boolean; onSchedule: (session: CodexSession) => void; onSchedules: (session: CodexSession) => void }
+type Props = { recent: CodexSession[]; onSelect: (id: string) => void; onNew: () => void; onBrowse: () => void; csrf: string; id?: string; session?: CodexSession; draft: SessionDraft; onDraft: (change: (old: SessionDraft) => SessionDraft) => void; onSend: (turn?: string) => void; onRail: () => void; onCollapse: () => void; collapsed: boolean; onSchedule: (session: CodexSession) => void; onSchedules: (session: CodexSession) => void }
 
-export function Conversation({ csrf, id, session: listed, draft, onDraft, onSend, onRail, onCollapse, collapsed, onSchedule, onSchedules }: Props) {
+export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, session: listed, draft, onDraft, onSend, onRail, onCollapse, collapsed, onSchedule, onSchedules }: Props) {
   const metadata = useQuery({ queryKey: keys.session(id ?? ''), enabled: !!id, queryFn: async ({ signal }) => mergeSession(await json<CodexSession>(`/api/v1/codex/sessions/${encodeURIComponent(id!)}`, signal)) })
   const display = useQuery({ queryKey: ['codex', 'label', id], enabled: !!id && !listed && !metadata.data?.title, queryFn: ({ signal }) => fetchSessionDisplay(csrf, { mode: 'labels', session_ids: [id!] }, signal) })
   const session = metadata.data ? { ...listed, ...metadata.data, display_label: listed?.display_label ?? display.data?.sessions[0]?.display_label ?? metadata.data.display_label } : listed
@@ -25,10 +27,15 @@ export function Conversation({ csrf, id, session: listed, draft, onDraft, onSend
   const history = useQuery({ queryKey: keys.history(id ?? ''), enabled: !!id, staleTime: 0, refetchOnMount: 'always', queryFn: async ({ signal }) => cacheHistory(id!, await fetchTranscript(id!, undefined, signal)) })
   const page = history.data; const turns = page?.turns ?? []
   const [readingMore, setReadingMore] = useState(false)
+  const [modal, modalHolder] = Modal.useModal()
   const [moreError, setMoreError] = useState<Error>()
   const [newMessages, setNewMessages] = useState(false)
   const [away, setAway] = useState(false)
   const scroll = useRef<HTMLDivElement>(null)
+  const [scrollElement, setScrollElement] = useState<HTMLDivElement | null>(null)
+  // Publish the parent DOM attachment so the child Virtualizer connects before network reconciliation.
+  const bindScroll = useCallback((node: HTMLDivElement | null) => { scroll.current = node; setScrollElement(node) }, [])
+  const sender = useRef<ComponentRef<typeof Sender>>(null)
   const follow = useRef(true)
   const active = useRef(true)
   const continuationRead = useRef<AbortController | undefined>(undefined)
@@ -61,7 +68,7 @@ export function Conversation({ csrf, id, session: listed, draft, onDraft, onSend
     }
   }, [])
   useEffect(() => { active.current = true; return () => { active.current = false; continuationRead.current?.abort() } }, [])
-  useLayoutEffect(() => { restore() }, [page, draft.pending, restore])
+  useLayoutEffect(() => { restore() }, [page, draft.pending, scrollElement, restore])
   const previousPage = useRef(page)
   const hasPage = !!page
   useEffect(() => {
@@ -74,10 +81,11 @@ export function Conversation({ csrf, id, session: listed, draft, onDraft, onSend
     for (const child of node.children) observer.observe(child)
     return () => observer.disconnect()
   }, [restore, hasPage])
-  const load = async (older = false) => {
+  const refetchHistory = history.refetch
+  const load = useCallback(async (older = false) => {
     if (!id) return
     capture()
-    if (!older) { setMoreError(undefined); await history.refetch(); return }
+    if (!older) { setMoreError(undefined); await refetchHistory(); return }
     if (continuationRead.current || !page?.next_cursor) return
     anchorLocked.current = !!anchor.current
     const controller = new AbortController(); continuationRead.current = controller; setReadingMore(true)
@@ -86,11 +94,13 @@ export function Conversation({ csrf, id, session: listed, draft, onDraft, onSend
       if (!controller.signal.aborted) { queryClient.setQueryData<TranscriptPage>(keys.history(id), cacheHistory(id, next, true)); setMoreError(undefined) }
     } catch (reason) { anchorLocked.current = false; if (!controller.signal.aborted) setMoreError(reason instanceof Error ? reason : new Error(errorText(reason))) }
     finally { continuationRead.current = undefined; if (active.current) setReadingMore(false) }
-  }
+  }, [id, capture, refetchHistory, page])
+  const continueHistory = useCallback(() => { void load(true) }, [load])
+  const anchorInteraction = useCallback(() => { follow.current = false; setAway(true); capture() }, [capture])
   const interrupt = () => {
     if (!session?.active_turn_id) return
     const target = session
-    Modal.confirm({ title: '中断当前对话？', content: <><p>{sessionName(target)}</p><p>轮次 {target.active_turn_id}。本次回复将停止，已执行的修改不会撤销。</p></>, okText: '确认中断', cancelText: '取消', okButtonProps: { danger: true }, onOk: async () => {
+    modal.confirm({ title: '中断当前对话？', content: <><p>{sessionName(target)}</p><p>轮次 {target.active_turn_id}。本次回复将停止，已执行的修改不会撤销。</p></>, okText: '确认中断', cancelText: '取消', okButtonProps: { danger: true }, onOk: async () => {
       try { await waitForCommand(await interruptSession(csrf, target.session_id, target.active_turn_id)) }
       catch (error) { if (active.current) onDraft((old) => ({ ...old, error: errorText(error) })); throw error }
     } })
@@ -107,18 +117,45 @@ export function Conversation({ csrf, id, session: listed, draft, onDraft, onSend
     if (key === 'schedules' && session) onSchedules(session)
     if (key === 'copy' && id) void navigator.clipboard.writeText(id).catch(() => onDraft((old) => ({ ...old, error: `复制失败，会话 ID：${id}` })))
   } }
-  return <section className="codex-conversation">
-    <header className="conversation-head"><div className="conversation-identity"><Button className="mobile-only" type="text" icon={<MenuOutlined />} onClick={onRail} aria-label="打开会话列表" /><Button className="desktop-only" type="text" icon={collapsed ? <MenuOutlined /> : <ArrowLeftOutlined />} onClick={onCollapse} aria-label={collapsed ? '展开会话列表' : '折叠会话列表'} /><div className="conversation-title"><strong>{session ? sessionName(session) : id ? '正在读取会话…' : '选择一个会话'}</strong><div className="conversation-meta">{session ? `${session.agent_id} / ${session.project_id} · ${session.mode === 'edit' ? '编辑' : '只读'}` : '查看历史，继续你的工作'}</div></div></div><Space size={4}><Button type="text" icon={<ReloadOutlined />} disabled={!id} loading={history.isFetching} onClick={() => void load()} aria-label="刷新对话" /><Dropdown menu={menu} trigger={['click']}><Button type="text" icon={<EllipsisOutlined />} aria-label="会话操作" /></Dropdown></Space></header>
+  const lastReceipt = draft.pending.at(-1)
+  const receiptFailed = !!lastReceipt && ['failed', 'orphaned', 'unknown', 'rejected', 'expired', 'unconfirmed'].includes(lastReceipt.state)
+  const prompt = (text: string) => { onDraft((old) => old.text.trim() ? old : { ...old, text }); sender.current?.focus({ preventScroll: true, cursor: 'end' }) }
+  const submit = () => {
+    // An explicit send returns to the latest turn; background deltas keep the reading anchor.
+    follow.current = true; anchor.current = undefined; anchorLocked.current = false
+    setAway(false); setNewMessages(false)
+    onSend(visibleTurn); sender.current?.focus({ preventScroll: true })
+  }
+  return <section className={`codex-conversation ${!id ? 'conversation-unselected' : ''}`}>
+    {modalHolder}
+    <header className="conversation-head">
+      <div className="conversation-identity">
+        <Button className="mobile-only" type="text" icon={<MenuOutlined />} onClick={onRail} aria-label="打开会话列表" />
+        <Tooltip title={collapsed ? '展开会话列表' : '收起会话列表'}><Button className="desktop-only" type="text" icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />} onClick={onCollapse} aria-label={collapsed ? '展开会话列表' : '折叠会话列表'} /></Tooltip>
+        <div className="conversation-title"><div className="conversation-meta">{session ? <><FolderOpenOutlined /><span>{session.project_id}</span><span className="context-separator">/</span><span>{agent?.hostname ?? session.agent_id}</span></> : '你的项目，你的工作进度'}</div><h1>{session ? sessionName(session) : id ? '正在读取会话…' : 'Codex 工作区'}</h1></div>
+      </div>
+      <Space size={4}><Tooltip title="刷新对话"><Button type="text" icon={<ReloadOutlined />} disabled={!id} loading={history.isFetching} onClick={() => void load()} aria-label="刷新对话" /></Tooltip><Dropdown menu={menu} trigger={['click']}><Button type="text" icon={<EllipsisOutlined />} aria-label="会话操作" /></Dropdown></Space>
+    </header>
     <div className="conversation-alerts">{codexNotice && <Alert showIcon type={codex?.state === 'starting' ? 'info' : 'warning'} title={codexNotice} />}{draft.error && <Alert showIcon closable type="warning" title="指令尚未完成提交" description={draft.error} onClose={() => onDraft((old) => ({ ...old, error: undefined }))} />}{failure && turns.length > 0 && <Alert showIcon type="warning" title="历史刷新失败，已保留当前内容" description={failure.message} action={<Button onClick={() => void load(!!moreError)}>重试</Button>} />}</div>
-    <div className="conversation-history"><div className="conversation-scroll" ref={scroll} onWheel={() => { anchorLocked.current = false }} onTouchMove={() => { anchorLocked.current = false }} onScroll={() => { const node = scroll.current; if (!node || restoring.current || anchorLocked.current) return; follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < 80; setAway(!follow.current); if (follow.current) setNewMessages(false); capture() }}>
-      {!id ? <Empty className="codex-empty" description="从会话列表选择一个会话，或新建会话开始工作" /> : loading && !page ? <div className="history-loading" role="status"><span>正在读取对话历史…</span><Skeleton active paragraph={{ rows: 5 }} /></div> : failure && !turns.length ? <Empty className="codex-empty" description={<><p>{unavailable}</p><p className="conversation-meta">{failure.message}</p></>}><Button onClick={() => void load()} icon={<ReloadOutlined />}>重试读取</Button></Empty> : page && !turns.length ? <Empty className="codex-empty" description="这个会话还没有对话，发送第一条指令开始" /> : null}
+    <div className="conversation-history"><div className="conversation-scroll" ref={bindScroll} onWheel={() => { anchorLocked.current = false }} onTouchMove={() => { anchorLocked.current = false }} onScroll={() => { const node = scroll.current; if (!node || restoring.current || anchorLocked.current) return; follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < 80; setAway(!follow.current); if (follow.current) setNewMessages(false); capture() }}>
+      {!id ? <Welcome recent={recent} hasDraft={false} onNew={onNew} onBrowse={onBrowse} onSelect={onSelect} onPrompt={prompt} /> : loading && !page ? <div className="history-loading" role="status"><span>正在读取对话历史…</span><Skeleton active paragraph={{ rows: 5 }} /></div> : failure && !turns.length ? <Empty className="codex-empty" description={<><p>{unavailable}</p><p className="conversation-meta">{failure.message}</p></>}><Button onClick={() => void load()} icon={<ReloadOutlined />}>重试读取</Button></Empty> : page && !turns.length && session ? <Welcome session={session} recent={[]} hasDraft={!!draft.text.trim()} onNew={onNew} onBrowse={onBrowse} onSelect={onSelect} onPrompt={prompt} /> : null}
       {page?.next_cursor && !needsMessage && <Button loading={loading} className="load-earlier" onClick={() => void load(true)}>加载更早对话</Button>}
-      <Transcript turns={turns} scroll={scroll} position={position} continuation={needsMessage ? continuation : undefined} loading={loading} onContinue={() => void load(true)} onAnchor={capture} />
-      <div className="pending-messages">{pending.map((p) => <article key={p.id} className="codex-message user pending-message" data-message-key={`pending:${p.id}`}><div className="message-role">你 · {stateNames[p.state] ?? '处理中'}</div><div className="message-body user-text">{p.text}</div></article>)}</div>
-    </div><Button className="jump-to-bottom" icon={<ArrowDownOutlined />} hidden={!away && !newMessages} onClick={() => { follow.current = true; anchor.current = undefined; restore(); setNewMessages(false); setAway(false) }}>{newMessages ? '有新消息 · 回到底部' : '回到底部'}</Button></div>
-    <footer className="composer-wrap"><Sender className="composer" components={senderComponents} value={draft.text} onChange={(value) => onDraft((old) => ({ ...old, text: value }))} autoSize={{ minRows: 2, maxRows: 5 }} placeholder={session ? '给 Codex 发送指令…' : '请先选择会话'} disabled={!session || failureCode === 'session_not_found'} onSubmit={() => onSend(visibleTurn)} onKeyDown={(event) => { if (event.nativeEvent.isComposing || event.keyCode === 229) return false }} suffix={false} footer={(_, { components: { SendButton } }) => <>
-      {visibleTurn && <Radio.Group className="delivery-options" aria-label="活动会话发送方式" value={draft.delivery} onChange={(event) => onDraft((old) => ({ ...old, delivery: event.target.value as 'queue' | 'steer' }))}><Radio value="queue">排队下一轮</Radio><Radio value="steer">补充当前对话</Radio></Radio.Group>}
-      <div className="composer-actions"><Space size={4}><Button type="text" icon={<ClockCircleOutlined />} disabled={!session} onClick={() => session && onSchedule(session)}>定时发送</Button>{visibleTurn && <Button danger type="text" icon={<StopOutlined />} onClick={interrupt} aria-label="中断">中断</Button>}</Space><SendButton shape="default" type="primary" icon={<SendOutlined />} loading={draft.sending} disabled={!session || !draft.text.trim() || draft.sending} aria-label="发送指令">发送</SendButton></div>
-    </>} /><div className="composer-hint" role="status">{draft.sending ? '正在提交，等待 Agent 保存确认…' : draft.pending.at(-1)?.command_id ? `${stateNames[draft.pending.at(-1)!.state] ?? '处理中'} · 指令 ${draft.pending.at(-1)!.command_id!.slice(-8)}` : 'Enter 发送 · Shift + Enter 换行'}</div></footer>
+      <Transcript turns={turns} scroll={scrollElement} position={position} continuation={needsMessage ? continuation : undefined} loading={loading} onContinue={continueHistory} onAnchor={anchorInteraction} />
+      <div className="pending-messages">{pending.map((p) => <article key={p.id} className={`codex-message user pending-message ${p.state === 'submitting' ? 'is-submitting' : ''}`} data-message-key={`pending:${p.id}`}><div className="message-role">{p.state === 'submitting' ? <LoadingOutlined /> : ['failed', 'orphaned', 'unknown', 'rejected', 'expired', 'unconfirmed'].includes(p.state) ? <CloseCircleOutlined /> : p.command_id ? <CheckCircleOutlined /> : <ClockCircleOutlined />} 你 · {stateNames[p.state] ?? '处理中'}</div><div className="message-body user-text">{p.text}</div></article>)}</div>
+      {visibleTurn && <div className="response-activity" role="status"><ActivityIndicator /><span>{turns.some((turn) => turn.items.some((item) => item.streaming)) ? 'Codex 正在回复' : 'Codex 正在处理'}<small>你可以继续编写下一条指令</small></span></div>}
+    </div><Button className="jump-to-bottom" icon={<ArrowDownOutlined aria-hidden />} hidden={!away && !newMessages} onClick={() => { follow.current = true; anchor.current = undefined; restore(); setNewMessages(false); setAway(false) }}>{newMessages ? '有新消息 · 回到底部' : '回到底部'}</Button></div>
+    {id && <footer className="composer-wrap">
+      <Sender ref={sender} className={`composer ${draft.text.trim() ? 'has-draft' : ''} ${draft.sending ? 'is-submitting' : ''}`} components={senderComponents} value={draft.text} onChange={(value) => onDraft((old) => ({ ...old, text: value }))} autoSize={{ minRows: 1, maxRows: 5 }} placeholder={session ? '描述下一步，或提出问题…' : '正在读取会话…'} disabled={!session || failureCode === 'session_not_found'} onSubmit={submit} onKeyDown={(event) => { if (event.nativeEvent.isComposing || event.keyCode === 229) return false }} suffix={false} footer={(_, { components: { SendButton } }) => <>
+        {visibleTurn && <div className="active-turn-controls"><Radio.Group className="delivery-options" aria-label="活动会话发送方式" value={draft.delivery} onChange={(event) => onDraft((old) => ({ ...old, delivery: event.target.value as 'queue' | 'steer' }))}><Radio value="queue">排队下一轮</Radio><Radio value="steer">补充当前对话</Radio></Radio.Group><Tooltip title="中断当前对话"><Button danger type="text" icon={<StopOutlined />} onClick={interrupt} aria-label="中断" /></Tooltip></div>}
+        <div className="composer-actions">
+          <div className="composer-tools"><PermissionDetails context={page?.context} session={session} supported={agent ? agent.capabilities?.includes('codex.session_context') ?? false : undefined} /><Tooltip title="定时发送"><Button type="text" className="composer-control schedule-action" icon={<ClockCircleOutlined />} disabled={!session} onClick={() => session && onSchedule(session)} aria-label="定时发送" /></Tooltip></div>
+          <div className="composer-submit"><ModelDetails context={page?.context} loading={history.isFetching && !page} disabled={!session} />
+          <SendButton className="send-action" shape="default" type="primary" icon={<ArrowUpOutlined />} loading={draft.sending} disabled={!session || !draft.text.trim() || draft.sending} aria-label="发送指令"><span className="sr-only">发送</span></SendButton>
+          </div>
+        </div>
+      </>} />
+      <div className="composer-hint"><span className={`submission-status ${receiptFailed ? 'status-error' : ''}`} role="status">{draft.sending ? <><LoadingOutlined /> 等待 Agent 保存确认…</> : lastReceipt?.command_id ? <>{receiptFailed ? <CloseCircleOutlined /> : ['accepted', 'completed'].includes(lastReceipt.state) ? <CheckCircleOutlined /> : <ClockCircleOutlined />} {stateNames[lastReceipt.state] ?? '处理中'}<span className="receipt-id"> · {lastReceipt.command_id.slice(-8)}</span></> : session ? <><FolderOpenOutlined /> {session.project_id}</> : '正在读取会话'}</span><span className="keyboard-hint"><kbd>Enter</kbd> 发送 <span>·</span> <kbd>Shift + Enter</kbd> 换行</span></div>
+    </footer>}
+
   </section>
 }

@@ -74,9 +74,130 @@ test('responsive navigation and validated status are visible', async ({ page }, 
 })
 
 test('keyboard navigation reaches visible controls', async ({ page }) => {
+  await expect(page.getByRole('heading', { name: '运行总览' })).toBeVisible()
+  if (page.viewportSize()!.width >= 768) await expect(page.locator('.app-sider')).toBeVisible()
   await page.keyboard.press('Tab')
   const focused = page.locator(':focus-visible')
   await expect(focused).toHaveCount(1)
+})
+
+test('appearance presets and custom colors persist without writing to Hub', async ({ page, context }) => {
+  const writes: string[] = []
+  page.on('request', (request) => { if (request.url().includes('/api/') && request.method() !== 'GET') writes.push(request.url()) })
+  await page.goto('/settings')
+  const canvas = () => page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--farhelm-canvas').trim())
+  const originalCanvas = await canvas()
+  await page.getByRole('button', { name: '玫瑰', exact: true }).focus()
+  await page.keyboard.press('Enter')
+  await expect(page.getByRole('button', { name: '玫瑰', exact: true })).toHaveAttribute('aria-pressed', 'true')
+  await expect.poll(() => page.evaluate(() => localStorage.getItem('farhelm-accent'))).toBe('rose')
+  expect(await canvas()).toBe(originalCanvas)
+  await page.reload()
+  await expect(page.getByRole('button', { name: '玫瑰', exact: true })).toHaveAttribute('aria-pressed', 'true')
+  const input = page.getByLabel('自定义颜色', { exact: true })
+  await input.fill('#12xx')
+  await expect(page.getByRole('button', { name: '应用颜色' })).toBeDisabled()
+  await expect(input).toHaveAttribute('aria-invalid', 'true')
+  await input.fill('#a3f')
+  await input.press('Enter')
+  await expect.poll(() => page.evaluate(() => localStorage.getItem('farhelm-accent'))).toBe('#AA33FF')
+  await page.getByRole('radiogroup', { name: '显示模式' }).getByText('浅色', { exact: true }).click()
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'light')
+  await page.reload()
+  await expect(page.getByLabel('自定义颜色', { exact: true })).toHaveValue('#AA33FF')
+  const other = await context.newPage()
+  await other.route('**/api/v1/auth/session', (route) => route.fulfill({ status: 401, json: {} }))
+  await other.goto('/')
+  await expect(other.getByLabel('用户名')).toBeVisible()
+  await page.getByRole('button', { name: '绿色', exact: true }).click()
+  await expect.poll(() => other.evaluate(() => document.documentElement.style.getPropertyValue('--farhelm-accent'))).toBe(await page.evaluate(() => document.documentElement.style.getPropertyValue('--farhelm-accent')))
+  await other.close()
+  expect(writes).toEqual([])
+})
+
+test('one theme color reaches navigation, selected sessions and primary actions while the logo keeps its brand', async ({ page }) => {
+  for (const [mode, color] of [['浅色', '#00865A'], ['深色', '#AA33FF']]) {
+    await page.goto('/settings')
+    await page.getByRole('radiogroup', { name: '显示模式' }).getByText(mode, { exact: true }).click()
+    await page.getByLabel('自定义颜色', { exact: true }).fill(color)
+    await page.getByRole('button', { name: '应用颜色' }).click()
+    await page.goto('/codex?session=ses-a')
+    await page.getByLabel('给 Codex 发送指令').fill('主题切换时仍保留的草稿')
+    const themeColors = await page.evaluate(() => {
+      const rgb = (name: string) => { const hex = getComputedStyle(document.documentElement).getPropertyValue(name).trim(); return `rgb(${[1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16)).join(', ')})` }
+      return { accent: rgb('--farhelm-accent'), soft: rgb('--farhelm-accent-soft') }
+    })
+    await expect(page.getByRole('button', { name: '发送指令' })).toHaveCSS('background-color', themeColors.accent)
+    const activeNavigation = page.locator('.app-sider .ant-menu-item-selected, .mobile-nav button.active').filter({ visible: true })
+    await expect(activeNavigation).toHaveCSS('color', themeColors.accent)
+    await expect(activeNavigation).toHaveCSS('background-color', themeColors.soft)
+    const logo = page.locator('.brand img, .mobile-brand img').filter({ visible: true })
+    const brand = await logo.evaluate(async (node: HTMLImageElement) => {
+      await node.decode()
+      const canvas = document.createElement('canvas'); canvas.width = canvas.height = 96
+      const ctx = canvas.getContext('2d')!; ctx.drawImage(node, 0, 0, 96, 96)
+      const filters = []; let parent: Element | null = node
+      while (parent) { filters.push(getComputedStyle(parent).filter); parent = parent.parentElement }
+      return { pixel: [...ctx.getImageData(30, 30, 1, 1).data], filters }
+    })
+    expect(brand.pixel).toEqual([34, 199, 169, 255]); expect(brand.filters.every(v => v === 'none')).toBe(true)
+    if (page.viewportSize()!.width < 768) await page.getByRole('button', { name: '打开会话列表' }).click()
+    const selected = page.locator('.codex-rail:visible .session-select[aria-current="page"]')
+    await expect(selected).toHaveCSS('color', themeColors.accent)
+    await expect(page.locator('.codex-rail:visible .ant-conversations-item-active')).toHaveCSS('background-color', themeColors.soft)
+    for (const path of ['/', '/agents', '/experiments', '/notifications', '/audit', '/settings']) {
+      await page.goto(path)
+      await expect(page.locator('.app-sider .ant-menu-item-selected, .mobile-nav button.active').filter({ visible: true })).toHaveCSS('color', themeColors.accent)
+    }
+  }
+})
+
+test('project hover and session selection paint one background through pointer and keyboard actions', async ({ page }, info) => {
+  for (const colorScheme of ['light', 'dark'] as const) {
+    await page.emulateMedia({ colorScheme }); await page.goto('/codex?session=ses-a')
+    await page.getByLabel('给 Codex 发送指令').fill('折叠项目后保留草稿')
+    if (page.viewportSize()!.width < 768) await page.getByRole('button', { name: '打开会话列表' }).click()
+    const rail = page.locator('.codex-rail:visible'), heading = rail.locator('.session-group-heading').first()
+    const outer = rail.locator('.ant-conversations-group-title').first()
+    await heading.hover()
+    await expect(heading).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)')
+    await expect(outer).toHaveCSS('height', '44px')
+    const hover = await outer.evaluate(n => getComputedStyle(n).backgroundColor)
+    expect(hover).not.toBe('rgba(0, 0, 0, 0)')
+    await page.mouse.down()
+    await expect(heading).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)')
+    await expect(heading).toHaveCSS('transform', 'none')
+    await expect(outer).toHaveCSS('background-color', hover)
+    await rail.screenshot({ path: info.outputPath(`single-layer-${colorScheme}.png`) })
+    await page.mouse.up(); await expect(heading).toHaveAttribute('aria-expanded', 'false')
+    await heading.focus(); await page.keyboard.press('Space'); await expect(heading).toHaveAttribute('aria-expanded', 'true')
+    const selected = rail.locator('.session-select[aria-current="page"]'), row = rail.locator('.ant-conversations-item-active')
+    const selectedColor = await row.evaluate(n => getComputedStyle(n).backgroundColor)
+    await selected.hover(); await page.mouse.down()
+    await expect(selected).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)')
+    await expect(row).toHaveCSS('background-color', selectedColor)
+    await page.mouse.up(); await expect(page).toHaveURL(/session=ses-a/)
+    await expect(page.getByLabel('给 Codex 发送指令')).toHaveValue('折叠项目后保留草稿')
+  }
+})
+
+test('extreme custom colors keep appearance controls readable and within the mobile viewport', async ({ page }, info) => {
+  test.setTimeout(60_000)
+  await page.goto('/settings')
+  for (const mode of ['浅色', '深色']) {
+    await page.getByRole('radiogroup', { name: '显示模式' }).getByText(mode, { exact: true }).click()
+    await page.getByLabel('自定义颜色', { exact: true }).fill(mode === '浅色' ? '#FFFFFF' : '#000000')
+    await page.getByRole('button', { name: '应用颜色' }).click()
+    const results = await new AxeBuilder({ page }).analyze()
+    expect(results.violations.filter((violation) => violation.impact === 'critical' || violation.impact === 'serious')).toEqual([])
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+    const choices = await page.locator('.accent-choice').evaluateAll((nodes) => nodes.map((node) => ({ w: node.getBoundingClientRect().width, h: node.getBoundingClientRect().height })))
+    expect(choices.every(({ w, h }) => w >= 44 && h >= 44)).toBe(true)
+    await page.screenshot({ path: info.outputPath(`appearance-${mode}.png`), fullPage: true })
+  }
+  await page.getByRole('button', { name: '打开自定义取色器' }).click()
+  await expect(page.locator('.ant-color-picker-panel')).toBeVisible()
+  await page.keyboard.press('Escape')
 })
 
 test('agent page renders validated Hub data', async ({ page }) => {
@@ -129,7 +250,8 @@ test('experiment deep link and Codex manual queue use the mobile-safe workflow',
     await route.fulfill({ status: 202, contentType: 'application/json', body: '{}' })
   })
   await page.getByRole('button', { name: /定时发送/ }).click()
-  await page.getByLabel('发送时间（本地时区）').fill('2030-01-01T12:00')
+  const localTime = await page.evaluate(() => { const date = new Date(Date.now() + 300_000); return new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16) })
+  await page.getByLabel('发送时间（本地时区）').fill(localTime)
   await page.getByLabel('指令', { exact: true }).fill('定时检查结果')
   await page.getByRole('button', { name: '创建定时任务' }).click()
   await expect.poll(() => scheduled).toMatchObject({ prompt: '定时检查结果', trigger: { type: 'at_time' } })
@@ -190,6 +312,7 @@ test('switching sessions ignores late history responses', async ({ page }, testI
 })
 
 test('same project names on different Agents retain the selected target', async ({ page }, testInfo) => {
+  await page.route('**/api/v1/agents', (route) => route.fulfill({ json: { protocol: 'farhelm/1', agents: ['gpu-a', 'gpu-b'].map(agent_id => ({ agent_id, hostname: agent_id, agent_version: '0.8.0', online: true, last_seen_unix: 2000000000, capabilities: ['codex.session_context'] })) } }))
   await page.route('**/api/v1/projects', (route) => route.fulfill({ json: { protocol: 'farhelm/1', projects: ['gpu-a', 'gpu-b'].map((agent_id) => ({ candidate_id: `candidate-${agent_id}`, agent_id, display_name: 'shared', suggested_project_id: 'shared', session_count: 1, state: 'approved', updated_at_unix: 2000000000 })) } }))
   let target: unknown
   await page.route('**/api/v1/codex/sessions', async (route) => { target = route.request().postDataJSON(); await route.fulfill({ status: 202, json: {} }) })
@@ -199,7 +322,7 @@ test('same project names on different Agents retain the selected target', async 
   await page.getByLabel('项目', { exact: true }).click()
   await page.getByText('shared · gpu-b', { exact: true }).click()
   await page.getByRole('dialog').getByRole('button', { name: /创\s*建/ }).click()
-  await expect.poll(() => target).toEqual({ agent_id: 'gpu-b', project_id: 'shared', mode: 'inspect' })
+  await expect.poll(() => target).toEqual({ agent_id: 'gpu-b', project_id: 'shared', mode: 'inspect', inherit_permissions: true })
 })
 
 

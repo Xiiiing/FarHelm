@@ -4,6 +4,7 @@ export type AgentSummary = {
   agent_id: string
   hostname: string
   agent_version: string
+  capabilities?: string[]
   last_seen_unix: number
   online: boolean
   codex?: { state: 'ready' | 'unconfigured' | 'unavailable' | 'starting' | 'login_required'; version?: string; reason?: string }

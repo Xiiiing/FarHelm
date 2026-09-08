@@ -1,3 +1,4 @@
+import { version } from '../package.json'
 import { clearMarkdownCache } from './components/codex/markdownService'
 import { clearOperationReceipts } from './api/features'
 import {
@@ -6,6 +7,7 @@ import {
   DashboardOutlined,
   DesktopOutlined,
   FileSearchOutlined,
+  LogoutOutlined,
   MenuOutlined,
   MoonOutlined,
   MoreOutlined,
@@ -15,14 +17,16 @@ import {
 } from '@ant-design/icons'
 import { QueryClientProvider } from '@tanstack/react-query'
 import { queryClient, connectCodexCache } from './api/cache'
-import { Button, ConfigProvider, Drawer, Grid, Layout, Menu, Space, Spin, Typography } from 'antd'
-import { lazy, Suspense, useEffect, useState } from 'react'
+import { connectMetadataCache } from './api/metadata'
+import { Avatar, Button, ConfigProvider, Drawer, Grid, Layout, Menu, Space, Spin, Tooltip, Typography } from 'antd'
+import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 
 import { AuditPage } from './components/AuditPage'
 import { SettingsPage } from './components/SettingsPage'
 import { LiveNotifications } from './components/LiveNotifications'
-import type { ColorPreference } from './hooks/useColorMode'
+import { ConnectionStatus } from './components/ConnectionStatus'
+import type { AppearanceProps } from './components/AppearanceSettings'
 import { AgentListPage } from './components/AgentListPage'
 import { ExperimentPage } from './components/ExperimentPage'
 import { LoginPage } from './components/LoginPage'
@@ -39,23 +43,23 @@ const CodexPage = lazy(() => import('./components/CodexPage').then((module) => (
 const codexFallback = <div className="session-loading"><Spin /><span>正在加载 Codex 工作区…</span></div>
 
 const desktopItems = [
-  { key: '/', icon: <DashboardOutlined />, label: '总览' },
-  { key: '/agents', icon: <DesktopOutlined />, label: 'Agent' },
-  { key: '/experiments', icon: <UnorderedListOutlined />, label: '实验' },
-  { key: '/codex', icon: <CodeOutlined />, label: 'Codex' },
-  { key: '/notifications', icon: <BellOutlined />, label: '通知' },
-  { key: '/audit', icon: <FileSearchOutlined />, label: '审计' },
-  { key: '/settings', icon: <SettingOutlined />, label: '设置' },
+  { key: '/', icon: <DashboardOutlined aria-hidden />, label: '总览' },
+  { key: '/agents', icon: <DesktopOutlined aria-hidden />, label: 'Agent' },
+  { key: '/experiments', icon: <UnorderedListOutlined aria-hidden />, label: '实验' },
+  { key: '/codex', icon: <CodeOutlined aria-hidden />, label: 'Codex' },
+  { key: '/notifications', icon: <BellOutlined aria-hidden />, label: '通知' },
+  { key: '/audit', icon: <FileSearchOutlined aria-hidden />, label: '审计' },
+  { key: '/settings', icon: <SettingOutlined aria-hidden />, label: '设置' },
 ]
 
 const mobileItems = [
-  { key: '/', icon: <DashboardOutlined />, label: '总览' },
-  { key: '/experiments', icon: <UnorderedListOutlined />, label: '实验' },
-  { key: '/codex', icon: <CodeOutlined />, label: 'Codex' },
-  { key: '/more', icon: <MoreOutlined />, label: '更多' },
+  { key: '/', icon: <DashboardOutlined aria-hidden />, label: '总览' },
+  { key: '/experiments', icon: <UnorderedListOutlined aria-hidden />, label: '实验' },
+  { key: '/codex', icon: <CodeOutlined aria-hidden />, label: 'Codex' },
+  { key: '/more', icon: <MoreOutlined aria-hidden />, label: '更多' },
 ]
 
-function FeatureRoutes({ csrf, preference, onPreference, onLogout }: { csrf: string; preference: ColorPreference; onPreference: (value: ColorPreference) => void; onLogout: () => void }) {
+function FeatureRoutes({ csrf, onLogout, ...appearance }: AppearanceProps & { csrf: string; onLogout: () => void }) {
   const { health, refresh } = useHubHealth()
   const { agents, refresh: refreshAgents } = useAgents()
   const refreshOverview = () => {
@@ -68,10 +72,10 @@ function FeatureRoutes({ csrf, preference, onPreference, onLogout }: { csrf: str
       <Route path="/agents" element={<AgentListPage csrf={csrf} agents={agents} onRefresh={refreshAgents} />} />
       <Route path="/experiments" element={<ExperimentPage />} />
       <Route path="/jobs" element={<Navigate to="/experiments" replace />} />
-      <Route path="/codex" element={<Suspense fallback={codexFallback}><CodexPage csrf={csrf} /></Suspense>} />
+      <Route path="/codex" element={<Suspense fallback={codexFallback}><CodexPage csrf={csrf} agents={agents.data?.agents ?? []} /></Suspense>} />
       <Route path="/notifications" element={<NotificationPage csrf={csrf} />} />
       <Route path="/audit" element={<AuditPage />} />
-      <Route path="/settings" element={<SettingsPage csrf={csrf} preference={preference} onPreference={onPreference} onLogout={onLogout} />} />
+      <Route path="/settings" element={<SettingsPage csrf={csrf} {...appearance} onLogout={onLogout} />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   )
@@ -83,16 +87,19 @@ function AppContent() {
   const navigate = useNavigate()
   const location = useLocation()
   const [drawerOpen, setDrawerOpen] = useState(false)
-  const { mode, preference, setPreference, toggleMode } = useColorMode()
+  const { mode, preference, setPreference, accent, setAccent, toggleMode } = useColorMode()
+  const appearanceTheme = useMemo(() => createTheme(mode, accent), [mode, accent])
   const [session, setSession] = useState<BrowserSession | null | undefined>(undefined)
   useEffect(() => { void readSession().then(setSession).catch(() => setSession(null)) }, [])
   useEffect(() => {
     if (!session) { queryClient.clear(); clearMarkdownCache(); clearOperationReceipts(); return }
-    return connectCodexCache()
+    const codex = connectCodexCache(), metadata = connectMetadataCache()
+    return () => { codex(); metadata() }
   }, [session])
   const mobileSelection = ['/agents', '/notifications', '/audit', '/settings'].includes(location.pathname)
     ? '/more'
     : location.pathname
+  const currentPage = desktopItems.find((item) => item.key === location.pathname)?.label ?? '控制台'
 
   const go = (key: string) => {
     if (key === '/more') {
@@ -103,39 +110,46 @@ function AppContent() {
     setDrawerOpen(false)
   }
 
-  if (session === undefined) return <ConfigProvider theme={createTheme(mode)}><div className="session-loading"><Spin /><span>正在恢复安全会话…</span></div></ConfigProvider>
-  if (session === null) return <ConfigProvider theme={createTheme(mode)}><LoginPage onLogin={setSession} /></ConfigProvider>
+  if (session === undefined) return <ConfigProvider theme={appearanceTheme}><div className="session-loading"><Spin /><span>正在恢复安全会话…</span></div></ConfigProvider>
+  if (session === null) return <ConfigProvider theme={appearanceTheme}><LoginPage onLogin={setSession} /></ConfigProvider>
 
   return (
-    <ConfigProvider theme={createTheme(mode)}>
+    <ConfigProvider theme={appearanceTheme}>
       <LiveNotifications />
       <Layout className={location.pathname === '/codex' ? 'app-layout codex-shell' : 'app-layout'}>
         {isDesktop && (
-          <Sider width={240} className="app-sider">
+          <Sider width={88} className="app-sider">
             <div className="brand" aria-label="FarHelm Console">
               <img src="/farhelm-mark.svg" alt="" width="36" height="36" />
-              <div><strong>FarHelm</strong><span>远程训练控制台</span></div>
+              <strong>FarHelm</strong>
             </div>
-            <Menu mode="inline" selectedKeys={[location.pathname]} items={desktopItems} onClick={({ key }) => go(key)} />
-            <div className="sider-footer"><Typography.Text type="secondary">V0.8.0 · Codex workspace</Typography.Text></div>
+            <nav aria-label="系统导航"><Menu mode="inline" selectedKeys={[location.pathname]} items={[
+              { type: 'group', label: '工作空间', children: desktopItems.slice(0, 4) },
+              { type: 'group', label: '管理', children: desktopItems.slice(4) },
+            ]} onClick={({ key }) => go(key)} /></nav>
+            <div className="sider-footer"><Tooltip title={`${session.user} · 账户设置`}><Button type="text" className="account-identity" aria-label={`账户：${session.user}，打开设置`} onClick={() => go('/settings')}><Avatar shape="square">{session.user.slice(0, 1).toUpperCase()}</Avatar></Button></Tooltip><span className="console-version">V{version}</span></div>
           </Sider>
         )}
 
         <Layout>
           <Header className="app-header">
-            {!isDesktop && <Typography.Text className="mobile-brand">FarHelm</Typography.Text>}
+            {isDesktop ? <div className="header-location"><span>{desktopItems.slice(4).some((item) => item.key === location.pathname) ? '管理' : '工作空间'}</span><span aria-hidden="true">/</span><strong>{currentPage}</strong></div> : <Typography.Text className="mobile-brand"><img src="/farhelm-mark.svg" width="24" height="24" alt="" />FarHelm</Typography.Text>}
             <Space className="header-actions">
+              <ConnectionStatus />
+              <Tooltip title={mode === 'dark' ? '浅色主题' : '深色主题'}>
               <Button
+                className="theme-toggle"
                 type="text"
-                icon={mode === 'dark' ? <SunOutlined /> : <MoonOutlined />}
+                icon={<span key={mode} className="theme-glyph">{mode === 'dark' ? <SunOutlined /> : <MoonOutlined />}</span>}
                 onClick={toggleMode}
                 aria-label={mode === 'dark' ? '切换到浅色主题' : '切换到深色主题'}
               />
-              {isDesktop && <Button onClick={() => void logout(session.csrf_token).then(() => setSession(null))}>退出</Button>}
+              </Tooltip>
+              {isDesktop && <Tooltip title="退出登录"><Button type="text" icon={<LogoutOutlined />} aria-label="退出登录" onClick={() => void logout(session.csrf_token).then(() => setSession(null))} /></Tooltip>}
               {!isDesktop && <Button type="text" icon={<MenuOutlined />} onClick={() => setDrawerOpen(true)} aria-label="打开更多导航" />}
             </Space>
           </Header>
-          <Content className={location.pathname === '/codex' ? 'app-content codex-content' : 'app-content'}><FeatureRoutes csrf={session.csrf_token} preference={preference} onPreference={setPreference} onLogout={() => void logout(session.csrf_token).then(() => setSession(null))} /></Content>
+          <Content className={location.pathname === '/codex' ? 'app-content codex-content' : 'app-content'}><FeatureRoutes csrf={session.csrf_token} preference={preference} onPreference={setPreference} accent={accent} onAccent={setAccent} onLogout={() => void logout(session.csrf_token).then(() => setSession(null))} /></Content>
         </Layout>
 
         {!isDesktop && (

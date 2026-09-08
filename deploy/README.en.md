@@ -1,4 +1,4 @@
-# FarHelm V0.8.0 deployment and lifecycle
+# FarHelm V0.9.0 deployment and lifecycle
 
 [简体中文](README.md) · [English](README.en.md)
 
@@ -154,9 +154,9 @@ farhelm-agent uninstall --keep-data
 
 ## Migrating from V0.2.0
 
-Hosts already on `V0.3.0` through `V0.7.1` can run `farhelm-hub update` or `farhelm-agent update` directly. `V0.2.0` must first upgrade to `V0.3.0` to migrate the old layout, then upgrade to V0.8.0.
+Hosts already on `V0.3.0` through `V0.8.0` can run `farhelm-hub update` or `farhelm-agent update` directly. `V0.2.0` must first upgrade to `V0.3.0` to migrate the old layout, then upgrade to V0.9.0.
 
-Lowercase legacy `v0.1.0/v0.2.0` releases are outside the formal update sequence. Remove them with their matching old uninstaller before installing V0.8.0.
+Lowercase legacy `v0.1.0/v0.2.0` releases are outside the formal update sequence. Remove them with their matching old uninstaller before installing V0.9.0.
 
 ## Security notes
 
@@ -181,3 +181,11 @@ Update Hub first, then Agent. The database stays at schema 7; project, session, 
 A binary rollback retains the current database and receipts. Never restore an older queue database: it could repeat completed operations. Running work becomes orphaned after restart and requires inspection instead of automatic replay. V0.8 does not downgrade your Codex executable; an older FarHelm installation can reuse its retained Python directory only after rollback verification.
 
 In the browser, verify the permanent system navigation, cached session switching, Markdown, queued sends, interrupts and completion alerts. Conversation caches are memory-only and cleared on logout; at most 20 inactive histories or 24 MiB plus up to 8 MiB of parsed Markdown are retained. Page notifications remain the supported notification experience for this release.
+
+## V0.8.0 → V0.9.0
+
+On the Hub host, run `sudo farhelm-hub update --version V0.9.0` first. Then run `farhelm-agent update --version V0.9.0` as the original user on each Agent host. Check `farhelm-hub status` and `farhelm-agent status`, then refresh the browser. The database stays at schema 7; no re-pairing, project import, or old database restoration is required.
+
+Check device names beside projects, model/permission details, appearance settings, cached session switching, notification pagination/details, and list synchronization after creating/cancelling schedules. Existing server Codex settings continue to apply. Agents without `codex.session_context` must be upgraded before the browser can create sessions with native permissions. Failed submission retries preserve the original operation identity.
+
+Rollback replaces only the executable and retains the current database, configuration, and receipts. Never restore an old queue snapshot. V0.8.0 can still read schema 7, but does not provide the V0.9.0 interface or native permission display features.
