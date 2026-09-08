@@ -16,6 +16,13 @@ function stream() {
   return (type: string, payload: object, lastEventId = '') => sources[0].dispatchEvent(new MessageEvent(type, { data: JSON.stringify({ event_id: `event-${lastEventId}`, payload }), lastEventId }))
 }
 describe('shared workspace cache', () => {
+  it('keeps current native settings through older pages and clears stale settings on a fresh response', () => {
+    const context = { model: 'gpt-5.4', sandbox: 'danger-full-access' }
+    queryClient.setQueryData(keys.history('s'), { ...page('s'), context })
+    expect(cacheHistory('s', { ...page('s'), context: { model: 'older-model' } }, true).context).toEqual(context)
+    expect(cacheHistory('s', { ...page('s'), context: {} }).context).toEqual({})
+    expect(cacheHistory('other', page('other')).context).toBeUndefined()
+  })
   it('retains the newest 20 inactive histories even when writes share a timestamp', () => {
     for (let i = 0; i < 25; i++) queryClient.setQueryData(keys.history(String(i)), page(String(i)))
     expect(queryClient.getQueryData(keys.history('0'))).toBeUndefined()

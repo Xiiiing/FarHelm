@@ -154,6 +154,8 @@ flowchart LR
 
 FarHelm 是一个 monorepo，但 Hub 与 Agent 分离编译并保持不同权限与攻击面。Codex 只通过本机 stdio 通信；登录凭据保留在本机，Hub 仅在最长 20 秒的有界内存中中转正文。
 
+Codex 输入区显示服务器返回的会话模型、推理强度和权限详情。恢复会话沿用原生 Codex 设置；网页新建会话默认使用项目配置，隔离 Git 工作区为可选项。尚未确认的设置明确标为未知，不根据会话旧模式猜测权限。模型和权限在服务器上的 Codex 中调整；网页暂不支持人工审批，需要用户批准的操作会被拒绝。请先升级 Hub，再升级 Agent，确认 Agent 已提供 `codex.session_context` 能力。旧 API/CLI 显式创建的 inspect/edit 模式继续兼容。
+
 ## 本地开发
 
 需要 Rust 1.98、Node.js 24 和 Corepack；原生联调另需已安装、已登录的 Codex。

@@ -21,7 +21,7 @@ export function cacheOperation(id: string, value: Operation) {
 }
 export function cacheHistory(id: string, page: TranscriptPage, older = false): TranscriptPage {
   const previous = queryClient.getQueryData<TranscriptPage>(keys.history(id))
-  return { ...page, ...(previous?.older_loaded && !older ? { next_cursor: previous.next_cursor, continuation: previous.continuation } : {}), older_loaded: older || previous?.older_loaded, turns: mergeTurns(previous?.turns ?? [], [...page.turns].reverse(), older) }
+  return { ...page, context: older ? previous?.context : page.context, ...(previous?.older_loaded && !older ? { next_cursor: previous.next_cursor, continuation: previous.continuation } : {}), older_loaded: older || previous?.older_loaded, turns: mergeTurns(previous?.turns ?? [], [...page.turns].reverse(), older) }
 }
 
 // Estimate retained strings without serializing megabyte bodies on the UI thread.
@@ -151,6 +151,9 @@ export function connectCodexCache() {
           flush()
           const state = event.type === 'codex.turn.started' ? 'running' : event.type.split('.').at(-1)!
           if (payload.operation_id) cacheOperation(payload.operation_id, { command_id: payload.operation_id, state, data: { turn_id: data?.turn_id, session_id: id } })
+          const context = queryClient.getQueryData<TranscriptPage>(keys.history(id))?.context
+          // A first resume confirms the previously unknown native permission profile.
+          if (state === 'running' && context && !context.sandbox) refreshHistory(id)
           if (terminal(state)) {
             queryClient.setQueryData<TranscriptPage>(keys.history(id), (old) => old && ({ ...old, turns: old.turns.map((turn) => turn.turn_id === data?.turn_id ? { ...turn, status: state } : turn) }))
             reconcileTerminal(id, payload.operation_id, data?.turn_id)

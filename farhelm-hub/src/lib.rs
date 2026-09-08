@@ -1173,6 +1173,7 @@ async fn list_agents(State(state): State<AppState>) -> Json<AgentListResponse> {
         .await
         .iter()
         .map(|(agent_id, stored)| AgentSummary {
+            capabilities: stored.capabilities.clone(),
             agent_id: agent_id.clone(),
             hostname: stored.hostname.clone(),
             agent_version: stored.agent_version.clone(),
@@ -1427,7 +1428,25 @@ async fn create_codex_session(
     let Some(key) = idempotency_header(&headers) else {
         return api_error(StatusCode::BAD_REQUEST, "missing_idempotency_key");
     };
-    let payload = serde_json::json!({"project_id":request.project_id,"mode":request.mode});
+    if request.inherit_permissions
+        && !state
+            .agents
+            .read()
+            .await
+            .get(&request.agent_id)
+            .is_some_and(|agent| {
+                agent
+                    .capabilities
+                    .iter()
+                    .any(|c| c == "codex.session_context")
+            })
+    {
+        return api_error(StatusCode::CONFLICT, "agent_upgrade_required");
+    }
+    let mut payload = serde_json::json!({"project_id":request.project_id,"mode":request.mode});
+    if request.inherit_permissions {
+        payload["inherit_permissions"] = serde_json::json!(true);
+    }
     create_typed_response(
         &state,
         &request.agent_id,
@@ -3239,6 +3258,50 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn native_session_creation_requires_capability_and_preserves_inheritance() {
+        let state = test_state();
+        let request = || {
+            Request::builder().method("POST").uri("/api/v1/codex/sessions")
+            .header(header::COOKIE, browser_cookie()).header("x-csrf-token", "test-csrf")
+            .header("idempotency-key", "native-session-test-key-0001")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({"agent_id":"gpu-a","project_id":"cc08","mode":"inspect","inherit_permissions":true}).to_string())).unwrap()
+        };
+        let rejected = app(state.clone()).oneshot(request()).await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        state.agents.write().await.insert(
+            "gpu-a".into(),
+            StoredAgent {
+                codex: None,
+                capabilities: vec!["codex.session_context".into()],
+                hostname: "gpu-a".into(),
+                agent_version: PRODUCT_VERSION.into(),
+                last_seen_unix: unix_time(),
+                credential_state: AgentCredentialState::Paired,
+            },
+        );
+        let accepted = app(state.clone()).oneshot(request()).await.unwrap();
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let result: CommandAccepted =
+            serde_json::from_slice(&to_bytes(accepted.into_body(), 4096).await.unwrap()).unwrap();
+        let command = state
+            .typed_commands
+            .claim("gpu-a", unix_time())
+            .unwrap()
+            .unwrap();
+        assert_eq!(command.action, CommandAction::CodexSessionCreate);
+        assert_eq!(
+            command.payload.as_ref().unwrap()["inherit_permissions"],
+            true
+        );
+        assert_eq!(command.payload.as_ref().unwrap()["mode"], "inspect");
+        let retry = app(state.clone()).oneshot(request()).await.unwrap();
+        let repeated: CommandAccepted =
+            serde_json::from_slice(&to_bytes(retry.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(repeated.command_id, result.command_id);
     }
 
     #[tokio::test]

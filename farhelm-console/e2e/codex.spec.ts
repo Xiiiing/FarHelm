@@ -15,6 +15,7 @@ async function setup(page: Page) {
   await page.route('**/api/v1/**', (route) => {
     const path = new URL(route.request().url()).pathname
     if (path.endsWith('/auth/session')) return route.fulfill({ json: { authenticated: true, user: 'admin', csrf_token: 'test-csrf', expires_at_unix: 2000000000 } })
+    if (path.endsWith('/agents')) return route.fulfill({ json: { protocol: 'farhelm/1', agents: [{ agent_id: 'gpu-a', hostname: 'TITAN', agent_version: '0.8.0', online: true, last_seen_unix: 2000000000, capabilities: ['codex.session_context'] }] } })
     if (path.endsWith('/codex/sessions')) return route.fulfill({ json: { protocol: 'farhelm/1', sessions: model.sessions } })
     if (path.endsWith('/session-display')) return route.fulfill({ json: { protocol: 'farhelm/1', sessions: model.sessions.map((s) => ({ ...s, display_label: s.session_id === 'ses-a' ? '训练结果分析' : '另一个会话' })), incomplete_agents: [] } })
     if (path.endsWith('/transcript')) { model.historyReads++; return route.fulfill({ status: model.historyStatus, json: model.historyStatus !== 200 ? { error: model.historyError } : path.includes('ses-b') ? { session_id: 'ses-b', turns: [turn('另一会话的回复')] } : model.history }) }

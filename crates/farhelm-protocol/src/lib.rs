@@ -55,6 +55,7 @@ impl AgentHeartbeat {
                 "codex.session_display".to_owned(),
                 "codex.item_offsets".to_owned(),
                 "codex.native".to_owned(),
+                "codex.session_context".to_owned(),
                 "agent.live".to_owned(),
             ],
             protocol: FARHELM_PROTOCOL.to_owned(),
@@ -74,6 +75,8 @@ pub struct AgentHeartbeatAck {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSummary {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex: Option<live::CodexReadiness>,
     pub agent_id: String,
@@ -354,9 +357,26 @@ pub struct CodexTranscriptPage {
     pub session_id: String,
     pub turns: Vec<CodexTranscriptTurn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<CodexSessionContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation: Option<TranscriptContinuation>,
+}
+
+/// Ephemeral configuration only. Never persist a native configuration object or paths.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexSessionContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals_reviewer: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -522,6 +542,8 @@ pub struct CreateCodexSessionRequest {
     pub agent_id: String,
     pub project_id: String,
     pub mode: CodexSessionMode,
+    #[serde(default)]
+    pub inherit_permissions: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -744,7 +766,7 @@ mod tests {
                 "agent_id": "gpu-a",
                 "hostname": "trainer-a",
                 "agent_version": "0.1.0",
-                "capabilities": ["codex.ephemeral_submit", "codex.session_display", "codex.item_offsets", "codex.native", "agent.live"]
+                "capabilities": ["codex.ephemeral_submit", "codex.session_display", "codex.item_offsets", "codex.native", "codex.session_context", "agent.live"]
             })
         );
     }
@@ -768,6 +790,21 @@ mod tests {
         );
         assert!(!data.to_string().contains("PRIVATE"));
         assert_eq!(data["data"]["turn_id"], "t");
+    }
+
+    #[test]
+    fn ephemeral_native_context_is_allowlisted_and_old_requests_remain_compatible() {
+        let page: CodexTranscriptPage = serde_json::from_value(serde_json::json!({"session_id":"s","turns":[],"context":{"model":"gpt-5.4","sandbox":"workspace-write","cwd":"PRIVATE","writableRoots":["PRIVATE"],"api_key":"PRIVATE"}})).unwrap();
+        let value = serde_json::to_value(page).unwrap();
+        assert_eq!(value["context"]["model"], "gpt-5.4");
+        assert!(!value.to_string().contains("PRIVATE"));
+        let payload = public_event_payload("codex.session.updated", &value);
+        assert!(payload.get("context").is_none());
+        let legacy: CreateCodexSessionRequest = serde_json::from_value(
+            serde_json::json!({"agent_id":"a","project_id":"p","mode":"inspect"}),
+        )
+        .unwrap();
+        assert!(!legacy.inherit_permissions);
     }
 
     #[test]

@@ -245,6 +245,7 @@ test('switching sessions ignores late history responses', async ({ page }, testI
 })
 
 test('same project names on different Agents retain the selected target', async ({ page }, testInfo) => {
+  await page.route('**/api/v1/agents', (route) => route.fulfill({ json: { protocol: 'farhelm/1', agents: ['gpu-a', 'gpu-b'].map(agent_id => ({ agent_id, hostname: agent_id, agent_version: '0.8.0', online: true, last_seen_unix: 2000000000, capabilities: ['codex.session_context'] })) } }))
   await page.route('**/api/v1/projects', (route) => route.fulfill({ json: { protocol: 'farhelm/1', projects: ['gpu-a', 'gpu-b'].map((agent_id) => ({ candidate_id: `candidate-${agent_id}`, agent_id, display_name: 'shared', suggested_project_id: 'shared', session_count: 1, state: 'approved', updated_at_unix: 2000000000 })) } }))
   let target: unknown
   await page.route('**/api/v1/codex/sessions', async (route) => { target = route.request().postDataJSON(); await route.fulfill({ status: 202, json: {} }) })
@@ -254,7 +255,7 @@ test('same project names on different Agents retain the selected target', async 
   await page.getByLabel('项目', { exact: true }).click()
   await page.getByText('shared · gpu-b', { exact: true }).click()
   await page.getByRole('dialog').getByRole('button', { name: /创\s*建/ }).click()
-  await expect.poll(() => target).toEqual({ agent_id: 'gpu-b', project_id: 'shared', mode: 'inspect' })
+  await expect.poll(() => target).toEqual({ agent_id: 'gpu-b', project_id: 'shared', mode: 'inspect', inherit_permissions: true })
 })
 
 

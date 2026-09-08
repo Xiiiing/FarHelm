@@ -42,6 +42,192 @@ done
 }
 
 #[tokio::test]
+async fn native_resume_inherits_settings_and_creation_retains_explicit_legacy_modes() {
+    for version in ["0.147.0", "0.153.4"] {
+        let directory = tempfile::tempdir().unwrap();
+        let bin = fixture(directory.path(), version);
+        let requests = directory.path().join("requests");
+        let script = std::fs::read_to_string(&bin).unwrap();
+        let mut lines = Vec::new();
+        for line in script.lines() {
+            if line.contains("Empty sessions must use their loaded thread") {
+                lines.push("  *'\"method\":\"thread/resume\"'*) result='{\"thread\":{\"id\":\"s\",\"cwd\":\"/tmp/project\"},\"model\":\"gpt-5.4\",\"reasoningEffort\":\"high\",\"sandbox\":{\"type\":\"dangerFullAccess\"},\"approvalPolicy\":\"never\",\"approvalsReviewer\":\"user\"}' ;;".to_owned());
+            } else {
+                lines.push(line.to_owned());
+                if line == " [ -n \"$id\" ] || continue" {
+                    lines.push(format!(
+                        " printf '%s\\n' \"$line\" >> '{}'",
+                        requests.display()
+                    ));
+                }
+            }
+        }
+        transport::write_fixture_executable(&bin, &lines.join("\n"));
+        let native = Codex::new(Some(bin));
+        native
+            .call(
+                "codex.session.resume",
+                json!({"session_id":"s","cwd":"/tmp/project","mode":"inspect"}),
+            )
+            .await
+            .unwrap();
+        let page = native
+            .call("codex.session.history", json!({"session_id":"s"}))
+            .await
+            .unwrap();
+        assert_eq!(page["context"]["model"], "gpt-5.4");
+        assert_eq!(page["context"]["sandbox"], "danger-full-access");
+        assert_eq!(page["context"]["approval_policy"], "never");
+        native
+            .call(
+                "codex.session.start",
+                json!({"cwd":"/tmp/project","mode":"inspect","inherit_permissions":true}),
+            )
+            .await
+            .unwrap();
+        native
+            .call(
+                "codex.session.start",
+                json!({"cwd":"/tmp/project","mode":"inspect"}),
+            )
+            .await
+            .unwrap();
+        native
+            .call(
+                "codex.session.start",
+                json!({"cwd":"/tmp/project","mode":"edit"}),
+            )
+            .await
+            .unwrap();
+        let recorded = std::fs::read_to_string(requests)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let resume = recorded
+            .iter()
+            .find(|v| v["method"] == "thread/resume")
+            .unwrap();
+        for key in [
+            "sandbox",
+            "approvalPolicy",
+            "model",
+            "config",
+            "permissionProfile",
+        ] {
+            assert!(
+                resume["params"].get(key).is_none(),
+                "resume must not override {key}"
+            );
+        }
+        assert_eq!(
+            resume["params"].get("excludeTurns").is_some(),
+            version == "0.153.4"
+        );
+        let starts = recorded
+            .iter()
+            .filter(|v| v["method"] == "thread/start")
+            .collect::<Vec<_>>();
+        assert_eq!(starts.len(), 3);
+        assert!(starts[0]["params"].get("sandbox").is_none());
+        assert!(starts[0]["params"].get("approvalPolicy").is_none());
+        assert_eq!(starts[1]["params"]["sandbox"], "read-only");
+        assert_eq!(starts[2]["params"]["sandbox"], "workspace-write");
+        native.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn slow_optional_settings_do_not_hold_history_for_the_native_rpc_timeout() {
+    let directory = tempfile::tempdir().unwrap();
+    let bin = fixture(directory.path(), "0.153.4");
+    let script = std::fs::read_to_string(&bin)
+        .unwrap()
+        .replace("printf 'legacy\\n' >>", "sleep 1; printf 'legacy\\n' >>");
+    transport::write_fixture_executable(&bin, &script);
+    let native = Codex::new(Some(bin));
+    native.warm().await.unwrap();
+    let start = Instant::now();
+    let page = native
+        .call("codex.session.history", json!({"session_id":"s"}))
+        .await
+        .unwrap();
+    assert!(start.elapsed() < Duration::from_millis(750));
+    assert_eq!(page["turns"][0]["items"][0]["text"], "用户输入");
+    assert_eq!(page["context"], json!({}));
+    native.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires an installed Codex; creates and archives one synthetic local thread, no model turn"]
+async fn installed_codex_preserves_native_permissions_and_model_on_resume() {
+    let directory = tempfile::tempdir().unwrap();
+    let bin = std::env::var_os("FARHELM_TEST_CODEX_BIN").map(PathBuf::from);
+    let native = Codex::new(bin.clone());
+    native.warm().await.unwrap();
+    let connection = native.connection().await.unwrap();
+    // Establish a native thread independently, as another Codex client would.
+    let original = connection
+        .request(
+            "thread/start",
+            json!({"cwd":directory.path(),"sandbox":"workspace-write","approvalPolicy":"never"}),
+        )
+        .await
+        .unwrap();
+    let id = original["thread"]["id"].as_str().unwrap();
+    // Codex does not persist a thread until it has history. Inject one synthetic
+    // history item without starting a model turn or executing any tools.
+    connection
+        .request(
+            "thread/inject_items",
+            json!({"threadId":id,"items":[{"type":"message","role":"user","content":[{"type":"input_text","text":"FarHelm synthetic settings verification."}]}]}),
+        )
+        .await
+        .unwrap();
+    // Archive flushes Codex's lazily materialized rollout. Restore visibility
+    // before reconnecting so this checks a persisted thread, not a live cache.
+    connection
+        .request("thread/archive", json!({"threadId":id}))
+        .await
+        .unwrap();
+    connection
+        .request("thread/unarchive", json!({"threadId":id}))
+        .await
+        .unwrap();
+    native.shutdown().await;
+    // A fresh App Server must restore the saved settings, not its own defaults.
+    let native = Codex::new(bin);
+    native.warm().await.unwrap();
+    let connection = native.connection().await.unwrap();
+    let resumed = native
+        .call(
+            "codex.session.resume",
+            json!({"session_id":id,"cwd":directory.path(),"mode":"inspect"}),
+        )
+        .await;
+    let confirmed = native
+        .inner
+        .loaded
+        .read()
+        .await
+        .get(id)
+        .map(|thread| thread.context.clone());
+    // Always clean up the thread before checking assertions, including adapter failures.
+    let archived = connection
+        .request("thread/archive", json!({"threadId":id}))
+        .await;
+    native.shutdown().await;
+    resumed.unwrap();
+    archived.unwrap();
+    let confirmed = confirmed.unwrap();
+    assert_eq!(confirmed, context::project(&original, None));
+    assert_eq!(confirmed.sandbox.as_deref(), Some("workspace-write"));
+    assert_eq!(confirmed.approval_policy.as_deref(), Some("never"));
+    assert!(confirmed.model.is_some());
+    println!("Native model and permissions preserved; no model turn executed.");
+}
+
+#[tokio::test]
 async fn native_versions_share_index_and_coalesce_history_without_losing_text() {
     for version in ["0.147.0", "0.153.4"] {
         let directory = tempfile::tempdir().unwrap();

@@ -8,7 +8,8 @@ export type SessionState = 'creating' | 'idle' | 'queued' | 'running' | 'interru
 export type CodexSession = { session_id: string; agent_id: string; project_id: string; mode: 'inspect' | 'edit'; state: SessionState; title?: string; display_label?: string; active_turn_id?: string; updated_at_unix: number; revision?: number }
 export type TranscriptItem = { item_id: string; kind: 'user_message' | 'assistant_message' | 'command_summary' | 'file_change_summary' | 'error'; text: string; text_offset?: number; text_complete?: boolean; status?: string; exit_code?: number; duration_ms?: number; streaming?: boolean }
 export type TranscriptTurn = { turn_id: string; status: string; started_at_unix?: number; completed_at_unix?: number; items: TranscriptItem[] }
-export type TranscriptPage = { older_loaded?: boolean; protocol?: string; session_id: string; turns: TranscriptTurn[]; next_cursor?: string; continuation?: { kind: 'message' | 'history'; turn_id: string; item_id: string; text_offset: number } }
+export type SessionContext = { model?: string; reasoning_effort?: string; sandbox?: string; approval_policy?: string; approvals_reviewer?: string }
+export type TranscriptPage = { older_loaded?: boolean; protocol?: string; session_id: string; turns: TranscriptTurn[]; context?: SessionContext; next_cursor?: string; continuation?: { kind: 'message' | 'history'; turn_id: string; item_id: string; text_offset: number } }
 export type DisplayPage = { sessions: CodexSession[]; next_cursor?: string; incomplete_agents: { agent_id: string; reason: string }[] }
 export async function fetchSessionDisplay(csrf: string, request: { mode: 'labels' | 'search'; session_ids?: string[]; query?: string; agent_id?: string; project_id?: string; archived?: 'false' | 'true' | 'all'; cursor?: string }, signal?: AbortSignal): Promise<DisplayPage> {
   const response = await fetch('/api/v1/codex/session-display', { method: 'POST', credentials: 'same-origin', signal, headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf }, body: JSON.stringify(request) })
@@ -125,8 +126,8 @@ export async function waitForCommand(operation: Operation): Promise<Operation> {
   }
 }
 
-export function createSession(csrf: string, agentId: string, projectId: string, mode: 'inspect' | 'edit') {
-  return mutate('/api/v1/codex/sessions', csrf, { agent_id: agentId, project_id: projectId, mode })
+export function createSession(csrf: string, agentId: string, projectId: string, mode: 'inspect' | 'edit', inheritPermissions = false) {
+  return mutate('/api/v1/codex/sessions', csrf, { agent_id: agentId, project_id: projectId, mode, ...(inheritPermissions ? { inherit_permissions: true } : {}) })
 }
 export function sendMessage(csrf: string, sessionId: string, prompt: string, delivery: 'queue' | 'steer', turnId?: string, operationId?: string) {
   return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/messages`, csrf, { prompt, delivery, ...(delivery === 'steer' ? { turn_id: turnId } : {}) }, 'POST', operationId)

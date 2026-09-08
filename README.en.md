@@ -154,6 +154,8 @@ flowchart LR
 
 FarHelm is one monorepo, but Hub and Agent are compiled separately and retain distinct privileges and attack surfaces. Codex communicates only over local stdio. Authentication remains local; Hub relays bodies only in bounded memory for at most 20 seconds.
 
+The Codex composer displays the session model, reasoning effort, and permission details returned by the server. Resuming inherits native Codex settings; new browser sessions use project configuration, with an optional isolated Git worktree. Unconfirmed settings are marked unknown rather than inferred from legacy session modes. Adjust the model and permissions in Codex on the server. Browser approval prompts are not supported yet, so operations requiring user approval are declined. Upgrade Hub before Agent and verify that Agent advertises `codex.session_context`. Explicit inspect/edit creation through older APIs and the CLI remains compatible.
+
 ## Local development
 
 You need Rust 1.98, Node.js 24, Corepack, and a locally installed Codex.

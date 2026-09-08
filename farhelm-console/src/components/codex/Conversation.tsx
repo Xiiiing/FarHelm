@@ -1,4 +1,4 @@
-import { ArrowDownOutlined, ArrowUpOutlined, CalendarOutlined, CheckCircleOutlined, ClockCircleOutlined, CloseCircleOutlined, CopyOutlined, EditOutlined, EllipsisOutlined, EyeOutlined, FolderOpenOutlined, LoadingOutlined, MenuFoldOutlined, MenuOutlined, MenuUnfoldOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons'
+import { ArrowDownOutlined, ArrowUpOutlined, CalendarOutlined, CheckCircleOutlined, ClockCircleOutlined, CloseCircleOutlined, CopyOutlined, EllipsisOutlined, FolderOpenOutlined, LoadingOutlined, MenuFoldOutlined, MenuOutlined, MenuUnfoldOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons'
 import { Sender } from '@ant-design/x'
 import { useQuery } from '@tanstack/react-query'
 import { Alert, Button, Dropdown, Empty, Input, Modal, Radio, Skeleton, Space, Tooltip } from 'antd'
@@ -10,6 +10,7 @@ import { Transcript, type TranscriptPosition } from './Transcript'
 import { errorText, sessionName, stateNames } from './presentation'
 import type { SessionDraft } from './useOperations'
 import { useAgents } from '../../hooks/useAgents'
+import { ModelDetails, PermissionDetails } from './SessionSettings'
 
 const ComposerInput = forwardRef<ComponentRef<typeof Input.TextArea>, ComponentProps<typeof Input.TextArea>>((props, ref) => <Input.TextArea {...props} ref={ref} aria-label="给 Codex 发送指令" maxLength={32768} />)
 const senderComponents = { input: ComposerInput }
@@ -140,10 +141,12 @@ export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, sess
     </div><Button className="jump-to-bottom" icon={<ArrowDownOutlined aria-hidden />} hidden={!away && !newMessages} onClick={() => { follow.current = true; anchor.current = undefined; restore(); setNewMessages(false); setAway(false) }}>{newMessages ? '有新消息 · 回到底部' : '回到底部'}</Button></div>
     {id && <footer className="composer-wrap">
       <Sender ref={sender} className={`composer ${draft.text.trim() ? 'has-draft' : ''} ${draft.sending ? 'is-submitting' : ''}`} components={senderComponents} value={draft.text} onChange={(value) => onDraft((old) => ({ ...old, text: value }))} autoSize={{ minRows: 1, maxRows: 5 }} placeholder={session ? '描述下一步，或提出问题…' : '正在读取会话…'} disabled={!session || failureCode === 'session_not_found'} onSubmit={submit} onKeyDown={(event) => { if (event.nativeEvent.isComposing || event.keyCode === 229) return false }} suffix={false} footer={(_, { components: { SendButton } }) => <>
-        {visibleTurn && <Radio.Group className="delivery-options" aria-label="活动会话发送方式" value={draft.delivery} onChange={(event) => onDraft((old) => ({ ...old, delivery: event.target.value as 'queue' | 'steer' }))}><Radio value="queue">排队下一轮</Radio><Radio value="steer">补充当前对话</Radio></Radio.Group>}
+        {visibleTurn && <div className="active-turn-controls"><Radio.Group className="delivery-options" aria-label="活动会话发送方式" value={draft.delivery} onChange={(event) => onDraft((old) => ({ ...old, delivery: event.target.value as 'queue' | 'steer' }))}><Radio value="queue">排队下一轮</Radio><Radio value="steer">补充当前对话</Radio></Radio.Group><Tooltip title="中断当前对话"><Button danger type="text" icon={<StopOutlined />} onClick={interrupt} aria-label="中断" /></Tooltip></div>}
         <div className="composer-actions">
-          <Space size={4}><Tooltip title={session?.mode === 'edit' ? '允许在隔离工作区中编辑' : '只读模式：分析与检查，不修改项目'}><span className="composer-context">{session?.mode === 'edit' ? <EditOutlined /> : <EyeOutlined />}<span>{session?.mode === 'edit' ? '编辑' : '只读'}</span></span></Tooltip><span className="composer-action-divider" /><Tooltip title="在指定时间或训练成功后发送"><Button type="text" className="schedule-action" icon={<ClockCircleOutlined />} disabled={!session} onClick={() => session && onSchedule(session)} aria-label="定时发送"><span>定时</span></Button></Tooltip>{visibleTurn && <Button danger type="text" icon={<StopOutlined />} onClick={interrupt} aria-label="中断">中断</Button>}</Space>
+          <div className="composer-tools"><PermissionDetails context={page?.context} session={session} supported={agent ? agent.capabilities?.includes('codex.session_context') ?? false : undefined} /><Tooltip title="定时发送"><Button type="text" className="composer-control schedule-action" icon={<ClockCircleOutlined />} disabled={!session} onClick={() => session && onSchedule(session)} aria-label="定时发送" /></Tooltip></div>
+          <div className="composer-submit"><ModelDetails context={page?.context} loading={history.isFetching && !page} disabled={!session} />
           <SendButton className="send-action" shape="default" type="primary" icon={<ArrowUpOutlined />} loading={draft.sending} disabled={!session || !draft.text.trim() || draft.sending} aria-label="发送指令"><span className="sr-only">发送</span></SendButton>
+          </div>
         </div>
       </>} />
       <div className="composer-hint"><span className={`submission-status ${receiptFailed ? 'status-error' : ''}`} role="status">{draft.sending ? <><LoadingOutlined /> 等待 Agent 保存确认…</> : lastReceipt?.command_id ? <>{receiptFailed ? <CloseCircleOutlined /> : ['accepted', 'completed'].includes(lastReceipt.state) ? <CheckCircleOutlined /> : <ClockCircleOutlined />} {stateNames[lastReceipt.state] ?? '处理中'}<span className="receipt-id"> · {lastReceipt.command_id.slice(-8)}</span></> : session ? <><FolderOpenOutlined /> {session.project_id}</> : '正在读取会话'}</span><span className="keyboard-hint"><kbd>Enter</kbd> 发送 <span>·</span> <kbd>Shift + Enter</kbd> 换行</span></div>
