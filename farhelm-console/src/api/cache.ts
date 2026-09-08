@@ -1,7 +1,7 @@
 import { QueryClient, notifyManager, type InfiniteData } from '@tanstack/react-query'
 import type { CodexSession, DisplayPage, Operation, TranscriptPage } from './features'
 import type { AgentListResponse, AgentSummary } from './agents'
-import { mergeDelta, mergeTurns } from './transcript'
+import { mergeDeltas, mergeTurns, type TranscriptDelta } from './transcript'
 import { subscribeEvents } from './events'
 
 export const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: 30_000, gcTime: 5 * 60_000, retry: false, refetchOnWindowFocus: false, structuralSharing: false }, mutations: { retry: false } } })
@@ -44,7 +44,11 @@ queryClient.getQueryCache().subscribe((event) => {
 
 function updateSession(payload: Partial<CodexSession> & { update_kind?: string }) {
   const id = payload.session_id
-  if (!id) return
+  // Durable replay contains raw Agent events, not the versioned live projection.
+  // Recovery reconciles lists once; replay cannot overwrite or refetch per row.
+  if (!id || !Number.isSafeInteger(payload.revision) || payload.revision! < 0) return
+  const known = queryClient.getQueryData<CodexSession>(keys.session(id))
+  if (known && (known.revision ?? 0) > (payload.revision ?? 0)) return
   const patch = (old?: CodexSession): CodexSession | undefined => {
     if (old && (old.revision ?? 0) > (payload.revision ?? 0)) return old
     if (!old && (!payload.agent_id || !payload.project_id || !payload.mode)) return old
@@ -57,11 +61,21 @@ function updateSession(payload: Partial<CodexSession> & { update_kind?: string }
   for (const query of queryClient.getQueryCache().findAll({ queryKey: ['codex', 'sessions'] })) {
     const old = query.state.data as InfiniteData<DisplayPage> | undefined
     if (!old) continue
-    const existing = old.pages.flatMap((page) => page.sessions).find((row) => row.session_id === id)
-    if (!existing || (existing.state === 'archived') !== (payload.state === 'archived')) {
-      // A membership change needs one paginated reconciliation, not a refresh per delta.
-      void queryClient.invalidateQueries({ queryKey: query.queryKey, exact: true })
-    } else queryClient.setQueryData(query.queryKey, { ...old, pages: old.pages.map((page) => ({ ...page, sessions: page.sessions.map((row) => row.session_id === id ? patch(row)! : row) })) })
+    const existing = old.pages.find((page) => page.sessions.some((row) => row.session_id === id))?.sessions.find((row) => row.session_id === id)
+    if (existing && (existing.revision ?? 0) > (payload.revision ?? 0)) continue
+    const value = patch(existing) ?? queryClient.getQueryData<CodexSession>(keys.session(id)) ?? payload
+    const [, , archived, agent, project, search] = query.queryKey
+    // Missing metadata is unknown, not evidence that the event belongs elsewhere.
+    const outside = (agent && value.agent_id && agent !== value.agent_id) || (project && value.project_id && project !== value.project_id)
+      || (value.state && ((archived === 'true' && value.state !== 'archived') || (archived === 'false' && value.state === 'archived')))
+    if (!existing && outside) continue
+    if (existing) {
+      queryClient.setQueryData(query.queryKey, { ...old, pages: old.pages.map((page) => !page.sessions.some((row) => row.session_id === id) ? page : {
+        ...page, sessions: outside ? page.sessions.filter((row) => row.session_id !== id) : page.sessions.map((row) => row.session_id === id ? value : row),
+      }) })
+    }
+    // Search also depends on Agent-only preview text, so its membership needs a read.
+    if (!existing || outside || search) void queryClient.invalidateQueries({ queryKey: query.queryKey, exact: true })
   }
 }
 
@@ -71,17 +85,28 @@ export function connectCodexCache() {
   const refresh = new Map<string, ReturnType<typeof setTimeout>>()
   const reconciled = new Set<string>()
   let frame: ReturnType<typeof setTimeout> | undefined
-  const deltas = new Map<string, Parameters<typeof mergeDelta>[1][]>()
+  let listingRefresh: ReturnType<typeof setTimeout> | undefined
+  const deltas = new Map<string, TranscriptDelta[]>()
   const flush = () => {
     clearTimeout(frame); frame = undefined
     notifyManager.batch(() => {
-      for (const [id, chunks] of deltas) queryClient.setQueryData<TranscriptPage>(keys.history(id), (old) => ({ session_id: id, ...old, turns: chunks.reduce(mergeDelta, old?.turns ?? []) }))
+      for (const [id, chunks] of deltas) queryClient.setQueryData<TranscriptPage>(keys.history(id), (old) => {
+        const turns = mergeDeltas(old?.turns ?? [], chunks)
+        return old?.turns === turns ? old : { session_id: id, ...old, turns }
+      })
       deltas.clear()
     })
   }
   const refreshHistory = (id: string) => {
     if (refresh.has(id)) return
     refresh.set(id, setTimeout(() => { refresh.delete(id); void queryClient.invalidateQueries({ queryKey: keys.history(id), exact: true, refetchType: 'active' }) }, 50))
+  }
+  const reconcileLists = () => {
+    listingRefresh ??= setTimeout(() => {
+      listingRefresh = undefined
+      // Also stale inactive scopes so archive/search switches do not reuse old membership.
+      void queryClient.invalidateQueries({ queryKey: ['codex'], predicate: (query) => ['sessions', 'labels'].includes(String(query.queryKey[1])), refetchType: 'active' })
+    }, 50)
   }
   const reconcileTerminal = (session: string, operation?: string, turn?: string) => {
     const identities = [...(operation ? [`operation:${operation}`] : []), ...(turn ? [`turn:${session}:${turn}`] : [])]
@@ -94,6 +119,7 @@ export function connectCodexCache() {
     if (event.type === 'open' || event.type === 'codex.stream.resync') {
       if (opened || event.type === 'codex.stream.resync') {
         flush()
+        reconcileLists()
         for (const query of queryClient.getQueryCache().findAll({ queryKey: ['codex'], type: 'active' })) if (['history', 'session', 'operation'].includes(String(query.queryKey[1]))) void queryClient.invalidateQueries({ queryKey: query.queryKey, exact: true })
       }
       opened = true; return
@@ -117,7 +143,9 @@ export function connectCodexCache() {
       else if (payload.session_id) {
         const id = payload.session_id; const data = payload.data
         if (event.type === 'codex.message.delta' && data?.turn_id && data.item_id && typeof data.delta === 'string' && Number.isSafeInteger(data.text_offset) && data.text_offset! >= 0) {
-          deltas.set(id, [...(deltas.get(id) ?? []), { turn_id: data.turn_id, item_id: data.item_id, delta: data.delta, text_offset: data.text_offset! }])
+          const chunks = deltas.get(id) ?? []
+          chunks.push({ turn_id: data.turn_id, item_id: data.item_id, delta: data.delta, text_offset: data.text_offset! })
+          deltas.set(id, chunks)
           frame ??= setTimeout(flush, 24)
         } else {
           flush()
@@ -131,5 +159,5 @@ export function connectCodexCache() {
       }
     } catch { /* Unknown frames never create anonymous transcript content. */ }
   })
-  return () => { off(); clearTimeout(frame); for (const timer of refresh.values()) clearTimeout(timer); deltas.clear() }
+  return () => { off(); clearTimeout(frame); clearTimeout(listingRefresh); for (const timer of refresh.values()) clearTimeout(timer); deltas.clear() }
 }

@@ -34,6 +34,8 @@ pub struct CodexStatus {
 struct Index {
     rows: HashMap<String, Value>,
     refreshed: Option<Instant>,
+    // A complete empty snapshot is distinct from an index not yet initialized.
+    snapshot_generation: u64,
     revision: u64,
     changed: HashMap<String, u64>,
 }
@@ -235,25 +237,37 @@ impl Codex {
     }
 
     async fn index(&self, force: bool) -> Result<Vec<Value>> {
-        let _refresh = self.inner.refresh.lock().await;
-        if !force
-            && self
-                .inner
-                .index
-                .read()
-                .await
-                .refreshed
-                .is_some_and(|time| time.elapsed() < Duration::from_secs(30))
+        let generation = {
+            let index = self.inner.index.read().await;
+            if !force
+                && index
+                    .refreshed
+                    .is_some_and(|time| time.elapsed() < Duration::from_secs(30))
+            {
+                return Ok(index.rows.values().cloned().collect());
+            }
+            index.snapshot_generation
+        };
+        let _refresh = match self.inner.refresh.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                if !force {
+                    let index = self.inner.index.read().await;
+                    if index.snapshot_generation > 0 {
+                        // Names/search use the last complete projection while the
+                        // existing discovery lane prepares an atomic replacement.
+                        return Ok(index.rows.values().cloned().collect());
+                    }
+                }
+                self.inner.refresh.lock().await
+            }
+        };
         {
-            return Ok(self
-                .inner
-                .index
-                .read()
-                .await
-                .rows
-                .values()
-                .cloned()
-                .collect());
+            let index = self.inner.index.read().await;
+            if index.snapshot_generation != generation {
+                // Another caller completed the requested scan while we waited.
+                return Ok(index.rows.values().cloned().collect());
+            }
         }
         let connection = self.connection().await?;
         let revision = self.inner.index.read().await.revision;
@@ -306,6 +320,7 @@ impl Codex {
         }
         index.rows = rows;
         index.refreshed = Some(Instant::now());
+        index.snapshot_generation += 1;
         index.changed.retain(|_, changed| *changed > revision);
         Ok(index.rows.values().cloned().collect())
     }

@@ -1,5 +1,4 @@
 use super::*;
-use std::os::unix::fs::PermissionsExt;
 
 fn fixture(directory: &std::path::Path, version: &str) -> PathBuf {
     let path = directory.join("codex");
@@ -33,14 +32,12 @@ while IFS= read -r line; do
  printf '{"id":%s,"result":%s}\n' "$id" "$result"
 done
 "#;
-    std::fs::write(
+    transport::write_fixture_executable(
         &path,
-        script
+        &script
             .replace("VERSION", version)
             .replace("RECORD", directory.join("methods").to_str().unwrap()),
-    )
-    .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
     path
 }
 
@@ -86,6 +83,193 @@ async fn native_versions_share_index_and_coalesce_history_without_losing_text() 
         );
         native.shutdown().await;
     }
+}
+
+fn gated_index_fixture(directory: &std::path::Path) -> PathBuf {
+    let path = fixture(directory, "0.153.4");
+    let script = std::fs::read_to_string(&path).unwrap();
+    let gate = directory.join("hold-index");
+    let fail = directory.join("fail-index");
+    let script = script.replace(
+        "   case \"$line\" in *'\"archived\":true'*)",
+        &format!(
+            "   while [ -f '{}' ]; do sleep 0.01; done\n   if [ -f '{}' ]; then printf '{{\"id\":%s,\"error\":{{\"code\":-32000,\"message\":\"fixture index unavailable\"}}}}\\n' \"$id\"; continue; fi\n   case \"$line\" in *'\"archived\":true'*)",
+            gate.display(), fail.display()
+        ),
+    );
+    assert!(script.contains("hold-index"));
+    transport::write_fixture_executable(&path, &script);
+    path
+}
+
+async fn wait_for_index_calls(directory: &std::path::Path, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let calls = std::fs::read_to_string(directory.join("methods"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| *line == "list")
+                .count();
+            if calls >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("fixture index call started");
+}
+
+#[tokio::test]
+async fn warm_index_reads_do_not_wait_for_background_scan() {
+    let directory = tempfile::tempdir().unwrap();
+    let native = Codex::new(Some(gated_index_fixture(directory.path())));
+    native.index(false).await.unwrap();
+    // A completed snapshot remains usable when its next scan is already in flight.
+    native.inner.index.write().await.refreshed = None;
+    let gate = directory.path().join("hold-index");
+    std::fs::write(&gate, "hold").unwrap();
+    let refresh = tokio::spawn({
+        let native = native.clone();
+        async move { native.index(true).await }
+    });
+    wait_for_index_calls(directory.path(), 3).await;
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        std::fs::remove_file(gate).unwrap();
+    });
+    let started = Instant::now();
+    let display = native
+        .call(
+            "codex.session.display",
+            json!({"mode":"labels","session_ids":["s"],"bindings":{"s":{"project_id":"project","cwd":"/tmp/project"}}}),
+        )
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    println!(
+        "warm_index_read_during_200ms_scan_ms={:.3}",
+        elapsed.as_secs_f64() * 1000.0
+    );
+    release.await.unwrap();
+    refresh.await.unwrap().unwrap();
+    native.shutdown().await;
+    assert_eq!(display["sessions"][0]["display_label"], "首条用户请求");
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "cached index waited for scan: {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn index_cold_reads_share_one_complete_scan() {
+    let directory = tempfile::tempdir().unwrap();
+    let native = Codex::new(Some(gated_index_fixture(directory.path())));
+    let gate = directory.path().join("hold-index");
+    std::fs::write(&gate, "hold").unwrap();
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let native = native.clone();
+        tasks.push(tokio::spawn(async move { native.index(false).await }));
+    }
+    wait_for_index_calls(directory.path(), 1).await;
+    assert!(tasks.iter().all(|task| !task.is_finished()));
+    std::fs::remove_file(gate).unwrap();
+    for task in tasks {
+        assert_eq!(task.await.unwrap().unwrap()[0]["id"], "s");
+    }
+    let methods = std::fs::read_to_string(directory.path().join("methods")).unwrap();
+    assert_eq!(methods.lines().filter(|line| *line == "list").count(), 2);
+    native.shutdown().await;
+}
+
+#[tokio::test]
+async fn index_overlapping_forced_scans_coalesce_and_preserve_native_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let native = Codex::new(Some(gated_index_fixture(directory.path())));
+    native.index(false).await.unwrap();
+    let gate = directory.path().join("hold-index");
+    std::fs::write(&gate, "hold").unwrap();
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let native = native.clone();
+        tasks.push(tokio::spawn(async move { native.index(true).await }));
+    }
+    wait_for_index_calls(directory.path(), 3).await;
+    let connection = native.connection().await.unwrap();
+    for event in [
+        json!({"method":"thread/name/updated","params":{"threadId":"s","threadName":"新的正式标题"}}),
+        json!({"method":"thread/status/changed","params":{"threadId":"s","status":{"type":"active"}}}),
+        json!({"method":"thread/archived","params":{"threadId":"s"}}),
+    ] {
+        connection.events.send(event).unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while native.inner.index.read().await.rows["s"]["archived"] != true {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    std::fs::remove_file(gate).unwrap();
+    for task in tasks {
+        let rows = task.await.unwrap().unwrap();
+        assert_eq!(rows[0]["name"], "新的正式标题");
+        assert_eq!(rows[0]["status"]["type"], "active");
+        assert_eq!(rows[0]["archived"], true);
+    }
+    let methods = std::fs::read_to_string(directory.path().join("methods")).unwrap();
+    assert_eq!(methods.lines().filter(|line| *line == "list").count(), 4);
+    native.shutdown().await;
+}
+
+#[tokio::test]
+async fn index_failed_and_cancelled_scans_keep_snapshot_and_allow_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let native = Codex::new(Some(gated_index_fixture(directory.path())));
+    let snapshot = native.index(false).await.unwrap();
+    let fail = directory.path().join("fail-index");
+    std::fs::write(&fail, "fail").unwrap();
+    native.inner.index.write().await.refreshed = None;
+    assert!(native.index(true).await.is_err());
+    assert_eq!(native.inner.index.read().await.rows["s"], snapshot[0]);
+    assert!(native.inner.refresh.try_lock().is_ok());
+    std::fs::remove_file(fail).unwrap();
+    assert_eq!(native.index(false).await.unwrap(), snapshot);
+
+    let gate = directory.path().join("hold-index");
+    std::fs::write(&gate, "hold").unwrap();
+    let refresh = tokio::spawn({
+        let native = native.clone();
+        async move { native.index(true).await }
+    });
+    wait_for_index_calls(directory.path(), 6).await;
+    refresh.abort();
+    assert!(refresh.await.unwrap_err().is_cancelled());
+    assert!(native.inner.refresh.try_lock().is_ok());
+    assert_eq!(native.inner.index.read().await.rows["s"], snapshot[0]);
+    std::fs::remove_file(gate).unwrap();
+    assert_eq!(native.index(true).await.unwrap(), snapshot);
+    native.shutdown().await;
+}
+
+#[tokio::test]
+async fn empty_complete_index_is_available_during_refresh() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = gated_index_fixture(directory.path());
+    let script = std::fs::read_to_string(&path).unwrap().replace(
+        r#"[{"id":"s","cwd":"/tmp/project","name":null,"preview":"首条用户请求","updatedAt":2}]"#,
+        "[]",
+    );
+    transport::write_fixture_executable(&path, &script);
+    let native = Codex::new(Some(path));
+    assert!(native.index(false).await.unwrap().is_empty());
+    native.inner.index.write().await.refreshed = None;
+    let scan = native.inner.refresh.lock().await;
+    let rows = tokio::time::timeout(Duration::from_millis(100), native.index(false)).await;
+    drop(scan);
+    native.shutdown().await;
+    assert!(rows.unwrap().unwrap().is_empty());
 }
 
 #[tokio::test]

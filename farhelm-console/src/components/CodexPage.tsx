@@ -1,5 +1,5 @@
-import { PlusOutlined, SearchOutlined } from '@ant-design/icons'
-import { Alert, Button, Drawer, Empty, Input, Segmented, Select, Skeleton } from 'antd'
+import { CloseOutlined, FilterOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons'
+import { Alert, Button, Drawer, Empty, Input, Popover, Segmented, Select, Skeleton } from 'antd'
 import { useEffect, useMemo, useState } from 'react'
 import { SessionGroups } from './codex/SessionGroups'
 import { useQuery } from '@tanstack/react-query'
@@ -13,6 +13,11 @@ import { useOperations } from './codex/useOperations'
 import { useSessions, type ArchiveFilter } from './codex/useSessions'
 import './codex/workspace.css'
 import './codex/markdown.css'
+
+function ScopeFilter({ value, options, onChange }: { value?: string; options: { value: string; label: string }[]; onChange: (value?: string) => void }) {
+  const [open, setOpen] = useState(false)
+  return <Popover trigger="click" placement="bottomRight" open={open} onOpenChange={setOpen} title="会话范围" content={<div className="session-filter-popover"><label>服务器与项目</label><Select aria-label="筛选项目" showSearch allowClear optionFilterProp="label" placeholder="全部服务器与项目" value={value} onChange={(next) => { onChange(next); setOpen(false) }} options={options} /></div>}><Button type="text" className={value ? 'scope-active' : undefined} icon={<FilterOutlined />} aria-label="筛选服务器与项目" aria-expanded={open} /></Popover>
+}
 
 export function CodexPage({ csrf }: { csrf: string }) {
   const [params, setParams] = useSearchParams(); const id = params.get('session') ?? undefined
@@ -49,11 +54,12 @@ export function CodexPage({ csrf }: { csrf: string }) {
     else { setCollapsed(false); requestAnimationFrame(() => document.querySelector<HTMLInputElement>('.codex-desktop-rail input[aria-label="搜索全部会话"]')?.focus()) }
   }
   const rail = <aside className="codex-rail" aria-label="项目和会话">
-    <div className="codex-rail-head"><h2>会话</h2><span>CODEX</span></div>
-    <Button className="new-session-button" icon={<PlusOutlined />} onClick={newSession} block>新建会话</Button>
+    <div className="codex-rail-head"><h2>会话</h2><Button type="text" className="new-session-button" icon={<PlusOutlined />} onClick={newSession} aria-label="新建会话">新建</Button></div>
     <Input className="session-search" allowClear prefix={<SearchOutlined />} suffix={<kbd className="desktop-only">{navigator.platform.includes('Mac') ? '⌘ K' : 'Ctrl K'}</kbd>} placeholder="搜索全部会话" aria-label="搜索全部会话" value={query} onChange={(e) => setQuery(e.target.value)} />
-    <Segmented block value={archive} onChange={(value) => { setArchive(value as ArchiveFilter); select(undefined) }} options={[{ label: '当前', value: 'false' }, { label: '归档', value: 'true' }, { label: '全部', value: 'all' }]} />
-    {projects.length > 0 && <Select aria-label="筛选项目" allowClear placeholder="全部服务器与项目" value={scope} onChange={setScope} options={scopes} />}
+    <div className="session-filter-row"><Segmented className="archive-tabs" value={archive} onChange={(value) => { setArchive(value as ArchiveFilter); select(undefined) }} options={[{ label: '当前', value: 'false' }, { label: '归档', value: 'true' }, { label: '全部', value: 'all' }]} />
+      {projects.length > 0 && <ScopeFilter value={scope} options={scopes} onChange={setScope} />}
+    </div>
+    {scoped && <div className="active-session-scope"><span title={scoped.label}>{scoped.label}</span><Button type="text" icon={<CloseOutlined />} aria-label="清除项目筛选" onClick={() => setScope(undefined)} /></div>}
     {(sessions.error || projectError) && <Alert type="warning" title={sessions.error ?? projectError} action={<Button type="text" onClick={() => { void sessions.refresh(); if (projectError) void projectQuery.refetch() }}>重试</Button>} />}
     {sessions.incomplete.length > 0 && <div className="session-partial" role="status">部分会话信息不可用：{sessions.incomplete.map((a) => `${a.agent_id}（${a.reason === 'agent_offline' ? '离线' : a.reason === 'agent_upgrade_required' ? '需要升级 Agent' : '读取失败'}）`).join('、')}<Button type="link" onClick={() => void sessions.refresh()}>重试</Button></div>}
     <div className="codex-session-groups" onKeyDown={(event) => {

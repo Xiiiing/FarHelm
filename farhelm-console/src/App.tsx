@@ -41,20 +41,20 @@ const CodexPage = lazy(() => import('./components/CodexPage').then((module) => (
 const codexFallback = <div className="session-loading"><Spin /><span>正在加载 Codex 工作区…</span></div>
 
 const desktopItems = [
-  { key: '/', icon: <DashboardOutlined />, label: '总览' },
-  { key: '/agents', icon: <DesktopOutlined />, label: 'Agent' },
-  { key: '/experiments', icon: <UnorderedListOutlined />, label: '实验' },
-  { key: '/codex', icon: <CodeOutlined />, label: 'Codex' },
-  { key: '/notifications', icon: <BellOutlined />, label: '通知' },
-  { key: '/audit', icon: <FileSearchOutlined />, label: '审计' },
-  { key: '/settings', icon: <SettingOutlined />, label: '设置' },
+  { key: '/', icon: <DashboardOutlined aria-hidden />, label: '总览' },
+  { key: '/agents', icon: <DesktopOutlined aria-hidden />, label: 'Agent' },
+  { key: '/experiments', icon: <UnorderedListOutlined aria-hidden />, label: '实验' },
+  { key: '/codex', icon: <CodeOutlined aria-hidden />, label: 'Codex' },
+  { key: '/notifications', icon: <BellOutlined aria-hidden />, label: '通知' },
+  { key: '/audit', icon: <FileSearchOutlined aria-hidden />, label: '审计' },
+  { key: '/settings', icon: <SettingOutlined aria-hidden />, label: '设置' },
 ]
 
 const mobileItems = [
-  { key: '/', icon: <DashboardOutlined />, label: '总览' },
-  { key: '/experiments', icon: <UnorderedListOutlined />, label: '实验' },
-  { key: '/codex', icon: <CodeOutlined />, label: 'Codex' },
-  { key: '/more', icon: <MoreOutlined />, label: '更多' },
+  { key: '/', icon: <DashboardOutlined aria-hidden />, label: '总览' },
+  { key: '/experiments', icon: <UnorderedListOutlined aria-hidden />, label: '实验' },
+  { key: '/codex', icon: <CodeOutlined aria-hidden />, label: 'Codex' },
+  { key: '/more', icon: <MoreOutlined aria-hidden />, label: '更多' },
 ]
 
 function FeatureRoutes({ csrf, preference, onPreference, onLogout }: { csrf: string; preference: ColorPreference; onPreference: (value: ColorPreference) => void; onLogout: () => void }) {
@@ -114,16 +114,16 @@ function AppContent() {
       <LiveNotifications />
       <Layout className={location.pathname === '/codex' ? 'app-layout codex-shell' : 'app-layout'}>
         {isDesktop && (
-          <Sider width={240} className="app-sider">
+          <Sider width={88} className="app-sider">
             <div className="brand" aria-label="FarHelm Console">
               <img src="/farhelm-mark.svg" alt="" width="36" height="36" />
-              <div><strong>FarHelm</strong><span>远程工作空间</span></div>
+              <strong>FarHelm</strong>
             </div>
             <nav aria-label="系统导航"><Menu mode="inline" selectedKeys={[location.pathname]} items={[
               { type: 'group', label: '工作空间', children: desktopItems.slice(0, 4) },
               { type: 'group', label: '管理', children: desktopItems.slice(4) },
             ]} onClick={({ key }) => go(key)} /></nav>
-            <div className="sider-footer"><div className="account-identity"><Avatar shape="square">{session.user.slice(0, 1).toUpperCase()}</Avatar><div><strong>{session.user}</strong><span>个人控制台</span></div></div><span className="console-version">FarHelm <span>V0.8.0</span></span></div>
+            <div className="sider-footer"><Tooltip title={`${session.user} · 账户设置`}><Button type="text" className="account-identity" aria-label={`账户：${session.user}，打开设置`} onClick={() => go('/settings')}><Avatar shape="square">{session.user.slice(0, 1).toUpperCase()}</Avatar></Button></Tooltip><span className="console-version">V0.8.0</span></div>
           </Sider>
         )}
 

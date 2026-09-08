@@ -18,8 +18,8 @@
 .markdown-code pre { overflow: auto; max-width: 100%; padding: 16px; margin: 0; line-height: 24px; white-space: pre; }
 .markdown-table { max-width: 100%; overflow: auto; margin: 16px 0; }
 .markdown-table table { border-collapse: collapse; width: 100%; min-width: 50%; max-width: none; }
-.markdown-table th, .markdown-table td { border: 1px solid var(--farhelm-border); padding: 8px 12px; text-align: left; min-width: 100px; }
-.markdown-table th { background: var(--farhelm-raised); font-weight: 600; }
+.markdown-table th, .markdown-table td { border: 0; border-bottom: 1px solid var(--farhelm-border); padding: 12px 16px; text-align: left; min-width: 100px; }
+.markdown-table th { background: var(--farhelm-canvas); font-size: 14px; font-weight: 600; }
 .markdown-body .katex-display { max-width: 100%; overflow: auto; overflow-y: hidden; padding: 8px 0; }
 .hljs-keyword, .hljs-selector-tag, .hljs-literal { color: var(--farhelm-accent); }
 .hljs-string, .hljs-title, .hljs-number { color: var(--farhelm-text); font-weight: 600; }

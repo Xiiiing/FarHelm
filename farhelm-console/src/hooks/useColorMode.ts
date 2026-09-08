@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import type { ColorMode } from '../theme'
+import { palettes, uiFont, type ColorMode } from '../theme'
 export type ColorPreference = ColorMode | 'system'
 const STORAGE_KEY = 'farhelm-color-mode'
 function readPreference(): ColorPreference { const saved = localStorage.getItem(STORAGE_KEY); return saved === 'light' || saved === 'dark' ? saved : 'system' }
@@ -12,6 +12,12 @@ export function useColorMode() {
     media.addEventListener('change', change)
     return () => media.removeEventListener('change', change)
   }, [])
-  useEffect(() => { document.documentElement.dataset.theme = mode; document.documentElement.style.colorScheme = mode; localStorage.setItem(STORAGE_KEY, preference) }, [mode, preference])
+  useEffect(() => {
+    const root = document.documentElement
+    root.dataset.theme = mode; root.style.colorScheme = mode
+    for (const [name, value] of Object.entries(palettes[mode])) root.style.setProperty(`--farhelm-${name}`, value)
+    root.style.setProperty('--font-ui', uiFont)
+    localStorage.setItem(STORAGE_KEY, preference)
+  }, [mode, preference])
   return { mode, preference, setPreference, toggleMode: () => setPreference(mode === 'dark' ? 'light' : 'dark') }
 }
