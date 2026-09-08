@@ -45,27 +45,31 @@ export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, sess
   const position = useRef<TranscriptPosition | undefined>(undefined)
   const restoring = useRef(false)
   const anchorLocked = useRef(false)
+  const restoredTop = useRef<number | undefined>(undefined)
   const capture = useCallback(() => {
     // A new reading position supersedes callbacks from the previous layout.
     restoring.current = false
     const node = scroll.current; if (!node || follow.current) { anchor.current = undefined; return }
     const top = node.getBoundingClientRect().top
-    const first = [...node.querySelectorAll<HTMLElement>('[data-message-key]')].find((item) => item.getBoundingClientRect().bottom > top)
+    const bottom = node.getBoundingClientRect().bottom
+    const first = [...node.querySelectorAll<HTMLElement>('[data-message-key]')].find((item) => { const bounds = item.getBoundingClientRect(); return bounds.bottom > top && bounds.top < bottom })
     anchor.current = first ? { key: first.dataset.messageKey!, turn: first.closest<HTMLElement>('[data-turn-id]')?.dataset.turnId ?? '', offset: first.getBoundingClientRect().top - top } : undefined
   }, [])
   const restore = useCallback(() => {
     const node = scroll.current; if (!node) return
-    if (follow.current) { node.scrollTop = node.scrollHeight; return }
+    const move = (top: number) => { node.scrollTop = top; restoredTop.current = node.scrollTop }
+    if (follow.current) { move(node.scrollHeight); return }
     const saved = anchor.current
     if (saved) {
       const target = node.querySelector<HTMLElement>(`[data-message-key="${CSS.escape(saved.key)}"]`)
-      if (target) { node.scrollTop += target.getBoundingClientRect().top - node.getBoundingClientRect().top - saved.offset; restoring.current = false; requestAnimationFrame(() => requestAnimationFrame(() => { if (anchor.current === saved) anchorLocked.current = false })) }
+      if (target) { move(node.scrollTop + target.getBoundingClientRect().top - node.getBoundingClientRect().top - saved.offset); restoring.current = false; requestAnimationFrame(() => requestAnimationFrame(() => { if (anchor.current === saved) anchorLocked.current = false })) }
       else if (!restoring.current && position.current?.reveal(saved.turn)) {
+        restoredTop.current = node.scrollTop
         restoring.current = true
         requestAnimationFrame(() => {
           if (anchor.current !== saved) return
           const target = node.querySelector<HTMLElement>(`[data-message-key="${CSS.escape(saved.key)}"]`)
-          if (target) node.scrollTop += target.getBoundingClientRect().top - node.getBoundingClientRect().top - saved.offset
+          if (target) move(node.scrollTop + target.getBoundingClientRect().top - node.getBoundingClientRect().top - saved.offset)
           restoring.current = false
           requestAnimationFrame(() => requestAnimationFrame(() => { if (anchor.current === saved) anchorLocked.current = false }))
         })
@@ -152,7 +156,14 @@ export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, sess
       <Space size={4}><Tooltip title="刷新对话"><Button type="text" icon={<ReloadOutlined />} disabled={!id} loading={history.isFetching} onClick={() => void load()} aria-label="刷新对话" /></Tooltip><Dropdown menu={menu} trigger={['click']}><Button type="text" icon={<EllipsisOutlined />} aria-label="会话操作" /></Dropdown></Space>
     </header>
     <div className="conversation-alerts">{codexNotice && <Alert showIcon type={codex?.state === 'starting' ? 'info' : 'warning'} title={codexNotice} />}{draft.error && <Alert showIcon closable type="warning" title="指令尚未完成提交" description={draft.error} onClose={() => onDraft((old) => ({ ...old, error: undefined }))} />}{receiptError && <Alert showIcon type="warning" title="指令执行失败" description={receiptError} />}{failure && turns.length > 0 && <Alert showIcon type="warning" title="历史刷新失败，已保留当前内容" description={failure.message} action={<Button onClick={() => void load(!!moreError)}>重试</Button>} />}</div>
-    <div className="conversation-history"><div className="conversation-scroll" ref={bindScroll} onWheel={() => { anchorLocked.current = false }} onTouchMove={() => { anchorLocked.current = false }} onScroll={() => { const node = scroll.current; if (!node || restoring.current || anchorLocked.current) return; follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < 80; setAway(!follow.current); if (follow.current) setNewMessages(false); capture() }}>
+    <div className="conversation-history"><div className="conversation-scroll" ref={bindScroll} onWheel={() => { anchorLocked.current = false }} onTouchMove={() => { anchorLocked.current = false }} onScroll={() => {
+      const node = scroll.current; if (!node || restoring.current || anchorLocked.current) return
+      // A delayed scroll event from our own correction is not a new reading
+      // position. Keep the original message anchor through later measurements.
+      if (restoredTop.current !== undefined && Math.abs(node.scrollTop - restoredTop.current) < 1) return
+      restoredTop.current = undefined
+      follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < 80; setAway(!follow.current); if (follow.current) setNewMessages(false); capture()
+    }}>
       {!id ? <Welcome recent={recent} hasDraft={false} onNew={onNew} onBrowse={onBrowse} onSelect={onSelect} onPrompt={prompt} /> : loading && !page ? <div className="history-loading" role="status"><span>正在读取对话历史…</span><Skeleton active paragraph={{ rows: 5 }} /></div> : failure && !turns.length ? <Empty className="codex-empty" description={<><p>{unavailable}</p><p className="conversation-meta">{failure.message}</p></>}><Button onClick={() => void load()} icon={<ReloadOutlined />}>重试读取</Button></Empty> : page && !turns.length && session ? <Welcome session={session} recent={[]} hasDraft={!!draft.text.trim()} onNew={onNew} onBrowse={onBrowse} onSelect={onSelect} onPrompt={prompt} /> : null}
       {page?.next_cursor && !needsMessage && <Button loading={loading} className="load-earlier" onClick={() => void load(true)}>加载更早对话</Button>}
       <Transcript turns={turns} scroll={scrollElement} position={position} continuation={needsMessage ? continuation : undefined} loading={loading} onContinue={continueHistory} onAnchor={anchorInteraction} />

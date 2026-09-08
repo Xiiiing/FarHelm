@@ -43,13 +43,22 @@ export function Transcript({ turns, scroll, position, ...props }: Props) {
   // eslint-disable-next-line react-hooks/incompatible-library -- Virtualizer owns mutable measurements and must stay outside compiler memoization.
   const virtual = useVirtualizer({ count: turns.length, getScrollElement: () => scroll, getItemKey, estimateSize: () => 480, overscan: 4, enabled, scrollMargin: margin })
   useLayoutEffect(() => {
+    // Conversation owns the visible-message anchor. The library's estimate-to-size
+    // compensation would otherwise apply a second scroll adjustment (e.g. 480→234).
+    virtual.shouldAdjustScrollPositionOnItemSizeChange = () => false
+  }, [virtual])
+  useLayoutEffect(() => {
     position.current = { reveal: (turn) => {
       const index = turns.findIndex((row) => row.turn_id === turn)
       if (!enabled || index < 0) return false
-      virtual.scrollToIndex(index, { align: 'start' }); return true
+      const offset = virtual.getOffsetForIndex(index, 'start')?.[0]
+      if (!scroll || offset === undefined) return false
+      // Materialize the turn once; scrollToIndex's later reconciliation would
+      // compete with Conversation restoring the exact message/offset within it.
+      scroll.scrollTop = offset; return true
     } }
     return () => { position.current = undefined }
-  }, [turns, position, enabled, virtual])
+  }, [turns, position, enabled, virtual, scroll])
   useLayoutEffect(() => { if (container.current && scroll) setMargin(container.current.getBoundingClientRect().top - scroll.getBoundingClientRect().top + scroll.scrollTop) }, [turns.length, scroll])
   return <div className={`codex-transcript ${enabled ? 'virtual-transcript' : ''}`} ref={container} style={enabled ? { height: virtual.getTotalSize() } : undefined}>
     {enabled ? virtual.getVirtualItems().map((row) => <div key={row.key} ref={virtual.measureElement} data-index={row.index} className="virtual-turn" style={{ transform: `translateY(${row.start - margin}px)` }}><Turn {...props} turn={turns[row.index]} latest={row.index === turns.length - 1} /></div>) : turns.map((turn, index) => <Turn key={turn.turn_id} {...props} turn={turn} latest={index === turns.length - 1} />)}
