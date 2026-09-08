@@ -1,7 +1,8 @@
-import { ClockCircleOutlined, CloseCircleOutlined, DesktopOutlined, FolderOpenOutlined, LoadingOutlined, RightOutlined } from '@ant-design/icons'
+import { ClockCircleOutlined, CloseCircleOutlined, FolderOpenOutlined, LoadingOutlined } from '@ant-design/icons'
 import { Conversations } from '@ant-design/x'
-import { Button, Collapse } from 'antd'
+import { Badge, Button } from 'antd'
 import { memo, useMemo, useState } from 'react'
+import type { AgentSummary } from '../../api/agents'
 import type { CodexSession, ProjectCandidate } from '../../api/features'
 import { sessionName, stateNames } from './presentation'
 
@@ -18,34 +19,34 @@ const SessionRow = memo(function SessionRow({ id, label, state, updated, active 
   </Button>
 })
 
-export function SessionGroups({ rows, projects, selected, onSelect }: { rows: CodexSession[]; projects: ProjectCandidate[]; selected?: string; onSelect: (id: string) => void }) {
-  const [closedServers, setClosedServers] = useState<Record<string, boolean>>({})
+export function SessionGroups({ rows, projects, agents, selected, onSelect }: { rows: CodexSession[]; projects: ProjectCandidate[]; agents: AgentSummary[]; selected?: string; onSelect: (id: string) => void }) {
   const [closedProjects, setClosedProjects] = useState<Record<string, boolean>>({})
-  const servers = useMemo(() => {
-    const result = new Map<string, Map<string, CodexSession[]>>()
+  const groups = useMemo(() => {
+    const names = new Map(projects.map((project) => [JSON.stringify([project.agent_id, project.suggested_project_id]), project.display_name]))
+    const devices = new Map(agents.map((agent) => [agent.agent_id, agent]))
+    const result = new Map<string, { label: string; device: string; online?: boolean }>()
     for (const row of rows) {
-      const server = result.get(row.agent_id) ?? new Map<string, CodexSession[]>()
-      const project = server.get(row.project_id) ?? []
-      project.push(row); server.set(row.project_id, project); result.set(row.agent_id, server)
+      const key = JSON.stringify([row.agent_id, row.project_id])
+      if (result.has(key)) continue
+      const agent = devices.get(row.agent_id)
+      result.set(key, { label: names.get(key) || row.project_id, device: agent?.hostname || row.agent_id, online: agent?.online })
     }
-    return [...result].map(([id, groups]) => ({ id, groups: [...groups], rows: [...groups.values()].flat() }))
-  }, [rows])
-  return <Collapse ghost className="server-groups" activeKey={servers.filter((server) => !closedServers[server.id]).map((server) => server.id)}
-    onChange={(keys) => setClosedServers(Object.fromEntries(servers.map((server) => [server.id, !keys.includes(server.id)])))}
-    expandIcon={({ isActive }) => <RightOutlined className="disclosure-icon" rotate={isActive ? 90 : 0} />}
-    items={servers.map((server) => ({ key: server.id, className: 'server-group', label: <span className="server-heading"><DesktopOutlined /><strong>{server.id}</strong><span className="server-count">{server.rows.length}</span></span>, children:
-      <Conversations className="session-conversations" activeKey={selected} onActiveChange={onSelect}
-        groupable={{ collapsible: true,
-          expandedKeys: server.groups.filter(([group]) => !closedProjects[JSON.stringify([server.id, group])]).map(([group]) => group),
-          onExpand: (keys) => setClosedProjects((old) => ({ ...old, ...Object.fromEntries(server.groups.map(([group]) => [JSON.stringify([server.id, group]), !keys.includes(group)])) })),
-          label: (group) => {
-            const key = JSON.stringify([server.id, group])
-            const label = projects.find((project) => project.agent_id === server.id && project.suggested_project_id === group)?.display_name ?? group
-            return <Button type="text" className="session-group-heading" aria-label={`项目 ${label}`} aria-expanded={!closedProjects[key]} onClick={(event) => { event.stopPropagation(); setClosedProjects((old) => ({ ...old, [key]: !old[key] })) }}><FolderOpenOutlined /><span title={label}>{label}</span></Button>
-          },
-        }}
-        items={server.rows.map((session) => ({ key: session.session_id, group: session.project_id, className: 'session-row', label:
-          <SessionRow id={session.session_id} label={sessionName(session)} state={session.state} updated={session.updated_at_unix} active={session.session_id === selected} />,
-        }))} />,
+    return result
+  }, [rows, projects, agents])
+  return <Conversations className="session-conversations" activeKey={selected} onActiveChange={onSelect}
+    groupable={{ collapsible: true,
+      expandedKeys: [...groups.keys()].filter((key) => !closedProjects[key]),
+      onExpand: (keys) => setClosedProjects((old) => ({ ...old, ...Object.fromEntries([...groups.keys()].map((key) => [key, !keys.includes(key)])) })),
+      label: (key) => {
+        const { label, device, online } = groups.get(key)!
+        const status = online === undefined ? undefined : `设备${online ? '在线' : '离线'}`
+        return <Button type="text" className="session-group-heading" aria-label={`项目 ${label} · ${device}`} aria-description={status} aria-expanded={!closedProjects[key]} onClick={(event) => { event.stopPropagation(); setClosedProjects((old) => ({ ...old, [key]: !old[key] })) }}>
+          <FolderOpenOutlined aria-hidden /><span className="project-name" title={label}>{label}</span><span className="project-device" title={device}>{device}</span>
+          {status && <Badge status={online ? 'success' : 'default'} title={status} aria-hidden />}
+        </Button>
+      },
+    }}
+    items={rows.map((session) => ({ key: session.session_id, group: JSON.stringify([session.agent_id, session.project_id]), className: 'session-row', label:
+      <SessionRow id={session.session_id} label={sessionName(session)} state={session.state} updated={session.updated_at_unix} active={session.session_id === selected} />,
     }))} />
 }

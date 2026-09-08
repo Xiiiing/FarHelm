@@ -6,6 +6,7 @@ import { useQuery } from '@tanstack/react-query'
 import { flushSync } from 'react-dom'
 import { useSearchParams } from 'react-router-dom'
 import { fetchProjects, type CodexSession } from '../api/features'
+import type { AgentSummary } from '../api/agents'
 import { Conversation } from './codex/Conversation'
 import { CreateDialog, ScheduleDialog, SchedulesDrawer } from './codex/Dialogs'
 import { errorText } from './codex/presentation'
@@ -19,7 +20,7 @@ function ScopeFilter({ value, options, onChange }: { value?: string; options: { 
   return <Popover trigger="click" placement="bottomRight" open={open} onOpenChange={setOpen} title="会话范围" content={<div className="session-filter-popover"><label>服务器与项目</label><Select aria-label="筛选项目" showSearch allowClear optionFilterProp="label" placeholder="全部服务器与项目" value={value} onChange={(next) => { onChange(next); setOpen(false) }} options={options} /></div>}><Button type="text" className={value ? 'scope-active' : undefined} icon={<FilterOutlined />} aria-label="筛选服务器与项目" aria-expanded={open} /></Popover>
 }
 
-export function CodexPage({ csrf }: { csrf: string }) {
+export function CodexPage({ csrf, agents }: { csrf: string; agents: AgentSummary[] }) {
   const [params, setParams] = useSearchParams(); const id = params.get('session') ?? undefined
   const [query, setQuery] = useState(''); const [archive, setArchive] = useState<ArchiveFilter>('false')
   const [scope, setScope] = useState<string>(); const [railOpen, setRailOpen] = useState(false); const [collapsed, setCollapsed] = useState(false)
@@ -67,9 +68,9 @@ export function CodexPage({ csrf }: { csrf: string }) {
       if (!['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return
       const buttons = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('.session-select')].filter((button) => button.offsetParent !== null); const index = buttons.indexOf(document.activeElement as HTMLButtonElement); if (index < 0) return
       event.preventDefault(); const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1 : Math.max(0, Math.min(buttons.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1))); buttons[next]?.focus()
-    }}>{sessions.loading && !sessions.rows.length ? <Skeleton active paragraph={{ rows: 6 }} /> : sessions.rows.length ? <SessionGroups rows={sessions.rows} projects={projects} selected={id} onSelect={select} /> : !sessions.error && <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={query ? '当前范围内没有匹配的会话' : '当前范围内没有会话'} />}{sessions.cursor && <Button block loading={sessions.loading} onClick={() => void sessions.more()}>加载更多会话</Button>}</div>
+    }}>{sessions.loading && !sessions.rows.length ? <Skeleton active paragraph={{ rows: 6 }} /> : sessions.rows.length ? <SessionGroups rows={sessions.rows} projects={projects} agents={agents} selected={id} onSelect={select} /> : !sessions.error && <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={query ? '当前范围内没有匹配的会话' : '当前范围内没有会话'} />}{sessions.cursor && <Button block loading={sessions.loading} onClick={() => void sessions.more()}>加载更多会话</Button>}</div>
   </aside>
-  return <div className={`codex-workspace ${collapsed ? 'rail-collapsed' : ''}`}><div className="codex-desktop-rail">{rail}</div><Drawer className="codex-mobile-drawer" placement="left" open={railOpen} onClose={() => setRailOpen(false)} size={Math.min(320, window.innerWidth - 24)} closable={false}>{rail}</Drawer>
+  return <div className={`codex-workspace ${collapsed ? 'rail-collapsed' : ''}`}><div className="codex-desktop-rail">{rail}</div><Drawer className="codex-mobile-drawer" aria-label="项目和会话" placement="left" open={railOpen} onClose={() => setRailOpen(false)} size={Math.min(320, window.innerWidth - 24)} closable={false}>{rail}</Drawer>
     <Conversation recent={sessions.rows.slice(0, 3)} onSelect={select} onNew={newSession} onBrowse={browse} key={id ?? 'empty'} csrf={csrf} id={id} session={sessions.rows.find((s) => s.session_id === id)} draft={operations.get(id ?? '')} onDraft={(change) => { if (id) operations.update(id, change) }} onSend={(turn) => { if (id) void operations.send(id, turn) }} onRail={() => setRailOpen(true)} onCollapse={() => setCollapsed((old) => !old)} collapsed={collapsed} onSchedule={setSchedule} onSchedules={setSchedules} />
     {creating && <CreateDialog csrf={csrf} projects={projects} onClose={() => setCreating(false)} onCreated={(sessionId) => { if (sessionId) select(sessionId); void sessions.refresh() }} />}
     {schedule && <ScheduleDialog csrf={csrf} target={schedule} prompt={operations.get(schedule.session_id).text} onClose={() => setSchedule(undefined)} />}

@@ -127,7 +127,7 @@ Browser commands and schedules are acknowledged after Agent persistence. Failed 
 
 ## Codex workspace
 
-Desktop global navigation and mobile bottom navigation remain visible in Codex. Project groups collapse, and sessions use formal names or a temporary first-user-message summary. Search covers all imported sessions in the selected scope; offline Agents are clearly marked as incomplete results. Summaries and search results never enter Hub databases, logs, or notification titles.
+Desktop global navigation and mobile bottom navigation remain visible in Codex. Sessions collapse by project, with the device name beside each project; same-named projects on different devices remain separate. Sessions use formal names or a temporary first-user-message summary. Search covers all imported sessions in the selected scope; offline Agents are clearly marked as incomplete results. Summaries and search results never enter Hub databases, logs, or notification titles.
 
 Assistant replies support Markdown tables, code copying, math, and safe HTTPS links. Execution details in each turn form a collapsed group with visible failures. The composer stays visible, and reading older content does not jump to the bottom on new messages. Large-message continuation is separate from loading earlier conversations. Switching sessions immediately displays cached history and retains each draft; failed refreshes preserve visible content. Inactive body and parsing caches total at most 32 MiB, with at most 20 inactive histories, and are cleared on logout. Steer and interrupt target the visible active turn.
 

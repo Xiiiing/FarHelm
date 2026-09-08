@@ -70,7 +70,7 @@ function FeatureRoutes({ csrf, preference, onPreference, onLogout }: { csrf: str
       <Route path="/agents" element={<AgentListPage csrf={csrf} agents={agents} onRefresh={refreshAgents} />} />
       <Route path="/experiments" element={<ExperimentPage />} />
       <Route path="/jobs" element={<Navigate to="/experiments" replace />} />
-      <Route path="/codex" element={<Suspense fallback={codexFallback}><CodexPage csrf={csrf} /></Suspense>} />
+      <Route path="/codex" element={<Suspense fallback={codexFallback}><CodexPage csrf={csrf} agents={agents.data?.agents ?? []} /></Suspense>} />
       <Route path="/notifications" element={<NotificationPage csrf={csrf} />} />
       <Route path="/audit" element={<AuditPage />} />
       <Route path="/settings" element={<SettingsPage csrf={csrf} preference={preference} onPreference={onPreference} onLogout={onLogout} />} />

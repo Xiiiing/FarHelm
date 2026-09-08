@@ -33,21 +33,15 @@
 .active-session-scope > span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .active-session-scope .ant-btn { min-width: 44px; color: inherit; }
 .codex-session-groups { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; margin: 0 -4px; padding: 0 2px; }
-.server-groups.ant-collapse { background: transparent; }
-.server-group { margin-bottom: 16px; }
-.server-groups .ant-collapse-header { min-height: 44px; align-items: center !important; padding: 8px 4px !important; }
-.server-groups .ant-collapse-expand-icon { padding-inline-end: 8px !important; }
-.server-groups .ant-collapse-content-box, .server-groups .ant-collapse-body { padding: 0 !important; }
-.server-heading { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.server-heading > .anticon { color: var(--farhelm-muted); font-size: 15px; }
-.server-heading strong { overflow: hidden; text-overflow: ellipsis; font-size: 13px; font-weight: 600; }
-.server-count { margin-left: auto; color: var(--farhelm-muted); font: 12px/20px ui-monospace, monospace; }
-.disclosure-icon svg { transition: transform var(--motion-enter) var(--ease-out); }
 .session-conversations { padding: 0 !important; background: transparent; }
-.session-conversations .ant-conversations-group-title { min-height: 44px; padding: 0 8px !important; }
-.session-group-heading.ant-btn { min-width: 0; min-height: 44px; height: auto; padding: 4px 0; text-align: left; color: var(--farhelm-muted); font-size: 13px; }
-.session-group-heading > span:last-child { overflow: hidden; text-overflow: ellipsis; }
-.session-conversations .ant-conversations-list { border-left: 1px solid var(--farhelm-border-soft); margin-left: 16px; padding-left: 6px; gap: 2px; }
+.session-conversations .ant-conversations-group-title { min-height: 44px; padding: 0 4px !important; gap: 4px; }
+.session-conversations .ant-conversations-group-label { flex: 1; min-width: 0; }
+.session-group-heading.ant-btn { display: flex; justify-content: flex-start; width: 100%; min-width: 0; min-height: 44px; height: auto; padding: 4px 0; gap: 8px; text-align: left; color: var(--farhelm-text); font-size: 13px; }
+.session-group-heading > .anticon { color: var(--farhelm-muted); flex: none; }
+.session-group-heading .project-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
+.session-group-heading .project-device { flex-shrink: 0; max-width: 38%; overflow: hidden; text-overflow: ellipsis; color: var(--farhelm-muted); font-size: 12px; font-weight: 400; }
+.session-group-heading .ant-badge { flex: none; }
+.session-conversations .ant-conversations-list { margin-left: 12px; padding-left: 4px; gap: 2px; }
 .session-conversations .session-row { height: auto; min-height: 44px; position: relative; margin: 2px 0; padding: 0 !important; border-radius: 8px; }
 .session-conversations .session-row:hover { background: var(--farhelm-raised) !important; }
 .session-conversations .ant-conversations-item-active { background: var(--farhelm-accent-soft) !important; }
