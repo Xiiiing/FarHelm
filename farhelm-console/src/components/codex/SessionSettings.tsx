@@ -4,7 +4,7 @@ import { useQuery } from '@tanstack/react-query'
 import { cloneElement, useEffect, useState, type ReactElement, type ReactNode } from 'react'
 import { fetchModels, type CodexSession, type SessionContext, type ModelChoice } from '../../api/features'
 
-function SettingsPopover({ title, placement, content, children }: { title: string; placement: 'topLeft' | 'topRight'; content: ReactNode; children: ReactElement<{ 'aria-expanded'?: boolean }> }) {
+function SettingsPopover({ title, content, children }: { title: string; content: ReactNode; children: ReactElement<{ 'aria-expanded'?: boolean }> }) {
   const [open, setOpen] = useState(false)
   useEffect(() => {
     if (!open) return
@@ -12,7 +12,7 @@ function SettingsPopover({ title, placement, content, children }: { title: strin
     document.addEventListener('keydown', dismiss)
     return () => document.removeEventListener('keydown', dismiss)
   }, [open])
-  return <Popover trigger="click" open={open} onOpenChange={setOpen} placement={placement} title={title} content={content} destroyOnHidden fresh>{cloneElement(children, { 'aria-expanded': open })}</Popover>
+  return <Popover trigger="click" open={open} onOpenChange={setOpen} placement="top" title={title} content={content} destroyOnHidden fresh>{cloneElement(children, { 'aria-expanded': open })}</Popover>
 }
 
 const efforts: Record<string, string> = { none: '无', minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高', ultra: '超高' }
@@ -32,7 +32,7 @@ export function ModelPicker({ context, session, choice, onChange, supported, sen
     document.addEventListener('keydown', dismiss)
     return () => document.removeEventListener('keydown', dismiss)
   }, [open])
-  return <Popover trigger="click" placement="topRight" title="模型与推理强度" open={open} onOpenChange={setOpen} destroyOnHidden content={<div className="model-picker session-settings-details">
+  return <Popover trigger="click" placement="top" title="模型与推理强度" open={open} onOpenChange={setOpen} destroyOnHidden content={<div className="model-picker session-settings-details">
     {!supported ? <p>请升级 Agent 后使用模型切换。当前模型由服务器 Codex 管理。</p> : models.isPending ? <Skeleton active paragraph={{ rows: 2 }} title={false} /> : models.error ? <Alert type="warning" showIcon title="可用模型暂时无法读取" action={<Button onClick={() => void models.refetch()}>重试</Button>} /> : <>
       <label htmlFor="codex-model-select">模型</label>
       <Select id="codex-model-select" aria-label="选择模型" showSearch={{ optionFilterProp: 'label' }} value={model} placeholder="选择服务器提供的模型" disabled={sending} options={models.data?.models.map(m => ({ value: m.model, label: m.display_name }))} onChange={value => {
@@ -64,7 +64,7 @@ export function PermissionDetails({ context, session, supported }: { context?: S
   const permission = sandbox ? permissions[sandbox] : undefined
   const name = permission?.name ?? '跟随 Codex'
   const approval = legacy ? 'on-request' : context?.approval_policy
-  return <SettingsPopover placement="topLeft" title="会话权限" content={<div className="session-settings-details">
+  return <SettingsPopover title="会话权限" content={<div className="session-settings-details">
     <p>{permission?.description ?? '沿用这条会话在服务器上的 Codex 权限。发送时由 Codex 恢复设置，确认后在这里显示具体权限。'}</p>
     {approval && <dl><dt>审批方式</dt><dd>{approvals[approval] ?? '由 Codex 管理'}</dd>{context?.approvals_reviewer && <><dt>审批处理</dt><dd>{context.approvals_reviewer === 'user' ? '由用户确认' : 'Codex 自动审查'}</dd></>}</dl>}
     <p className="settings-detail-note">{legacy ? '当前 Agent 使用旧的权限逻辑，请升级 Agent 后使用会话权限继承。' : '权限由服务器上的 Codex 管理，此处展示实际设置。'}</p>

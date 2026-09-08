@@ -127,6 +127,26 @@ test('model choices use native options, remain per session and freeze retry sett
   expect(requests[1]).toEqual(requests[0])
 })
 
+test('model and permission popovers stay inside narrow viewports', async ({ page }) => {
+  await setup(page)
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+  await page.goto('/codex?session=s')
+  for (const width of [390, 320]) {
+    await page.setViewportSize({ width, height: 640 })
+    for (const name of [/会话模型：/, /会话权限：/]) {
+      await page.getByRole('button', { name }).click()
+      const popup = page.locator('.ant-popover:visible')
+      await expect(popup.locator('.session-settings-details')).toBeVisible()
+      await expect.poll(async () => {
+        const bounds = await popup.boundingBox()
+        return !!bounds && bounds.x >= 0 && bounds.y >= 0 && bounds.x + bounds.width <= width && bounds.y + bounds.height <= 640
+      }).toBe(true)
+      await page.keyboard.press('Escape')
+      await expect(popup).toHaveCount(0)
+    }
+  }
+})
+
 test('native identity exposes the same thread and renames only after server completion', async ({ page }) => {
   await setup(page)
   const names: string[] = []
