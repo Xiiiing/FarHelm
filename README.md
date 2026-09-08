@@ -4,14 +4,14 @@
   <p><strong>面向个人科研与 GPU 训练环境的远程控制平面</strong></p>
   <p>从手机查看训练服务器状态，并在不开放训练机入站端口的前提下安全扩展远程控制能力。</p>
   <p>
-    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.10.0">V0.10.0</a> ·
+    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.11.0">V0.11.0</a> ·
     <a href="./deploy/README.md">部署文档</a> ·
     <a href="./README.en.md">English</a>
   </p>
 </div>
 
 > [!IMPORTANT]
-> `V0.10.0` 支持选择原生 Codex 模型与推理强度、重命名和核对跨端会话，改善聊天字体、阅读布局和输入区。继续使用 Rust Agent、常驻本机 Codex 和出站 WSS，保留原生权限、实验上报、定时任务与页面通知。
+> `V0.11.0` 补齐项目与会话流程：导入已发现项目、接入已有目录、创建空项目、多项目展示、账号同步偏好，以及原生会话归档与恢复。已有安装先在 Hub 执行 `sudo farhelm-hub update`，再由原用户在各台 Agent 执行 `farhelm-agent update`，无需重新配对。本版迁移至 schema 8，旧版程序不能直接回退运行。
 
 ## 快速安装
 
@@ -202,3 +202,21 @@ make test-release
 FarHelm 使用 [Apache License 2.0](LICENSE)。
 
 直接使用的界面组件与缓存依赖固定版本，许可见[第三方声明](farhelm-console/public/third-party-notices.txt)。
+
+## 项目与会话管理（V0.11.0）
+
+在服务器授权一次项目父目录，然后在网页的“项目管理”中选择“导入已发现项目”“接入已有目录”或“创建空项目”：
+
+```sh
+farhelm-agent project roots add /srv/projects --name Projects
+farhelm-agent project roots list
+farhelm-agent project roots remove <root-id>
+```
+
+根目录授权只允许浏览、接入和创建其下目录；撤销后停止后续目录操作，已接入项目授权保持独立。真实路径只留在 Agent，网页提交临时目录 ID。空项目不需要先产生 Codex 历史，接入成功与历史同步分别反馈，失败时可单独重试同步。
+
+项目栏覆盖全部已接入项目，支持空项目及项目内新建会话。“展示管理”可全选、取消全选、隐藏、恢复、置顶或修改 FarHelm 显示名称，设置按账号在手机和电脑间同步。新项目默认展示；置顶优先，其余按最近会话活动排序。隐藏、筛选和折叠保留当前会话、URL 与草稿；搜索默认覆盖展示项目的全部会话索引，也可包含隐藏项目。
+
+会话菜单提供重命名、归档和恢复。归档同步到原生 Codex，并包含派生子会话；确认前显示影响范围，存在未授权项目、未保存会话、活动任务、排队输入或待触发调度时拒绝执行。恢复保持原 ID 和历史，仅恢复选中会话。完整影响范围检查需要原生 Codex 0.153.4 或以上版本。非 Git 项目或无有效提交时禁用隔离工作区；不包含 Git 初始化、克隆、目录移动或删除。
+
+本版使用 schema 8，保留已有项目、会话、收据和授权，协议仍为 `farhelm/1`。旧 Agent 会提示升级；旧程序拒绝打开新版数据库。不要恢复旧数据库快照来回退执行记录。

@@ -74,6 +74,13 @@ enum CommandKind {
         #[command(subcommand)]
         command: ExperimentCommand,
     },
+    /// Authorize local project containers for the Console.
+    Project {
+        #[arg(long, env = "FARHELM_AGENT_CONFIG")]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        command: ProjectCommand,
+    },
     /// Inspect Codex sessions available to an approved project.
     Codex {
         #[command(subcommand)]
@@ -127,6 +134,51 @@ enum CommandKind {
         #[arg(long)]
         keep_data: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum ProjectCommand {
+    /// Root removal only revokes future browsing and registration.
+    Roots {
+        #[command(subcommand)]
+        command: ProjectRootCommand,
+    },
+}
+#[derive(Subcommand)]
+enum ProjectRootCommand {
+    Add {
+        path: PathBuf,
+        #[arg(long)]
+        name: String,
+    },
+    List,
+    Remove {
+        id: String,
+    },
+}
+fn project_command(config: Option<PathBuf>, command: ProjectCommand) -> Result<()> {
+    let config = load_local_config(config)?;
+    let store = ExperimentStore::open(&config.agent.database)?;
+    match command {
+        ProjectCommand::Roots { command } => match command {
+            ProjectRootCommand::Add { path, name } => {
+                println!(
+                    "Authorized project root: {}",
+                    store.add_project_root(&path, &name)?
+                );
+            }
+            ProjectRootCommand::List => {
+                println!("{}", serde_json::to_string_pretty(&store.project_roots()?)?);
+            }
+            ProjectRootCommand::Remove { id } => {
+                store.remove_project_root(&id)?;
+                println!(
+                    "Root authorization removed; imported projects retain their existing authorization."
+                );
+            }
+        },
+    }
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -296,6 +348,7 @@ async fn main() -> Result<()> {
             let runtime = resolve_runtime(connection, None, None, database)?;
             command_poll_once(&runtime).await
         }
+        CommandKind::Project { config, command } => project_command(config, command),
         CommandKind::Experiment { command } => experiment_command(command),
         CommandKind::Codex { command } => codex_command(command).await,
         CommandKind::Install { no_service } => management::install(no_service).await,
@@ -436,6 +489,7 @@ async fn run(
             "Codex turns interrupted by the previous Agent exit were marked orphaned"
         );
     }
+    experiment_store.recover_project_creations(unix_time())?;
     let orphaned_remote = experiment_store.orphan_running_remote_commands(unix_time())?;
     if orphaned_remote > 0 {
         warn!(
@@ -678,9 +732,28 @@ fn approved_project_sections(
 }
 
 async fn discover_projects(database: &Path, codex: &codex::Codex) -> Result<()> {
-    let value = codex
-        .call("codex.projects.discover", serde_json::json!({}))
+    codex
+        .recover_archives(&ExperimentStore::open_async(database).await?)
         .await?;
+    let _activity = codex.activity().await;
+    let value = match codex
+        .call("codex.projects.discover", serde_json::json!({}))
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            let store = ExperimentStore::open_async(database).await?;
+            store
+                .background(|s| {
+                    for id in s.approved_projects()?.keys() {
+                        s.set_project_sync(id, "failed", unix_time())?;
+                    }
+                    Ok(())
+                })
+                .await?;
+            return Err(error);
+        }
+    };
     let database = database.to_owned();
     runtime_tasks::blocking(move || {
     let projects = value
@@ -775,6 +848,9 @@ async fn discover_projects(database: &Path, codex: &codex::Codex) -> Result<()> 
             session["archived"].as_bool().unwrap_or(false),
             updated,
         )?;
+    }
+    for (id,project) in store.approved_projects()? {
+        store.set_project_sync(&id,if fs::canonicalize(project.path).is_ok(){"ready"}else{"failed"},unix_time())?;
     }
     Ok(())
     }).await
@@ -1436,6 +1512,24 @@ async fn execute_remote_command(
                 "codex.turn.failed"
             };
             let error_detail = [
+                "project_root_revoked",
+                "project_root_is_container",
+                "project_directory_expired",
+                "project_directory_changed",
+                "project_directory_unavailable",
+                "project_directory_permission",
+                "project_invalid_name",
+                "project_name_conflict",
+                "project_creation_unconfirmed",
+                "project_candidate_missing",
+                "project_history_sync_failed",
+                "project_not_approved",
+                "codex_session_archived",
+                "codex_archive_busy",
+                "codex_archive_unverified",
+                "codex_archive_changed",
+                "codex_archive_unapproved",
+                "codex_archive_unsaved",
                 "codex_session_in_use",
                 "model_choice_unavailable",
                 "codex_handoff_busy",
@@ -1492,45 +1586,52 @@ async fn execute_remote_command_inner(
 ) -> Result<serde_json::Value> {
     let handoff =
         command.action == CommandAction::CodexSessionResume && command.payload["handoff"] == true;
-    let _activity = if handoff {
+    let _activity = if handoff
+        || matches!(
+            command.action,
+            CommandAction::ProjectApprove
+                | CommandAction::ProjectAdd
+                | CommandAction::CodexSessionArchive
+                | CommandAction::CodexSessionUnarchive
+        ) {
         None
     } else {
         Some(worker_runtime.codex.activity().await)
     };
     if command.action == CommandAction::ProjectApprove {
-        let candidate_ids = command
-            .payload
-            .get("candidate_ids")
-            .and_then(serde_json::Value::as_array)
-            .context("project approval omitted candidate_ids")?
-            .iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .map(str::to_owned)
-                    .context("project candidate ID must be a string")
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let now = unix_time();
-        let approved = store.approve_candidates(&candidate_ids, now)?;
-        for project in &approved {
-            store.enqueue_event(
-                &format!("project:{}:approved:{now}", project.candidate_id),
-                "project.updated",
-                &serde_json::json!({"candidate_id":project.candidate_id,"display_name":project.display_name,"suggested_project_id":project.suggested_project_id,"session_count":project.session_count,"state":"approved","updated_at_unix":now}),
-                now,
-            )?;
-            sync_project_sessions(
-                store.path(),
-                &worker_runtime.codex,
-                &project.suggested_project_id,
-                &project.path,
-            )
-            .await?;
-        }
-        return Ok(
-            serde_json::json!({"approved": approved.iter().map(|project| project.candidate_id.as_str()).collect::<Vec<_>>() }),
-        );
+        let ids: Vec<String> = serde_json::from_value(command.payload["candidate_ids"].clone())?;
+        let id = command.command_id.clone();
+        return store
+            .background(move |s| s.approve_project_command(&id, &ids, unix_time()))
+            .await;
+    }
+    if command.action == CommandAction::ProjectAdd {
+        let id = command.command_id.clone();
+        let payload = command.payload.clone();
+        return store
+            .background(move |s| s.add_project_command(&id, &payload, unix_time()))
+            .await;
+    }
+    if command.action == CommandAction::ProjectSync {
+        let project_id = command.payload["project_id"]
+            .as_str()
+            .context("project_not_approved")?;
+        let project = projects.get(project_id).context("project_not_approved")?;
+        store.set_project_sync(project_id, "pending", unix_time())?;
+        let outcome = sync_project_sessions(
+            store.path(),
+            &worker_runtime.codex,
+            project_id,
+            &project.path,
+        )
+        .await;
+        store.set_project_sync(
+            project_id,
+            if outcome.is_ok() { "ready" } else { "failed" },
+            unix_time(),
+        )?;
+        outcome.map_err(|_| anyhow::anyhow!("project_history_sync_failed"))?;
+        return Ok(serde_json::json!({"project_id":project_id}));
     }
     let project_id = command
         .payload
@@ -1548,6 +1649,25 @@ async fn execute_remote_command_inner(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("inspect");
     match command.action {
+        CommandAction::CodexSessionArchive | CommandAction::CodexSessionUnarchive => {
+            let session_id = command.payload["session_id"]
+                .as_str()
+                .context("codex_archive_unapproved")?;
+            let binding = store
+                .session_binding(session_id)?
+                .context("codex_archive_unapproved")?;
+            ensure!(binding.project_id == project_id, "codex_archive_unapproved");
+            worker_runtime
+                .codex
+                .archive_session(
+                    store,
+                    &command.command_id,
+                    session_id,
+                    command.action == CommandAction::CodexSessionArchive,
+                    command.payload["fingerprint"].as_str(),
+                )
+                .await
+        }
         CommandAction::CodexSessionResume if handoff => {
             let session_id = command.payload["session_id"]
                 .as_str()
@@ -1576,7 +1696,7 @@ async fn execute_remote_command_inner(
                     serde_json::json!({"session_id":session_id,"name":name}),
                 )
                 .await?;
-            store.enqueue_event(&format!("{}:rename",command.command_id), "codex.session.updated", &serde_json::json!({"session_id":session_id,"project_id":project_id,"mode":binding.mode,"state":"idle","title":name,"active_turn_id":null,"update_kind":"metadata","updated_at_unix":unix_time()}), unix_time())?;
+            store.enqueue_event(&format!("{}:rename",command.command_id), "codex.session.updated", &serde_json::json!({"session_id":session_id,"project_id":project_id,"mode":binding.mode,"state":"idle","title":name,"active_turn_id":null,"update_kind":"name","updated_at_unix":unix_time()}), unix_time())?;
             Ok(result)
         }
         CommandAction::CodexSessionCreate | CommandAction::CodexSessionResume => {
@@ -1641,6 +1761,7 @@ async fn execute_remote_command_inner(
                 .and_then(serde_json::Value::as_str)
                 .context("command omitted session_id")?
                 .to_owned();
+            store.check_session_writable(&session_id)?;
             let prompt = command
                 .payload
                 .get("prompt")
@@ -1690,7 +1811,9 @@ async fn execute_remote_command_inner(
             Ok(serde_json::json!({"schedule_id":schedule_id,"cancelled":true}))
         }
         CommandAction::AgentProbe => bail!("probe reached Codex executor"),
-        CommandAction::ProjectApprove => unreachable!("project approval returned above"),
+        CommandAction::ProjectApprove | CommandAction::ProjectAdd | CommandAction::ProjectSync => {
+            unreachable!("project command returned above")
+        }
     }
 }
 
@@ -2106,7 +2229,32 @@ async fn read_request(
     store: &ExperimentStore,
     request: farhelm_protocol::AgentReadRequest,
 ) -> Result<AgentReadReportRequest> {
-    let outcome = if matches!(
+    let outcome = if request.method.starts_with("project.") {
+        let method = request.method.clone();
+        let params = request.params.clone();
+        store
+            .background(move |s| match method.as_str() {
+                "project.roots" => Ok(serde_json::to_value(s.project_roots()?)?),
+                "project.directories" => Ok(serde_json::to_value(
+                    s.browse_projects(
+                        params["directory_id"]
+                            .as_str()
+                            .context("project_directory_expired")?,
+                        params["cursor"].as_str(),
+                        unix_time(),
+                    )?,
+                )?),
+                "project.info" => Ok(serde_json::to_value(
+                    s.project_info(
+                        params["project_id"]
+                            .as_str()
+                            .context("project_not_approved")?,
+                    )?,
+                )?),
+                _ => bail!("unsupported_project_read"),
+            })
+            .await
+    } else if matches!(
         request.method.as_str(),
         "codex.session.history" | "codex.models.list" | "codex.session.native"
     ) {
@@ -2140,6 +2288,15 @@ async fn read_request(
                     farhelm_protocol::CodexTranscriptPage,
                 >(value)?)?),
             })
+    } else if request.method == "codex.session.archive_preview" {
+        let id = request.params["session_id"]
+            .as_str()
+            .context("codex_archive_unapproved")?;
+        ensure!(
+            store.session_binding(id)?.is_some(),
+            "codex_archive_unapproved"
+        );
+        serde_json::to_value(worker.codex.archive_preview(store, id).await?).map_err(Into::into)
     } else if request.method == "codex.session.display" {
         let ids: Option<Vec<String>> = request
             .params
@@ -2151,9 +2308,24 @@ async fn read_request(
             .get("project_id")
             .and_then(serde_json::Value::as_str);
         let project = project.map(str::to_owned);
-        let bindings = store
+        let allowed: Option<Vec<String>> = request
+            .params
+            .get("allowed_projects")
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()?;
+        let mut bindings = store
             .background(move |s| s.display_bindings(project.as_deref(), ids.as_deref()))
             .await?;
+        if let Some(allowed) = allowed {
+            bindings
+                .as_object_mut()
+                .context("invalid display bindings")?
+                .retain(|_, v| {
+                    v["project_id"]
+                        .as_str()
+                        .is_some_and(|p| allowed.iter().any(|a| a == p))
+                });
+        }
         let mut params = request.params;
         params["bindings"] = bindings;
         params["agent_id"] = serde_json::json!(hub.agent_id);
@@ -2190,7 +2362,9 @@ async fn read_request(
             ok: false,
             data: None,
             detail: Some(
-                if error.to_string().contains("not_configured") {
+                if let Some(code) = experiment_store::projects::public_error(&error) {
+                    code
+                } else if error.to_string().contains("not_configured") {
                     "codex_not_configured"
                 } else {
                     "codex_read_failed"

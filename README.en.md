@@ -4,14 +4,14 @@
   <p><strong>A remote control plane for personal research and GPU training environments</strong></p>
   <p>See training-host status from your phone and safely extend remote control without exposing inbound ports on training machines.</p>
   <p>
-    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.10.0">V0.10.0</a> ·
+    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.11.0">V0.11.0</a> ·
     <a href="./deploy/README.en.md">Deployment guide</a> ·
     <a href="./README.md">简体中文</a>
   </p>
 </div>
 
 > [!IMPORTANT]
-> `V0.10.0` adds native Codex model and reasoning-effort selection, session renaming and native identity checks, and improves chat typography, reading layout, and the composer. The Rust Agent, persistent local Codex, outbound WSS, native permissions, experiment reports, schedules, and browser notifications remain in place.
+> `V0.11.0` completes project and session workflows: discovered-project import, existing-directory attachment, empty-project creation, multiple visible projects, account-synced preferences, and native session archive/restore. Upgrade existing installations with `sudo farhelm-hub update` on Hub first, then `farhelm-agent update` as the original user on each Agent; no re-pairing is needed. This version migrates to schema 8, which older binaries cannot open for a direct rollback.
 
 ## Quick install
 
@@ -202,3 +202,21 @@ make test-release
 FarHelm is licensed under the [Apache License 2.0](LICENSE).
 
 Direct UI and cache dependencies use fixed versions; see the [third-party notices](farhelm-console/public/third-party-notices.txt).
+
+## Project and session management (V0.11.0)
+
+Authorize a project parent directory once on the server, then use Project Management in the browser to import discovered projects, attach an existing directory, or create an empty project:
+
+```sh
+farhelm-agent project roots add /srv/projects --name Projects
+farhelm-agent project roots list
+farhelm-agent project roots remove <root-id>
+```
+
+Root authorization grants browsing, attachment, and creation below that root. Revocation stops subsequent directory operations; existing project authorizations remain independent. Real paths stay on the Agent and the browser submits temporary directory IDs. Empty projects require no prior Codex history. Registration and history synchronization have separate outcomes; failed synchronization can be retried independently.
+
+The project rail covers all registered projects, including empty ones, with project-specific session creation. Display Management supports select all, deselect all, hide, restore, pin, and FarHelm display names. Preferences synchronize between phones and computers for the same account. New projects appear by default; pinned projects come first, followed by recent session activity. Hiding, filtering, and collapsing preserve the current session, URL, and draft. Search covers the full session index of visible projects by default, with an option to include hidden projects.
+
+Session actions include rename, archive, and restore. Native Codex archive includes spawned descendants; confirmation shows the affected sessions. Unapproved projects, unsaved sessions, active tasks, queued input, or pending schedules prevent execution. Restore retains the original ID and history and restores only the selected session. Complete impact checks require native Codex 0.153.4 or later. Isolated worktrees are unavailable without a valid Git commit. Git initialization, cloning, directory moves, and deletion are outside this version.
+
+This version uses schema 8 while retaining existing projects, sessions, receipts, and authorizations. The protocol remains `farhelm/1`. Older Agents show an upgrade prompt, and older binaries refuse the newer database. Never restore an old database snapshot to roll back execution records.

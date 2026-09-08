@@ -1,5 +1,201 @@
 use super::*;
 
+#[tokio::test]
+async fn archive_checks_subtree_then_preserves_ids_and_shared_gates() {
+    use crate::experiment_store::ExperimentStore;
+    use farhelm_protocol::{AgentCommand, CommandAction, FARHELM_PROTOCOL};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    std::fs::create_dir(&root).unwrap();
+    let unauthorized = temp.path().join("unauthorized");
+    std::fs::create_dir(&unauthorized).unwrap();
+    let saved = temp.path().join("saved.jsonl");
+    std::fs::write(&saved, b"synthetic history").unwrap();
+    let bin = temp.path().join("native");
+    let control = temp.path().join("control");
+    std::fs::write(&control, b"idle").unwrap();
+    let script = r#"#!/usr/bin/python3
+import sys,json,pathlib
+if '--version' in sys.argv: print('codex-cli 0.153.4');sys.exit()
+statefile=pathlib.Path(CONTROL+'.json')
+archived=set(json.loads(statefile.read_text())) if statefile.exists() else set()
+def row(id):
+ mode=pathlib.Path(CONTROL).read_text()
+ return dict(id=id,cwd=UNAUTHORIZED if id=='child' and mode=='unauthorized' else ROOT,name=None,parentThreadId=None if id=='root' else 'root',updatedAt=2 if mode=='changed' else 1,ephemeral=mode=='unsaved',path=SAVED,status={'type':'notLoaded' if id in archived else 'active' if id=='child' and mode=='active' else 'idle'})
+for line in sys.stdin:
+ q=json.loads(line)
+ if 'id' not in q:continue
+ m=q.get('method');p=q.get('params',{});result={}
+ if m=='initialize':result={'userAgent':'fixture'}
+ elif m=='account/read':result={'requiresOpenaiAuth':False,'account':None}
+ elif m=='thread/read':result={'thread':row(p['threadId'])}
+ elif m=='thread/list':
+  if 'subAgentThreadSpawn' not in p.get('sourceKinds',[]):
+   print(json.dumps({'id':q['id'],'error':{'code':-32600,'message':'incomplete source range'}}),flush=True);continue
+  ids=['child'] if p.get('ancestorThreadId') else ['root','child']
+  result={'data':[row(id) for id in ids if (id in archived)==p.get('archived',False)],'nextCursor':None}
+ elif m=='thread/queue/list' and p['threadId'] in archived:
+  print(json.dumps({'id':q['id'],'error':{'code':-32600,'message':'archived'}}),flush=True);continue
+ elif m in ['thread/backgroundTerminals/list','thread/queue/list']:
+  busy=(m=='thread/queue/list' and pathlib.Path(CONTROL).read_text()=='queued') or (m=='thread/backgroundTerminals/list' and pathlib.Path(CONTROL).read_text()=='background')
+  result={'data':[{'id':'pending'}] if busy and p['threadId']=='child' else [],'nextCursor':None}
+ elif m=='thread/archive':
+  archived.update(['root','child']);statefile.write_text(json.dumps(list(archived)))
+  if pathlib.Path(CONTROL).read_text()=='disconnect':sys.exit(1)
+ elif m=='thread/unarchive':archived.discard(p['threadId']);statefile.write_text(json.dumps(list(archived)))
+ print(json.dumps({'id':q['id'],'result':result}),flush=True)
+"#;
+    transport::write_fixture_executable(
+        &bin,
+        &script
+            .replace("ROOT", &json!(root).to_string())
+            .replace("UNAUTHORIZED", &json!(unauthorized).to_string())
+            .replace("SAVED", &json!(saved).to_string())
+            .replace("CONTROL", &json!(control).to_string()),
+    );
+    let store = ExperimentStore::open(&temp.path().join("agent.db")).unwrap();
+    let (candidate, _) = store
+        .upsert_discovered_project(&root, "Project", "p", 2, 1)
+        .unwrap();
+    store
+        .approve_candidates(&[candidate.candidate_id], 2)
+        .unwrap();
+    store
+        .bind_session("root", "p", &root, "inspect", 2)
+        .unwrap();
+    let native = Codex::new(Some(bin.clone()));
+    assert_eq!(native.index(true).await.unwrap().len(), 2);
+    for (mode, expected) in [
+        ("active", "busy"),
+        ("queued", "busy"),
+        ("background", "busy"),
+        ("unauthorized", "unapproved"),
+        ("unsaved", "unsaved"),
+    ] {
+        std::fs::write(&control, mode).unwrap();
+        let error = native.archive_preview(&store, "root").await.unwrap_err();
+        assert!(error.to_string().contains(expected), "{mode}: {error:#}");
+        assert!(store.pending_archives().unwrap().is_empty());
+    }
+    std::fs::write(&control, b"idle").unwrap();
+    let preview = native.archive_preview(&store, "root").await.unwrap();
+    assert_eq!(preview.session_ids, vec!["root", "child"]);
+    std::fs::write(&control, b"changed").unwrap();
+    assert_ne!(
+        native
+            .archive_preview(&store, "root")
+            .await
+            .unwrap()
+            .fingerprint,
+        preview.fingerprint
+    );
+    std::fs::write(&control, b"idle").unwrap();
+    let claim = |id: &str, action| {
+        store
+            .receive_remote_command(
+                &AgentCommand {
+                    protocol: FARHELM_PROTOCOL.into(),
+                    agent_id: "a".into(),
+                    command_id: id.into(),
+                    action,
+                    created_at_unix: 10,
+                    expires_at_unix: 1000,
+                    payload: Some(json!({"session_id":"root","project_id":"p"})),
+                },
+                10,
+            )
+            .unwrap();
+        store.mark_remote_accepted_reported(id, 10).unwrap();
+        assert!(store.claim_remote_command(id, 11).unwrap());
+    };
+    claim("pending-input", CommandAction::CodexTurnStart);
+    assert!(
+        native
+            .archive_preview(&store, "root")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("busy")
+    );
+    store
+        .finish_remote_command(
+            "pending-input",
+            farhelm_protocol::CommandState::Failed,
+            None,
+            Some("synthetic-cancel"),
+            11,
+        )
+        .unwrap();
+    store.create_schedule(&json!({"schedule_id":"later","project_id":"p","session_id":"root","prompt":"synthetic","trigger":{"type":"at_time","run_at_unix":100}}),10).unwrap();
+    assert!(
+        native
+            .archive_preview(&store, "root")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("busy")
+    );
+    store.cancel_schedule("later", 11).unwrap();
+    // Unrelated reads/turns must not prevent archiving this idle subtree.
+    let _unrelated = native.activity().await;
+    claim("archive", CommandAction::CodexSessionArchive);
+    native
+        .archive_session(&store, "archive", "root", true, Some(&preview.fingerprint))
+        .await
+        .unwrap();
+    assert!(store.check_session_writable("root").is_err());
+    assert!(store.check_session_writable("child").is_err());
+    assert!(store.pending_archives().unwrap().is_empty());
+    assert!(store.create_schedule(&json!({"schedule_id":"denied","project_id":"p","session_id":"child","prompt":"synthetic","trigger":{"type":"at_time","run_at_unix":100}}),12).is_err());
+    claim("restore", CommandAction::CodexSessionUnarchive);
+    native
+        .archive_session(&store, "restore", "root", false, None)
+        .await
+        .unwrap();
+    store.check_session_writable("root").unwrap();
+    assert!(store.check_session_writable("child").is_err());
+    assert_eq!(
+        store.remote_receipt("restore").unwrap().data.unwrap()["session_id"],
+        "root"
+    );
+    assert!(
+        !serde_json::to_string(&store.pending_events("a", 50).unwrap())
+            .unwrap()
+            .contains(root.to_str().unwrap())
+    );
+    drop(_unrelated);
+    let preview = native.archive_preview(&store, "root").await.unwrap();
+    claim("interrupted-archive", CommandAction::CodexSessionArchive);
+    std::fs::write(&control, b"disconnect").unwrap();
+    assert!(
+        native
+            .archive_session(
+                &store,
+                "interrupted-archive",
+                "root",
+                true,
+                Some(&preview.fingerprint)
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(store.pending_archives().unwrap().len(), 1);
+    assert_eq!(store.orphan_running_remote_commands(20).unwrap(), 0);
+    let reopened = ExperimentStore::open(&temp.path().join("agent.db")).unwrap();
+    let resumed = Codex::new(Some(bin));
+    resumed.recover_archives(&reopened).await.unwrap();
+    assert_eq!(
+        reopened
+            .remote_receipt("interrupted-archive")
+            .unwrap()
+            .state,
+        farhelm_protocol::CommandState::Completed
+    );
+    assert!(reopened.pending_archives().unwrap().is_empty());
+    resumed.shutdown().await;
+    native.shutdown().await;
+}
+
 fn fixture(directory: &std::path::Path, version: &str) -> PathBuf {
     let path = directory.join("codex");
     let script = r#"#!/bin/sh

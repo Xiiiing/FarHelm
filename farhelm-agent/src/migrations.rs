@@ -1,4 +1,4 @@
-//! The only schema-version owner for this role. Older binaries refuse version 7.
+//! The only schema-version owner for this role. Older binaries refuse version 8.
 use anyhow::{Result, ensure};
 use rusqlite::Connection;
 pub(crate) fn write_transaction(
@@ -9,8 +9,14 @@ pub(crate) fn write_transaction(
 pub fn apply(connection: &Connection) -> Result<()> {
     let tx = write_transaction(connection)?;
     let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    ensure!(version <= 7, "database schema is newer than this binary");
+    ensure!(version <= 8, "database schema is newer than this binary");
+    if version == 8 {
+        return Ok(());
+    }
     if version == 7 {
+        crate::experiment_store::projects::migrate(&tx)?;
+        tx.pragma_update(None, "user_version", 8)?;
+        tx.commit()?;
         return Ok(());
     }
     tx.execute_batch(
@@ -102,7 +108,8 @@ pub fn apply(connection: &Connection) -> Result<()> {
         )?;
     crate::experiment_store::ensure_remote_command_columns(&tx)?;
     crate::experiment_store::execution::migrate(&tx)?;
-    tx.pragma_update(None, "user_version", 7)?;
+    crate::experiment_store::projects::migrate(&tx)?;
+    tx.pragma_update(None, "user_version", 8)?;
     tx.commit()?;
     Ok(())
 }

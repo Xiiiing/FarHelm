@@ -381,22 +381,30 @@ impl EventStore {
         })
     }
 
-    pub fn sessions(
+    pub(crate) fn sessions_visible(
         &self,
         project: Option<&str>,
         archived: ArchiveFilter,
         agent: Option<&str>,
         offset: usize,
         limit: usize,
+        visibility: Option<(&str, u64)>,
     ) -> Result<CodexSessionListResponse> {
         let connection = self.lock()?;
+        if let Some((user, expected)) = visibility {
+            let actual:i64=connection.query_row("SELECT COALESCE((SELECT revision FROM project_preference_revisions WHERE user=?1),0)",[user],|r|r.get(0))?;
+            ensure!(
+                u64::try_from(actual)? == expected,
+                "project_preferences_conflict"
+            );
+        }
         let archive_clause = match archived {
             ArchiveFilter::Current => " AND state!='archived'",
             ArchiveFilter::Archived => " AND state='archived'",
             ArchiveFilter::All => "",
         };
         let sql = format!(
-            "SELECT session_id,agent_id,project_id,mode,state,title,active_turn_id,updated_at_unix,COALESCE((SELECT MAX(revision) FROM projection_revisions WHERE entity_id IN ('session:'||agent_id||':'||session_id||':metadata','session:'||agent_id||':'||session_id||':execution','session:'||agent_id||':'||session_id||':title')),0) FROM codex_sessions WHERE (?1 IS NULL OR project_id=?1) AND (?2 IS NULL OR agent_id=?2){archive_clause} ORDER BY updated_at_unix DESC,session_id DESC LIMIT ?3 OFFSET ?4"
+            "SELECT session_id,agent_id,project_id,mode,state,title,active_turn_id,updated_at_unix,COALESCE((SELECT MAX(revision) FROM projection_revisions WHERE entity_id IN ('session:'||agent_id||':'||session_id||':metadata','session:'||agent_id||':'||session_id||':execution','session:'||agent_id||':'||session_id||':title')),0) FROM codex_sessions WHERE (?1 IS NULL OR project_id=?1) AND (?2 IS NULL OR agent_id=?2) AND (?5 IS NULL OR NOT EXISTS(SELECT 1 FROM project_preferences p WHERE p.user=?5 AND p.agent_id=codex_sessions.agent_id AND p.project_id=codex_sessions.project_id AND p.hidden=1)){archive_clause} ORDER BY updated_at_unix DESC,session_id DESC LIMIT ?3 OFFSET ?4"
         );
         let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map(
@@ -404,7 +412,8 @@ impl EventStore {
                 project,
                 agent,
                 i64::try_from(limit + 1)?,
-                i64::try_from(offset)?
+                i64::try_from(offset)?,
+                visibility.map(|v| v.0)
             ],
             |row| {
                 Ok(CodexSessionSummary {
@@ -611,7 +620,7 @@ impl EventStore {
         Ok(())
     }
 
-    fn lock(&self) -> Result<MutexGuard<'_, Connection>> {
+    pub(crate) fn lock(&self) -> Result<MutexGuard<'_, Connection>> {
         self.connection
             .lock()
             .map_err(|_| anyhow!("Hub event database lock was poisoned"))
@@ -668,12 +677,18 @@ fn apply_materialized_view(
             }
             let session: CodexSessionSummary =
                 serde_json::from_value(value).context("invalid Codex session event")?;
-            let metadata =
-                event.payload.get("update_kind").and_then(Value::as_str) == Some("metadata");
+            let rename = event.payload["update_kind"] == "name";
+            let metadata = rename || event.payload["update_kind"] == "metadata";
             let dimension = if metadata { "metadata" } else { "execution" };
             let revision_key = format!("session:{agent_id}:{}:{dimension}", session.session_id);
             if connection.execute("INSERT INTO projection_revisions VALUES(?1,?2) ON CONFLICT(entity_id) DO UPDATE SET revision=excluded.revision WHERE excluded.revision>projection_revisions.revision", params![revision_key,as_i64(event.sequence)?])? == 0 {
                 return Ok(());
+            }
+            if event.payload["update_kind"] == "lifecycle" {
+                for dimension in ["metadata", "execution"] {
+                    let key = format!("session:{agent_id}:{}:{dimension}", session.session_id);
+                    connection.execute("INSERT INTO projection_revisions VALUES(?1,?2) ON CONFLICT(entity_id) DO UPDATE SET revision=MAX(revision,excluded.revision)",params![key,as_i64(event.sequence)?])?;
+                }
             }
             let title = session
                 .title
@@ -683,14 +698,14 @@ fn apply_materialized_view(
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
                  ON CONFLICT(session_id) DO UPDATE SET
                  mode=CASE WHEN ?9 THEN codex_sessions.mode ELSE excluded.mode END,
-                 state=CASE WHEN NOT ?9 THEN excluded.state
+                 state=CASE WHEN ?10 THEN codex_sessions.state WHEN NOT ?9 THEN excluded.state
                    WHEN codex_sessions.state IN ('creating','queued','running','interrupting') THEN codex_sessions.state
                    WHEN excluded.state='archived' THEN 'archived'
                    WHEN codex_sessions.state='archived' THEN 'idle' ELSE codex_sessions.state END,
                  active_turn_id=CASE WHEN ?9 THEN codex_sessions.active_turn_id ELSE excluded.active_turn_id END,
                  updated_at_unix=MAX(codex_sessions.updated_at_unix,excluded.updated_at_unix)
                  WHERE codex_sessions.agent_id=excluded.agent_id",
-                params![session.session_id,agent_id,session.project_id,mode_name(session.mode),session_state_name(session.state),title,session.active_turn_id,as_i64(session.updated_at_unix)?,metadata],
+                params![session.session_id,agent_id,session.project_id,mode_name(session.mode),session_state_name(session.state),title,session.active_turn_id,as_i64(session.updated_at_unix)?,metadata,rename],
             )?;
             if let Some(title) = title {
                 let key = format!("session:{agent_id}:{}:title", session.session_id);
@@ -730,7 +745,11 @@ fn apply_materialized_view(
                 params![schedule.schedule_id,agent_id,schedule.session_id,schedule.project_id,serde_json::to_string(&schedule.trigger)?,schedule_state_name(schedule.state),as_i64(schedule.created_at_unix)?,as_i64(schedule.updated_at_unix)?],
             )?;
         }
+        "project.sync.updated" => {
+            update_project_sync(connection, agent_id, event)?;
+        }
         "project.discovered" | "project.updated" => {
+            update_project_sync(connection, agent_id, event)?;
             if event.event_type == "project.updated" {
                 notifications::audit(
                     connection,
@@ -785,7 +804,7 @@ fn apply_materialized_view(
             connection.execute(
                 "INSERT INTO project_candidates (candidate_id,agent_id,display_name,suggested_project_id,session_count,state,updated_at_unix)
                  VALUES (?1,?2,?3,?4,?5,?6,?7)
-                 ON CONFLICT(candidate_id) DO UPDATE SET display_name=excluded.display_name,suggested_project_id=excluded.suggested_project_id,session_count=excluded.session_count,state=excluded.state,updated_at_unix=excluded.updated_at_unix
+                 ON CONFLICT(candidate_id) DO UPDATE SET display_name=excluded.display_name,suggested_project_id=excluded.suggested_project_id,session_count=excluded.session_count,state=CASE WHEN project_candidates.state='approved' THEN 'approved' ELSE excluded.state END,updated_at_unix=excluded.updated_at_unix
                  WHERE project_candidates.agent_id=excluded.agent_id AND excluded.updated_at_unix>=project_candidates.updated_at_unix",
                 params![candidate_id,agent_id,display_name,suggested_project_id,as_i64(session_count)?,state,as_i64(updated_at_unix)?],
             )?;
@@ -888,6 +907,18 @@ fn parse_mode(value: &str) -> rusqlite::Result<CodexSessionMode> {
         _ => Err(rusqlite::Error::InvalidQuery),
     }
 }
+fn update_project_sync(connection: &Connection, agent: &str, event: &AgentEvent) -> Result<()> {
+    if let Some(state) = event.payload["sync_state"].as_str() {
+        ensure!(
+            matches!(state, "pending" | "ready" | "failed"),
+            "invalid project sync state"
+        );
+        let project = required_string(&event.payload, "suggested_project_id")?;
+        connection.execute("INSERT INTO project_sync_status VALUES(?1,?2,?3,?4) ON CONFLICT(agent_id,project_id) DO UPDATE SET state=excluded.state,revision=excluded.revision WHERE excluded.revision>=project_sync_status.revision",params![agent,project,state,as_i64(event.sequence)?])?;
+    }
+    Ok(())
+}
+
 const fn session_state_name(state: CodexSessionState) -> &'static str {
     match state {
         CodexSessionState::Creating => "creating",

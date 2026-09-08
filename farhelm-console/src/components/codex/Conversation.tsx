@@ -12,6 +12,8 @@ import type { SessionDraft } from './useOperations'
 import { useAgents } from '../../hooks/useAgents'
 import { ModelPicker, PermissionDetails } from './SessionSettings'
 import { NativeSession, RenameSession } from './NativeSession'
+import { ArchiveDialog } from './ArchiveDialog'
+import { useProjects } from '../../hooks/useProjects'
 
 const ComposerInput = forwardRef<ComponentRef<typeof Input.TextArea>, ComponentProps<typeof Input.TextArea>>((props, ref) => <Input.TextArea {...props} variant="borderless" ref={ref} aria-label="给 Codex 发送指令" maxLength={32768} />)
 const senderComponents = { input: ComposerInput }
@@ -23,13 +25,16 @@ export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, sess
   const session = metadata.data ? { ...listed, ...metadata.data, display_label: listed?.display_label ?? display.data?.sessions[0]?.display_label ?? metadata.data.display_label } : listed
   const { agents } = useAgents()
   const agent = agents.state === 'ready' ? agents.data.agents.find((agent) => agent.agent_id === session?.agent_id) : undefined
+  const projects = useProjects(csrf)
+  const project = projects.approved.find((p) => p.agent_id === session?.agent_id && p.suggested_project_id === session?.project_id)
+  const hidden = project && projects.preference(project).hidden
   const codex = agent?.codex
   const codexNotice = agent?.online && codex && codex.state !== 'ready' ? codex.state === 'starting' ? 'Codex 正在初始化，实验上报正常运行' : codex.state === 'login_required' ? '请在服务器上登录 Codex，登录后会自动检查连接' : codex.reason === 'codex_not_configured' || codex.reason === 'codex_not_found' || codex.reason === 'codex_configured_binary_unavailable' ? '未找到已配置的 Codex，请在服务器运行 farhelm-agent codex configure 后重启 Agent' : 'Codex 暂时不可用，正在重新检查连接；可在服务器运行 farhelm-agent doctor 查看原因' : undefined
   const history = useQuery({ queryKey: keys.history(id ?? ''), enabled: !!id, staleTime: 0, refetchOnMount: 'always', queryFn: async ({ signal }) => cacheHistory(id!, await fetchTranscript(id!, undefined, signal)) })
   const page = history.data; const turns = page?.turns ?? []
   const [readingMore, setReadingMore] = useState(false)
   const [modal, modalHolder] = Modal.useModal()
-  const [sessionDialog, setSessionDialog] = useState<'rename' | 'native'>()
+  const [sessionDialog, setSessionDialog] = useState<'rename' | 'native' | 'archive'>()
   const [moreError, setMoreError] = useState<Error>()
   const [newMessages, setNewMessages] = useState(false)
   const [away, setAway] = useState(false)
@@ -128,8 +133,8 @@ export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, sess
   const continuation = page?.continuation
   const needsMessage = continuation?.kind === 'message' && !turns.some((t) => t.turn_id === continuation.turn_id && t.items.some((i) => i.item_id === continuation.item_id && i.text_complete))
   const nativeIdentity = !!session && !!agent?.capabilities?.includes('codex.native_identity')
-  const menu = { items: [{ key: 'rename', label: '重命名会话', disabled: !nativeIdentity }, { key: 'native', label: '在原生 Codex 中继续', disabled: !nativeIdentity }, { key: 'schedules', icon: <CalendarOutlined />, label: '定时任务', disabled: !session }, { key: 'copy', icon: <CopyOutlined />, label: '复制会话 ID', disabled: !id }], onClick: ({ key }: { key: string }) => {
-    if (key === 'rename' || key === 'native') setSessionDialog(key)
+  const menu = { items: [{ key: 'archive', label: session?.state === 'archived' ? '恢复会话' : '归档会话', disabled: !session || !agent?.online || !agent.capabilities?.includes('codex.session_archive') }, { key: 'rename', label: '重命名会话', disabled: !nativeIdentity || session?.state === 'archived' }, { key: 'native', label: '在原生 Codex 中继续', disabled: !nativeIdentity || session?.state === 'archived' }, { key: 'schedules', icon: <CalendarOutlined />, label: '定时任务', disabled: !session || session.state === 'archived' }, { key: 'copy', icon: <CopyOutlined />, label: '复制会话 ID', disabled: !id }], onClick: ({ key }: { key: string }) => {
+    if (key === 'rename' || key === 'native' || key === 'archive') setSessionDialog(key)
     if (key === 'schedules' && session) onSchedules(session)
     if (key === 'copy' && id) void navigator.clipboard.writeText(id).catch(() => onDraft((old) => ({ ...old, error: `复制失败，会话 ID：${id}` })))
   } }
@@ -138,6 +143,7 @@ export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, sess
   const receiptError = receiptFailed ? codexOperationError(lastReceipt?.detail) : undefined
   const prompt = (text: string) => { onDraft((old) => old.text.trim() ? old : { ...old, text }); sender.current?.focus({ preventScroll: true, cursor: 'end' }) }
   const submit = () => {
+    if (session?.state === 'archived') return
     // An explicit send returns to the latest turn; background deltas keep the reading anchor.
     follow.current = true; anchor.current = undefined; anchorLocked.current = false
     setAway(false); setNewMessages(false)
@@ -145,6 +151,7 @@ export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, sess
   }
   return <section className={`codex-conversation ${!id ? 'conversation-unselected' : ''}`}>
     {modalHolder}
+    {session && sessionDialog === 'archive' && <ArchiveDialog session={session} csrf={csrf} onClose={() => setSessionDialog(undefined)} />}
     {session && sessionDialog === 'rename' && <RenameSession session={session} csrf={csrf} onClose={() => setSessionDialog(undefined)} />}
     {session && sessionDialog === 'native' && <NativeSession session={session} csrf={csrf} onClose={() => setSessionDialog(undefined)} onRename={() => setSessionDialog('rename')} />}
     <header className="conversation-head">
@@ -155,7 +162,7 @@ export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, sess
       </div>
       <Space size={4}><Tooltip title="刷新对话"><Button type="text" icon={<ReloadOutlined />} disabled={!id} loading={history.isFetching} onClick={() => void load()} aria-label="刷新对话" /></Tooltip><Dropdown menu={menu} trigger={['click']}><Button type="text" icon={<EllipsisOutlined />} aria-label="会话操作" /></Dropdown></Space>
     </header>
-    <div className="conversation-alerts">{codexNotice && <Alert showIcon type={codex?.state === 'starting' ? 'info' : 'warning'} title={codexNotice} />}{draft.error && <Alert showIcon closable type="warning" title="指令尚未完成提交" description={draft.error} onClose={() => onDraft((old) => ({ ...old, error: undefined }))} />}{receiptError && <Alert showIcon type="warning" title="指令执行失败" description={receiptError} />}{failure && turns.length > 0 && <Alert showIcon type="warning" title="历史刷新失败，已保留当前内容" description={failure.message} action={<Button onClick={() => void load(!!moreError)}>重试</Button>} />}</div>
+    <div className="conversation-alerts">{hidden && <Alert type="info" title="当前会话所属项目已隐藏，草稿已保留" action={<Button disabled={projects.save.isPending} onClick={() => projects.save.mutate([{ ...projects.preference(project), hidden: false }])}>恢复项目显示</Button>} />}{projects.save.error && <Alert type="warning" title={errorText(projects.save.error)} />}{session?.state === 'archived' && <Alert type="info" title="会话已归档，恢复后可继续对话" action={<Button onClick={() => setSessionDialog('archive')}>恢复会话</Button>} />}{codexNotice && <Alert showIcon type={codex?.state === 'starting' ? 'info' : 'warning'} title={codexNotice} />}{draft.error && <Alert showIcon closable type="warning" title="指令尚未完成提交" description={draft.error} onClose={() => onDraft((old) => ({ ...old, error: undefined }))} />}{receiptError && <Alert showIcon type="warning" title="指令执行失败" description={receiptError} />}{failure && turns.length > 0 && <Alert showIcon type="warning" title="历史刷新失败，已保留当前内容" description={failure.message} action={<Button onClick={() => void load(!!moreError)}>重试</Button>} />}</div>
     <div className="conversation-history"><div className="conversation-scroll" ref={bindScroll} onWheel={() => { anchorLocked.current = false }} onTouchMove={() => { anchorLocked.current = false }} onScroll={() => {
       const node = scroll.current; if (!node || restoring.current || anchorLocked.current) return
       // A delayed scroll event from our own correction is not a new reading
@@ -171,12 +178,12 @@ export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, sess
       {visibleTurn && <div className="response-activity" role="status"><ActivityIndicator /><span>{turns.some((turn) => turn.items.some((item) => item.streaming)) ? 'Codex 正在回复' : 'Codex 正在处理'}<small>你可以继续编写下一条指令</small></span></div>}
     </div><Button className="jump-to-bottom" icon={<ArrowDownOutlined aria-hidden />} hidden={!away && !newMessages} onClick={() => { follow.current = true; anchor.current = undefined; restore(); setNewMessages(false); setAway(false) }}>{newMessages ? '有新消息 · 回到底部' : '回到底部'}</Button></div>
     {id && <footer className="composer-wrap">
-      <Sender ref={sender} className={`composer ${draft.text.trim() ? 'has-draft' : ''} ${draft.sending ? 'is-submitting' : ''}`} components={senderComponents} value={draft.text} onChange={(value) => onDraft((old) => ({ ...old, text: value }))} autoSize={{ minRows: 1, maxRows: 5 }} placeholder={session ? '描述下一步，或提出问题…' : '正在读取会话…'} disabled={!session || failureCode === 'session_not_found'} onSubmit={submit} onKeyDown={(event) => { if (event.nativeEvent.isComposing || event.keyCode === 229) return false }} suffix={false} footer={(_, { components: { SendButton } }) => <>
+      <Sender ref={sender} className={`composer ${draft.text.trim() ? 'has-draft' : ''} ${draft.sending ? 'is-submitting' : ''}`} components={senderComponents} value={draft.text} onChange={(value) => onDraft((old) => ({ ...old, text: value }))} autoSize={{ minRows: 1, maxRows: 5 }} placeholder={session ? '描述下一步，或提出问题…' : '正在读取会话…'} disabled={!session || session.state === 'archived' || failureCode === 'session_not_found'} onSubmit={submit} onKeyDown={(event) => { if (event.nativeEvent.isComposing || event.keyCode === 229) return false }} suffix={false} footer={(_, { components: { SendButton } }) => <>
         {visibleTurn && <div className="active-turn-controls"><Radio.Group className="delivery-options" aria-label="活动会话发送方式" value={draft.delivery} onChange={(event) => onDraft((old) => ({ ...old, delivery: event.target.value as 'queue' | 'steer' }))}><Radio value="queue">排队下一轮</Radio><Radio value="steer">补充当前对话</Radio></Radio.Group><Tooltip title="中断当前对话"><Button danger type="text" icon={<StopOutlined />} onClick={interrupt} aria-label="中断" /></Tooltip></div>}
         <div className="composer-actions">
-          <div className="composer-tools"><PermissionDetails context={page?.context} session={session} supported={agent ? agent.capabilities?.includes('codex.session_context') ?? false : undefined} /><Tooltip title="定时发送"><Button type="text" className="composer-control schedule-action" icon={<ClockCircleOutlined />} disabled={!session} onClick={() => session && onSchedule(session)} aria-label="定时发送" /></Tooltip></div>
+          <div className="composer-tools"><PermissionDetails context={page?.context} session={session} supported={agent ? agent.capabilities?.includes('codex.session_context') ?? false : undefined} /><Tooltip title="定时发送"><Button type="text" className="composer-control schedule-action" icon={<ClockCircleOutlined />} disabled={!session || session.state === 'archived'} onClick={() => session && onSchedule(session)} aria-label="定时发送" /></Tooltip></div>
           <div className="composer-submit"><ModelPicker context={page?.context} session={session} choice={draft.model_choice} sending={draft.sending} steer={!!visibleTurn && draft.delivery === 'steer'} supported={!!agent?.capabilities?.includes('codex.model_choice')} onChange={choice => onDraft(old => ({ ...old, model_choice: choice }))} />
-          <SendButton className="send-action" shape="default" type="primary" icon={<ArrowUpOutlined />} loading={draft.sending} disabled={!session || !draft.text.trim() || draft.sending} aria-label="发送指令"><span className="sr-only">发送</span></SendButton>
+          <SendButton className="send-action" shape="default" type="primary" icon={<ArrowUpOutlined />} loading={draft.sending} disabled={!session || session.state === 'archived' || !draft.text.trim() || draft.sending} aria-label="发送指令"><span className="sr-only">发送</span></SendButton>
           </div>
         </div>
       </>} />

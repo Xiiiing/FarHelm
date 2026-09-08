@@ -1,12 +1,12 @@
 import { Alert, Button, Drawer, Form, Input, List, Modal, Checkbox, Popconfirm, Segmented, Select, Tag } from 'antd'
 import { useEffect, useRef, useState } from 'react'
-import { cancelSchedule, createSchedule, createSession, fetchExperiments, fetchSchedules, waitForCommand, type CodexSession, type ProjectCandidate } from '../../api/features'
+import { cancelSchedule, createSchedule, createSession, fetchExperiments, fetchSchedules, fetchProjectInfo, waitForCommand, type CodexSession, type ProjectCandidate } from '../../api/features'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { queryClient } from '../../api/cache'
 import { errorText, sessionName, stateNames } from './presentation'
 import { useAgents } from '../../hooks/useAgents'
 
-export function CreateDialog({ csrf, projects, onClose, onCreated }: { csrf: string; projects: ProjectCandidate[]; onClose: () => void; onCreated: (sessionId?: string) => void }) {
+export function CreateDialog({ csrf, projects, initialProject, onClose, onCreated }: { csrf: string; projects: ProjectCandidate[]; initialProject?: ProjectCandidate; onClose: () => void; onCreated: (sessionId?: string) => void }) {
   const [error, setError] = useState<string>(); const [busy, setBusy] = useState(false)
   const [form] = Form.useForm<{ project: string; isolated: boolean }>()
   const selectedKey = Form.useWatch('project', form)
@@ -14,20 +14,23 @@ export function CreateDialog({ csrf, projects, onClose, onCreated }: { csrf: str
   const project = projects.find((p) => projectKey(p) === selectedKey && p.state === 'approved')
   const { agents } = useAgents()
   const supportsNative = agents.state === 'ready' && agents.data.agents.find((a) => a.agent_id === project?.agent_id)?.capabilities?.includes('codex.session_context')
+  const info = useQuery({ queryKey: ['project-info', project?.agent_id, project?.suggested_project_id], enabled: !!project, queryFn: ({ signal }) => fetchProjectInfo(project!.agent_id, project!.suggested_project_id, signal), staleTime: 0 })
   const active = useRef(true)
   useEffect(() => { active.current = true; return () => { active.current = false } }, [])
-  return <Modal title="创建 Codex 会话" open onCancel={onClose} footer={null}><Form className="create-session-form" form={form} layout="vertical" initialValues={{ isolated: false }} onFinish={async (values) => {
+  return <Modal title="创建 Codex 会话" open onCancel={onClose} footer={null}><Form className="create-session-form" form={form} layout="vertical" initialValues={{ isolated: false, project: initialProject ? projectKey(initialProject) : undefined }} onFinish={async (values) => {
     if (!project || busy || !supportsNative) return
     setBusy(true); setError(undefined)
     try {
-      const result = await waitForCommand(await createSession(csrf, project.agent_id, project.suggested_project_id, values.isolated ? 'edit' : 'inspect', true))
+      const result = await waitForCommand(await createSession(csrf, project.agent_id, project.suggested_project_id, values.isolated && info.data?.can_create_worktree ? 'edit' : 'inspect', true))
       if (active.current) { onCreated(result.data?.session_id ?? result.result?.session_id); onClose() }
     } catch (e) { if (active.current) setError(errorText(e)) } finally { if (active.current) setBusy(false) }
   }}>
     {error && <Alert type="error" showIcon title={error} />}
     <Form.Item label="项目" name="project" rules={[{ required: true }]}><Select options={projects.filter((p) => p.state === 'approved').map((p) => ({ value: projectKey(p), label: `${p.display_name} · ${p.agent_id}` }))} /></Form.Item>
     <p className="settings-detail-note">模型和权限跟随服务器上的 Codex 项目配置。</p>
-    <Form.Item name="isolated" valuePropName="checked" extra="单独的 Git 工作区，适合希望与当前项目修改分开的任务。"><Checkbox>使用隔离工作区</Checkbox></Form.Item>
+    <Form.Item name="isolated" valuePropName="checked" extra="单独的 Git 工作区，适合希望与当前项目修改分开的任务。"><Checkbox disabled={!info.data?.can_create_worktree}>使用隔离工作区</Checkbox></Form.Item>
+    {info.error && <Alert type="warning" title="项目状态读取失败" description={errorText(info.error)} action={<Button onClick={() => void info.refetch()}>重试</Button>} />}
+    {project && !info.error && !info.isPending && !info.data?.can_create_worktree && <p className="settings-detail-note">当前项目没有可用的 Git 提交，隔离工作区不可用。</p>}
     {project && !supportsNative && <Alert showIcon type="warning" title="请升级此 Agent 后使用原生会话权限" />}
     <Button type="primary" htmlType="submit" loading={busy} disabled={!supportsNative} block>创建会话</Button>
   </Form></Modal>

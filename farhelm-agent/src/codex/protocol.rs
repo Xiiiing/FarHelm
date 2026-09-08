@@ -32,13 +32,26 @@ pub struct GetAccountResponse {
     pub account: Option<Value>,
 }
 
+pub const THREAD_SOURCES: [&str; 10] = [
+    "cli",
+    "vscode",
+    "exec",
+    "appServer",
+    "subAgent",
+    "subAgentReview",
+    "subAgentCompact",
+    "subAgentThreadSpawn",
+    "subAgentOther",
+    "unknown",
+];
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadListParams {
     pub archived: bool,
     pub limit: u32,
     pub cursor: Option<String>,
-    pub source_kinds: [&'static str; 5],
+    pub source_kinds: [&'static str; 10],
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]

@@ -14,13 +14,14 @@ async function setup(page: Page) {
   })
   await page.route('**/api/v1/**', (route) => {
     const path = new URL(route.request().url()).pathname
+    if (path.endsWith('/project-preferences')) return route.fulfill({ json: { revision: 0, projects: [] } })
     if (path.endsWith('/auth/session')) return route.fulfill({ json: { authenticated: true, user: 'admin', csrf_token: 'test-csrf', expires_at_unix: 2000000000 } })
     if (path.endsWith('/agents')) return route.fulfill({ json: { protocol: 'farhelm/1', agents: [{ agent_id: 'gpu-a', hostname: 'TITAN', agent_version: '0.8.0', online: true, last_seen_unix: 2000000000, capabilities: ['codex.session_context'] }] } })
     if (path.endsWith('/codex/sessions')) return route.fulfill({ json: { protocol: 'farhelm/1', sessions: model.sessions } })
     if (path.endsWith('/session-display')) return route.fulfill({ json: { protocol: 'farhelm/1', sessions: model.sessions.map((s) => ({ ...s, display_label: s.session_id === 'ses-a' ? '训练结果分析' : '另一个会话' })), incomplete_agents: [] } })
     if (path.endsWith('/transcript')) { model.historyReads++; return route.fulfill({ status: model.historyStatus, json: model.historyStatus !== 200 ? { error: model.historyError } : path.includes('ses-b') ? { session_id: 'ses-b', turns: [turn('另一会话的回复')] } : model.history }) }
     if (path.includes('/codex/sessions/')) return route.fulfill({ json: model.sessions.find((s) => path.endsWith(s.session_id)) ?? {} })
-    if (path.endsWith('/projects')) return route.fulfill({ json: { protocol: 'farhelm/1', projects: [] } })
+    if (path.endsWith('/projects')) return route.fulfill({ json: { protocol: 'farhelm/1', projects: [{ candidate_id: 'project-a', agent_id: 'gpu-a', suggested_project_id: 'cc08', display_name: 'cc08', state: 'approved', session_count: 2 }] } })
     if (path.endsWith('/experiments')) return route.fulfill({ json: { protocol: 'farhelm/1', experiments: [] } })
     if (path.includes('/schedules')) return route.fulfill({ json: { protocol: 'farhelm/1', schedules: [] } })
     if (path.endsWith('/notifications/preferences')) return route.fulfill({ json: { experiments: true, codex: true } })
@@ -67,7 +68,7 @@ test('projects group sessions across devices and collapse independently without 
   const model = await setup(page)
   model.sessions.push({ ...session('ses-c'), agent_id: 'gpu-b', title: '另一台服务器的会话' })
   model.sessions.push({ ...session('ses-d'), project_id: 'vision', title: '另一个项目的会话' })
-  await page.route('**/api/v1/projects', (route) => route.fulfill({ json: { protocol: 'farhelm/1', projects: ['gpu-a', 'gpu-b'].map((agent_id) => ({ candidate_id: agent_id, agent_id, suggested_project_id: 'cc08', display_name: '共享项目', state: 'approved' })) } }))
+  await page.route('**/api/v1/projects', (route) => route.fulfill({ json: { protocol: 'farhelm/1', projects: [...['gpu-a', 'gpu-b'].map((agent_id, index) => ({ candidate_id: agent_id, agent_id, suggested_project_id: 'cc08', display_name: '共享项目', state: 'approved', last_activity_unix: 100 - index })), { candidate_id: 'vision', agent_id: 'gpu-a', suggested_project_id: 'vision', display_name: 'vision', state: 'approved' }] } }))
   await page.route('**/api/v1/agents', (route) => route.fulfill({ json: { protocol: 'farhelm/1', agents: ['gpu-a', 'gpu-b'].map((agent_id, index) => ({ agent_id, hostname: index ? '3090' : 'TITAN', agent_version: '0.8.0', last_seen_unix: 2000000000, online: !index, credential_state: 'paired' })) } }))
   await page.goto('/codex?session=ses-a')
   await expect(page.locator('.conversation-title')).toContainText('训练结果分析')
@@ -145,7 +146,7 @@ test('project scope popover closes after selection and preserves the active draf
   const rail = page.getByRole('complementary', { name: '项目和会话' }).filter({ visible: true })
   await rail.getByRole('button', { name: '筛选服务器与项目' }).click()
   await page.getByLabel('筛选项目').click()
-  const scoped = page.waitForRequest((request) => request.url().endsWith('/session-display') && request.postDataJSON()?.mode === 'search' && request.postDataJSON()?.agent_id === 'gpu-a' && request.postDataJSON()?.project_id === 'cc08')
+  const scoped = page.waitForRequest((request) => new URL(request.url()).pathname.endsWith('/codex/sessions') && new URL(request.url()).searchParams.get('agent') === 'gpu-a' && new URL(request.url()).searchParams.get('project') === 'cc08')
   await page.getByText('gpu-a / 训练项目', { exact: true }).click()
   await scoped
   await expect(rail.locator('.active-session-scope')).toContainText('gpu-a / 训练项目')

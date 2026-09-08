@@ -1,4 +1,5 @@
 //! Local Codex is the transcript/authentication authority. No vendor body is a Hub record.
+mod archive;
 mod context;
 mod handoff;
 pub mod history;
@@ -53,6 +54,7 @@ struct Inner {
     loaded: RwLock<HashMap<String, LoadedThread>>,
     models: Mutex<Option<(Instant, farhelm_protocol::CodexModelList)>>,
     activity: RwLock<()>,
+    lifecycle: Mutex<()>,
 }
 struct LoadedThread {
     thread: Value,
@@ -78,6 +80,7 @@ impl Codex {
                 loaded: RwLock::new(HashMap::new()),
                 models: Mutex::new(None),
                 activity: RwLock::new(()),
+                lifecycle: Mutex::new(()),
                 status: watch::channel(CodexStatus {
                     state: "starting".into(),
                     version: None,
@@ -298,7 +301,7 @@ impl Codex {
                             archived,
                             limit: 100,
                             cursor: cursor.as_str().map(str::to_owned),
-                            source_kinds: ["cli", "vscode", "exec", "appServer", "unknown"],
+                            source_kinds: THREAD_SOURCES,
                         })?,
                     )
                     .await?;

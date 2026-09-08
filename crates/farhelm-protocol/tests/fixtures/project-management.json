@@ -1,0 +1,8 @@
+{
+  "roots": { "roots": [{ "directory_id": "rtd_0123456789abcdef0123456789abcdef", "name": "Projects" }] },
+  "directory": { "directory": { "directory_id": "dir_0123456789abcdef0123456789abcdef", "name": "Empty" }, "parent_id": "rtd_0123456789abcdef0123456789abcdef", "entries": [], "next_cursor": null },
+  "create": { "kind": "create", "agent_id": "gpu-a", "directory_id": "rtd_0123456789abcdef0123456789abcdef", "name": "Empty" },
+  "preferences": { "revision": 1, "projects": [{ "agent_id": "gpu-a", "project_id": "empty", "display_name": "Research", "hidden": true, "pinned": false }] },
+  "preview": { "session_ids": ["session-a", "child-a"], "fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "can_archive": true, "reason": null },
+  "command": { "protocol": "farhelm/1", "command_id": "archive-a", "agent_id": "gpu-a", "action": "codex.session.archive", "created_at_unix": 10, "expires_at_unix": 130, "payload": { "session_id": "session-a", "project_id": "empty", "fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" } }
+}

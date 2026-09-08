@@ -54,7 +54,7 @@ function updateSession(payload: Partial<CodexSession> & { update_kind?: string }
     if (!old && (!payload.agent_id || !payload.project_id || !payload.mode)) return old
     const value = { ...old, ...payload } as CodexSession
     if (!payload.title) value.title = old?.title
-    if (payload.update_kind === 'metadata' && old) { value.mode = old.mode; if (payload.state !== 'archived') value.state = old.state; value.active_turn_id = old.active_turn_id }
+    if (['metadata', 'name'].includes(payload.update_kind ?? '') && old) { value.mode = old.mode; if (payload.update_kind === 'name' || ['creating', 'queued', 'running', 'interrupting'].includes(old.state)) value.state = old.state; else if (payload.state !== 'archived') value.state = old.state === 'archived' ? 'idle' : old.state; value.active_turn_id = old.active_turn_id }
     return value
   }
   queryClient.setQueryData<CodexSession>(keys.session(id), patch)
@@ -115,18 +115,20 @@ export function connectCodexCache() {
     while (reconciled.size > 512) reconciled.delete(reconciled.values().next().value!)
     if (!seen) refreshHistory(session)
   }
-  const off = subscribeEvents(['open', 'codex.stream.resync', 'agent.status', 'project.discovered', 'project.updated', 'command.updated', 'codex.schedule.updated', 'experiment.updated', 'experiment.reported', 'codex.session.updated', 'codex.turn.started', 'codex.turn.completed', 'codex.turn.failed', 'codex.turn.orphaned', 'codex.message.delta'], (event) => {
+  const off = subscribeEvents(['open', 'codex.stream.resync', 'agent.status', 'project.discovered', 'project.updated', 'project.sync.updated', 'project.preferences.updated', 'command.updated', 'codex.schedule.updated', 'experiment.updated', 'experiment.reported', 'codex.session.updated', 'codex.turn.started', 'codex.turn.completed', 'codex.turn.failed', 'codex.turn.orphaned', 'codex.message.delta'], (event) => {
     if (event.type === 'open' || event.type === 'codex.stream.resync') {
       if (opened || event.type === 'codex.stream.resync') {
         flush()
         reconcileLists()
+        void queryClient.invalidateQueries({ queryKey: ['projects'] })
+        void queryClient.invalidateQueries({ queryKey: ['project-preferences'] })
         for (const query of queryClient.getQueryCache().findAll({ queryKey: ['codex'], type: 'active' })) if (['history', 'session', 'operation', 'schedules'].includes(String(query.queryKey[1]))) void queryClient.invalidateQueries({ queryKey: query.queryKey, exact: true })
       }
       opened = true; return
     }
     try {
       const { payload } = JSON.parse(event.data) as { payload: Partial<CodexSession> & Operation & { update_kind?: string; operation_id?: string; data?: { turn_id?: string; item_id?: string; delta?: string; text_offset?: number; session_id?: string } } }
-      if (event.type.startsWith('project.')) { void queryClient.invalidateQueries({ queryKey: ['projects'] }) }
+      if (event.type.startsWith('project.')) { if (event.type === 'project.preferences.updated') { void queryClient.invalidateQueries({ queryKey: ['project-preferences'] }); reconcileLists() } else void queryClient.invalidateQueries({ queryKey: ['projects'] }) }
       else if (event.type.startsWith('experiment.')) { void queryClient.invalidateQueries({ queryKey: ['experiments'] }) }
       else if (event.type === 'codex.schedule.updated') { void queryClient.invalidateQueries({ queryKey: ['codex', 'schedules', payload.session_id] }) }
       else if (event.type === 'agent.status') {

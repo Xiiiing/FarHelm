@@ -1,4 +1,4 @@
-//! The only schema-version owner for this role. Older binaries refuse version 7.
+//! The only schema-version owner for this role. Older binaries refuse version 8.
 use anyhow::{Result, ensure};
 use rusqlite::Connection;
 pub(crate) fn write_transaction(
@@ -10,13 +10,20 @@ pub fn apply(connection: &Connection) -> Result<()> {
     connection.pragma_update(None, "secure_delete", true)?;
     let tx = write_transaction(connection)?;
     let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    ensure!(version <= 7, "database schema is newer than this binary");
+    ensure!(version <= 8, "database schema is newer than this binary");
     tx.execute_batch("CREATE TABLE IF NOT EXISTS hub_maintenance(id INTEGER PRIMARY KEY CHECK(id=1),vacuum_pending INTEGER NOT NULL);")?;
     tx.execute(
         "INSERT OR IGNORE INTO hub_maintenance VALUES(1,?1)",
         [version > 0 && version < 7],
     )?;
+    if version == 8 {
+        tx.commit()?;
+        return finish_maintenance(connection);
+    }
     if version == 7 {
+        crate::typed_command_store::ensure_action_schema(&tx)?;
+        crate::project_management::migrate(&tx)?;
+        tx.pragma_update(None, "user_version", 8)?;
         tx.commit()?;
         return finish_maintenance(connection);
     }
@@ -165,7 +172,8 @@ pub fn apply(connection: &Connection) -> Result<()> {
     crate::typed_command_store::ensure_action_schema(&tx)?;
     crate::event_store::notifications::migrate(&tx)?;
     crate::event_store::notifications::migrate_history(&tx)?;
-    tx.pragma_update(None, "user_version", 7)?;
+    crate::project_management::migrate(&tx)?;
+    tx.pragma_update(None, "user_version", 8)?;
     tx.commit()?;
     finish_maintenance(connection)?;
     Ok(())

@@ -223,7 +223,7 @@ fn notification_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Notification> {
 }
 const COLUMNS: &str =
     "id,event_id,agent_id,category,state,target_id,title,message,created_at_unix,read_at_unix";
-pub(super) fn audit(
+pub(crate) fn audit(
     connection: &Connection,
     action: &str,
     target: &str,

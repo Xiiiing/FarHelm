@@ -81,7 +81,22 @@ pub(super) async fn relay_method(
     }
     match result {
         Ok(Ok(report)) if report.ok => report.data.ok_or("agent_read_empty"),
-        Ok(Ok(_)) => Err("agent_read_failed"),
+        Ok(Ok(report)) => Err([
+            "project_root_revoked",
+            "project_root_is_container",
+            "project_directory_expired",
+            "project_directory_changed",
+            "project_directory_unavailable",
+            "project_directory_permission",
+            "project_not_approved",
+            "codex_archive_unverified",
+            "codex_archive_unapproved",
+            "codex_archive_busy",
+            "codex_archive_unsaved",
+        ]
+        .into_iter()
+        .find(|code| report.detail.as_deref() == Some(code))
+        .unwrap_or("agent_read_failed")),
         _ => Err("agent_read_timeout"),
     }
 }
@@ -117,12 +132,46 @@ pub(super) async fn display(
     {
         return api_error(StatusCode::BAD_REQUEST, "invalid_display_request");
     }
+    let preferences = match database(&state, |s| {
+        s.events.project_preferences(&s.config.admin_user)
+    })
+    .await
+    {
+        Ok(p) => p,
+        Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "event_store_failed"),
+    };
+    let approved = match database(&state, |s| s.events.projects()).await {
+        Ok(p) => p.projects,
+        Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "event_store_failed"),
+    };
+    let mut allowed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    if request.visible_only {
+        for p in approved
+            .into_iter()
+            .filter(|p| p.state == farhelm_protocol::ProjectCandidateState::Approved)
+        {
+            if !preferences.projects.iter().any(|v| {
+                v.agent_id == p.agent_id && v.project_id == p.suggested_project_id && v.hidden
+            }) {
+                allowed
+                    .entry(p.agent_id)
+                    .or_default()
+                    .push(p.suggested_project_id);
+            }
+        }
+    }
     let scope = URL_SAFE_NO_PAD.encode(Sha256::digest(
         serde_json::to_vec(&json!([
             request.query,
             request.agent_id,
             request.project_id,
-            request.archived
+            request.archived,
+            request.visible_only,
+            if request.visible_only {
+                Some(preferences.revision)
+            } else {
+                None
+            }
         ]))
         .unwrap_or_default(),
     ));
@@ -168,6 +217,9 @@ pub(super) async fn display(
     let mut tasks = tokio::task::JoinSet::new();
     let mut incomplete = Vec::new();
     for (agent, ids) in targets {
+        if request.visible_only && !allowed.contains_key(&agent) {
+            continue;
+        }
         let agents = state.agents.read().await;
         let reason = match agents.get(&agent) {
             Some(value) if !is_online(unix_time(), value.last_seen_unix) => Some("agent_offline"),
@@ -175,7 +227,9 @@ pub(super) async fn display(
                 if !value
                     .capabilities
                     .iter()
-                    .any(|c| c == "codex.session_display") =>
+                    .any(|c| c == "codex.session_display")
+                    || (request.visible_only
+                        && !value.capabilities.iter().any(|c| c == "project.management")) =>
             {
                 Some("agent_upgrade_required")
             }
@@ -189,6 +243,9 @@ pub(super) async fn display(
         }
         let mut params = json!({"mode":request.mode,"query":request.query,"project_id":request.project_id,
             "archived":if request.mode == "labels" {"all"} else {&request.archived}, "after":after});
+        if request.visible_only {
+            params["allowed_projects"] = json!(allowed.get(&agent).cloned().unwrap_or_default());
+        }
         if request.mode == "labels" {
             params["session_ids"] = json!(ids);
         }
@@ -231,7 +288,11 @@ pub(super) async fn display(
             let Some(session): Option<CodexSessionSummary> = s.events.session(id)? else {
                 continue;
             };
-            if session.agent_id != agent
+            if (requested.visible_only
+                && !allowed
+                    .get(&agent)
+                    .is_some_and(|p| p.contains(&session.project_id)))
+                || session.agent_id != agent
                 || requested
                     .project_id
                     .as_ref()
@@ -276,6 +337,11 @@ pub(super) async fn display(
         Ok(value) => value,
         Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "event_store_failed"),
     };
+    if request.visible_only
+        && !matches!(database(&state,|s|s.events.project_preferences(&s.config.admin_user)).await,Ok(p) if p.revision==preferences.revision)
+    {
+        return api_error(StatusCode::CONFLICT, "project_preferences_conflict");
+    }
     rows.sort_by(|a, b| a.0.key().cmp(&b.0.key()));
     rows.dedup_by(|a, b| a.0.agent_id == b.0.agent_id && a.0.session_id == b.0.session_id);
     rows.retain(|row| after.as_ref().is_none_or(|after| row.0.key() > after.key()));

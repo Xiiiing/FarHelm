@@ -17,6 +17,7 @@ test.beforeEach(async ({ page }) => {
   await page.route('**/api/v1/**', route => {
     const url = new URL(route.request().url()), path = url.pathname, more = url.searchParams.has('cursor')
     let value: unknown = {}
+    if (path.endsWith('/project-preferences')) return route.fulfill({ json: { revision: 0, projects: [] } })
     if (path.endsWith('/auth/session')) value = { authenticated: true, user: 'admin', csrf_token: 'test-csrf', expires_at_unix: 2_000_000_000 }
     else if (path.endsWith('/agents')) value = { protocol: 'farhelm/1', agents: ['a', 'b'].map(id => ({ agent_id: `gpu-${id}`, hostname: `服务器 ${id}`, agent_version: '0.9.0', online: true, capabilities: ['codex.session_context'], last_seen_unix: 2_000_000_000, codex: { state: 'ready', version: '0.153.4' } })) }
     else if (path.endsWith('/health')) value = { protocol: 'farhelm/1', service: 'farhelm-hub', status: 'ok', version: '0.9.0' }
@@ -28,6 +29,7 @@ test.beforeEach(async ({ page }) => {
     else if (path.endsWith('/ses-a')) value = session
     else if (path.endsWith('/transcript')) value = { session_id: 'ses-a', turns: [] }
     else if (path.endsWith('/session-display')) value = { sessions: [], incomplete_agents: [] }
+    else if (path.endsWith('/project-preferences')) value = { revision: 0, projects: [] }
     else if (path.endsWith('/projects')) value = { protocol: 'farhelm/1', projects: [] }
     else if (path.endsWith('/experiments')) value = { protocol: 'farhelm/1', experiments: [] }
     else if (path.endsWith('/schedules')) value = { protocol: 'farhelm/1', schedules: [] }

@@ -13,8 +13,10 @@ export async function setup(page: Page, modern = true) {
   })
   await page.route('**/api/v1/**', async route => {
     const path = new URL(route.request().url()).pathname
+    if (path.endsWith('/project-preferences')) return route.fulfill({ json: { revision: 0, projects: [] } })
     if (path.endsWith('/auth/session')) return route.fulfill({ json: { authenticated: true, user: 'admin', csrf_token: 'test', expires_at_unix: 2000000000 } })
     if (path.endsWith('/agents')) return route.fulfill({ json: { protocol: 'farhelm/1', agents: ['a', 'b'].map(id => ({ agent_id: id, hostname: id, agent_version: '0.8.0', last_seen_unix: 1, online: true, credential_state: 'paired', capabilities: modern ? ['codex.session_context', 'codex.model_choice', 'codex.native_identity'] : [] })) } })
+    if (path.endsWith('/info')) return route.fulfill({ json: { can_create_worktree: true } })
     if (path.endsWith('/projects')) return route.fulfill({ json: { protocol: 'farhelm/1', projects: ['a', 'b'].map(id => ({ agent_id: id, candidate_id: 'same-candidate', suggested_project_id: 'p', display_name: '项目', state: 'approved' })) } })
     if (path.endsWith('/models')) return route.fulfill({ json: { models: [{ model: 'gpt-5.4', display_name: 'GPT-5.4', reasoning_efforts: ['medium', 'high'], default_reasoning_effort: 'medium', is_default: true }, { model: 'local-fast', display_name: 'Local Fast', reasoning_efforts: ['low'], default_reasoning_effort: 'low', is_default: false }] } })
     if (path.endsWith('/transcript')) { state.reads++; return route.fulfill({ json: { session_id: 's', turns: [{ turn_id: 't', status: 'completed', items: [{ item_id: 'i', kind: 'assistant_message', text: '这是合成验收内容。' }] }], context: state.context } }) }

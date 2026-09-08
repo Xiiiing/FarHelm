@@ -105,7 +105,7 @@ describe('shared workspace cache', () => {
     const emit = stream()
     emit('codex.session.updated', { ...current, project_id: 'elsewhere', state: 'idle', revision: 4 })
     expect(queryClient.getQueryState(key)?.isInvalidated).toBe(false)
-    emit('codex.session.updated', { session_id: 'known', title: '正式名称', mode: 'inspect', state: 'idle', update_kind: 'metadata', revision: 6 })
+    emit('codex.session.updated', { session_id: 'known', title: '正式名称', mode: 'inspect', state: 'idle', update_kind: 'name', revision: 6 })
     expect(queryClient.getQueryData<InfiniteData<DisplayPage>>(key)?.pages[0].sessions[0]).toMatchObject({ state: 'archived', mode: 'edit', title: '正式名称' })
     expect(queryClient.getQueryState(key)?.isInvalidated).toBe(false)
   })

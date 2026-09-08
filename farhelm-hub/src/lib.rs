@@ -62,9 +62,11 @@ mod live;
 mod live_tests;
 mod migrations;
 mod notification_routes;
+mod project_management;
 mod session_display;
 #[cfg(test)]
 mod session_display_tests;
+mod session_lifecycle;
 mod typed_command_store;
 
 use command_store::{CommandStore, CreateCommandError, ReportCommandError};
@@ -347,7 +349,42 @@ pub fn app(state: AppState) -> Router {
             "/api/v1/push/devices/{id}/test",
             post(notification_routes::test),
         )
-        .route("/api/v1/projects", get(list_projects))
+        .route(
+            "/api/v1/codex/sessions/{session_id}/archive-preview",
+            get(session_lifecycle::preview),
+        )
+        .route(
+            "/api/v1/codex/sessions/{session_id}/archive",
+            post(session_lifecycle::archive),
+        )
+        .route(
+            "/api/v1/codex/sessions/{session_id}/unarchive",
+            post(session_lifecycle::unarchive),
+        )
+        .route(
+            "/api/v1/projects",
+            get(project_management::list).post(project_management::add),
+        )
+        .route(
+            "/api/v1/project-preferences",
+            get(project_management::preferences).put(project_management::save_preferences),
+        )
+        .route(
+            "/api/v1/agents/{agent_id}/project-roots",
+            get(project_management::roots),
+        )
+        .route(
+            "/api/v1/agents/{agent_id}/project-directories",
+            get(project_management::directories),
+        )
+        .route(
+            "/api/v1/agents/{agent_id}/projects/{project_id}/info",
+            get(project_management::info),
+        )
+        .route(
+            "/api/v1/agents/{agent_id}/projects/{project_id}/sync",
+            post(project_management::sync),
+        )
         .route("/api/v1/projects/import", post(import_projects))
         .route(
             "/api/v1/codex/sessions/{session_id}/models",
@@ -1335,16 +1372,6 @@ async fn list_experiments(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn list_projects(State(state): State<AppState>) -> Response {
-    match database(&state, |s| s.events.projects()).await {
-        Ok(projects) => Json(projects).into_response(),
-        Err(error) => {
-            tracing::error!(%error, "failed to list project candidates");
-            api_error(StatusCode::INTERNAL_SERVER_ERROR, "event_store_failed")
-        }
-    }
-}
-
 async fn import_projects(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1386,6 +1413,7 @@ async fn import_projects(
 
 #[derive(Debug, Deserialize)]
 struct SessionQuery {
+    visible_only: Option<bool>,
     agent: Option<String>,
     project: Option<String>,
     archived: Option<String>,
@@ -1403,27 +1431,68 @@ async fn list_codex_sessions(
         "all" => ArchiveFilter::All,
         _ => return api_error(StatusCode::BAD_REQUEST, "invalid_archive_filter"),
     };
-    let offset = match query.cursor.as_deref().unwrap_or("0").parse::<usize>() {
-        Ok(value) => value,
-        Err(_) => return api_error(StatusCode::BAD_REQUEST, "invalid_session_cursor"),
+    let preferences = if query.visible_only == Some(true) {
+        match database(&state, |s| {
+            s.events.project_preferences(&s.config.admin_user)
+        })
+        .await
+        {
+            Ok(p) => Some(p),
+            Err(_) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "event_store_failed"),
+        }
+    } else {
+        None
+    };
+    let scope = URL_SAFE_NO_PAD.encode(Sha256::digest(
+        serde_json::to_vec(&serde_json::json!([
+            query.agent,
+            query.project,
+            query.archived,
+            preferences.as_ref().map(|p| p.revision)
+        ]))
+        .unwrap_or_default(),
+    ));
+    let offset = match (&query.cursor, &preferences) {
+        (None, _) => 0,
+        (Some(cursor), None) => match cursor.parse::<usize>() {
+            Ok(v) => v,
+            Err(_) => return api_error(StatusCode::BAD_REQUEST, "invalid_session_cursor"),
+        },
+        (Some(cursor), Some(_)) => match cursor.split_once(':') {
+            Some((s, n)) if s == scope => match n.parse::<usize>() {
+                Ok(v) => v,
+                Err(_) => return api_error(StatusCode::BAD_REQUEST, "invalid_session_cursor"),
+            },
+            _ => return api_error(StatusCode::CONFLICT, "project_preferences_conflict"),
+        },
     };
     let limit = query.limit.unwrap_or(50);
     if !(1..=50).contains(&limit) {
         return api_error(StatusCode::BAD_REQUEST, "invalid_session_limit");
     }
     match database(&state, move |s| {
-        s.events.sessions(
+        let mut page = s.events.sessions_visible(
             query.project.as_deref(),
             archived,
             query.agent.as_deref(),
             offset,
             limit,
-        )
+            preferences
+                .as_ref()
+                .map(|p| (s.config.admin_user.as_str(), p.revision)),
+        )?;
+        if preferences.is_some() {
+            page.next_cursor = page.next_cursor.map(|n| format!("{scope}:{n}"));
+        }
+        Ok(page)
     })
     .await
     {
         Ok(page) => Json(page).into_response(),
         Err(error) => {
+            if error.to_string() == "project_preferences_conflict" {
+                return api_error(StatusCode::CONFLICT, "project_preferences_conflict");
+            }
             tracing::error!(%error, "failed to list Codex sessions");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,

@@ -17,7 +17,7 @@ export function fetchNativeIdentity(sessionId: string, signal?: AbortSignal) { r
 export function renameSession(csrf: string, sessionId: string, name: string) { return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/name`, csrf, { name }) }
 export type TranscriptPage = { older_loaded?: boolean; protocol?: string; session_id: string; turns: TranscriptTurn[]; context?: SessionContext; next_cursor?: string; continuation?: { kind: 'message' | 'history'; turn_id: string; item_id: string; text_offset: number } }
 export type DisplayPage = { sessions: CodexSession[]; next_cursor?: string; incomplete_agents: { agent_id: string; reason: string }[] }
-export async function fetchSessionDisplay(csrf: string, request: { mode: 'labels' | 'search'; session_ids?: string[]; query?: string; agent_id?: string; project_id?: string; archived?: 'false' | 'true' | 'all'; cursor?: string }, signal?: AbortSignal): Promise<DisplayPage> {
+export async function fetchSessionDisplay(csrf: string, request: { mode: 'labels' | 'search'; session_ids?: string[]; query?: string; agent_id?: string; project_id?: string; archived?: 'false' | 'true' | 'all'; cursor?: string; visible_only?: boolean }, signal?: AbortSignal): Promise<DisplayPage> {
   const response = await fetch('/api/v1/codex/session-display', { method: 'POST', credentials: 'same-origin', signal, headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf }, body: JSON.stringify(request) })
   if (!response.ok) throw await apiError(response)
   const page = await response.json() as DisplayPage
@@ -26,7 +26,7 @@ export async function fetchSessionDisplay(csrf: string, request: { mode: 'labels
 }
 export type ScheduleTrigger = { type: 'at_time'; run_at_unix: number } | { type: 'experiment_succeeded'; watch_id: string }
 export type CodexSchedule = { schedule_id: string; agent_id: string; session_id: string; project_id: string; trigger: ScheduleTrigger; state: 'pending' | 'queued' | 'running' | 'completed' | 'cancelled' | 'skipped' | 'missed' | 'failed' | 'orphaned'; created_at_unix: number; updated_at_unix: number }
-export type ProjectCandidate = { candidate_id: string; agent_id: string; display_name: string; suggested_project_id: string; session_count: number; state: 'discovered' | 'approved'; updated_at_unix: number }
+export type ProjectCandidate = { candidate_id: string; agent_id: string; display_name: string; suggested_project_id: string; session_count: number; state: 'discovered' | 'approved'; updated_at_unix: number; sync_state?: 'unknown' | 'pending' | 'ready' | 'failed'; last_activity_unix?: number }
 
 export async function json<T>(url: string, signal?: AbortSignal): Promise<T> {
   const response = await fetch(url, { credentials: 'same-origin', signal, headers: { Accept: 'application/json' } })
@@ -40,8 +40,8 @@ export async function fetchExperiments(): Promise<Experiment[]> {
   return value.experiments
 }
 
-export async function fetchSessionPage(project?: string, archived: 'false' | 'true' | 'all' = 'false', cursor?: string, signal?: AbortSignal) {
-  const params = new URLSearchParams({ archived, limit: '50' }); if (project) params.set('project', project); if (cursor) params.set('cursor', cursor)
+export async function fetchSessionPage(project?: string, archived: 'false' | 'true' | 'all' = 'false', cursor?: string, signal?: AbortSignal, visibleOnly = false, agent?: string) {
+  const params = new URLSearchParams({ archived, limit: '50' }); if (visibleOnly) params.set('visible_only', 'true'); if (agent) params.set('agent', agent); if (project) params.set('project', project); if (cursor) params.set('cursor', cursor)
   const value = await json<{ protocol: string; sessions: CodexSession[]; next_cursor?: string }>(`/api/v1/codex/sessions?${params}`, signal)
   if (value.protocol !== PROTOCOL_VERSION || !Array.isArray(value.sessions)) throw new Error('Hub returned invalid sessions')
   return value
@@ -74,8 +74,27 @@ const pendingOperations = new Map<string, string>()
 const savedReceipts = new Map<string, { identity: string; key: string }>()
 let receiptGeneration = 0
 export function clearOperationReceipts() { pendingOperations.clear(); savedReceipts.clear(); receiptGeneration++ }
-export type Operation = { command_id?: string; state?: string; detail?: string; status_url?: string; data?: { turn_id?: string; session_id?: string }; result?: { turn_id?: string; session_id?: string } }
+export type Operation = { command_id?: string; state?: string; detail?: string; status_url?: string; data?: { turn_id?: string; session_id?: string; project_id?: string }; result?: { turn_id?: string; session_id?: string; project_id?: string } }
 const codexErrors: Record<string, string> = {
+  project_preferences_conflict: '展示设置已在另一台设备更新，已重新读取，请再次选择',
+  project_root_revoked: '此根目录的授权已撤销，请重新选择或在服务器授权',
+  project_directory_expired: '目录选择已过期，请刷新根目录并重新选择',
+  project_directory_changed: '目录已移动或被替换，请重新选择',
+  project_directory_unavailable: '目录已消失或无法读取，请刷新后重新选择',
+  project_directory_permission: '目录权限已改变，请在服务器检查授权和目录权限',
+  project_invalid_name: '名称必须是单段目录名，不能包含斜线、控制字符或相对路径',
+  project_name_conflict: '同名目录已存在，请更换名称，或改为接入已有目录',
+  project_creation_unconfirmed: '目录创建结果尚未确认，请刷新项目列表并核对原操作',
+  project_history_sync_failed: '项目已接入，但历史同步失败，可单独重试同步',
+  project_not_approved: '项目尚未接入，请先添加项目',
+  project_root_is_container: '根目录仅用于授权范围，请选择它下面的项目目录',
+  codex_session_archived: '会话已归档，请先恢复会话再发送',
+  codex_archive_busy: '会话或关联子会话仍有活动任务、排队输入或待触发调度，请先处理这些任务',
+  codex_archive_unverified: '暂时无法完整核对原生状态。请使用 Codex 0.153.4 或以上版本，并刷新后重试',
+  codex_archive_changed: '会话及子会话范围已改变，请重新查看影响范围并确认',
+  codex_archive_unapproved: '会话或关联子会话所在项目未授权，或目录已改变，请先接入对应项目',
+  codex_archive_unsaved: '会话或关联子会话尚未保存，请先完成首次对话并等待保存',
+
   codex_session_in_use: '会话正由其他 Codex 客户端占用，请关闭那边的会话连接后再发送',
   model_choice_unavailable: '所选模型或推理强度已不可用，请重新选择',
   codex_handoff_busy: 'Agent 正在读取或执行对话，请结束活动任务后再交接',
@@ -104,7 +123,7 @@ export async function mutate(url: string, csrf: string, body?: unknown, method =
   if (pendingOperations.size > 256) pendingOperations.delete(pendingOperations.keys().next().value!)
   const response = await fetch(url, { method, credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf, 'Idempotency-Key': key }, body: encoded })
   if (!response.ok) {
-    if ([400, 401, 403, 404].includes(response.status)) pendingOperations.delete(identity)
+    if ([400, 401, 403, 404, 409].includes(response.status)) pendingOperations.delete(identity)
     throw await apiError(response)
   }
   const result = response.status === 204 ? {} : await response.json().catch(() => ({})) as Operation
@@ -214,3 +233,19 @@ export async function disablePush(csrf: string): Promise<void> {
   if (!removed.ok) throw new Error(`Hub 删除 Push 订阅失败（HTTP ${removed.status}）`)
   await subscription.unsubscribe()
 }
+
+export type ProjectPreference = { agent_id: string; project_id: string; display_name: string | null; hidden: boolean; pinned: boolean }
+export type ProjectPreferences = { revision: number; projects: ProjectPreference[] }
+export async function fetchProjectPreferences() { const value = await json<ProjectPreferences>('/api/v1/project-preferences'); if (!Number.isSafeInteger(value.revision) || !Array.isArray(value.projects)) throw new Error('项目展示设置读取失败，请更新 Hub 并重试'); return value }
+export async function saveProjectPreferences(csrf: string, revision: number, projects: ProjectPreference[]) { return await mutate('/api/v1/project-preferences', csrf, { revision, projects }, 'PUT') as unknown as ProjectPreferences }
+export type ProjectDirectory = { directory_id: string; name: string }
+export type DirectoryPage = { directory: ProjectDirectory; parent_id: string | null; entries: ProjectDirectory[]; next_cursor: string | null }
+export const fetchProjectRoots = (agent: string, signal?: AbortSignal) => json<{ roots: ProjectDirectory[] }>(`/api/v1/agents/${encodeURIComponent(agent)}/project-roots`, signal)
+export const fetchProjectDirectories = (agent: string, directory: string, cursor?: string, signal?: AbortSignal) => json<DirectoryPage>(`/api/v1/agents/${encodeURIComponent(agent)}/project-directories?${new URLSearchParams({ directory_id: directory, ...(cursor ? { cursor } : {}) })}`, signal)
+export const fetchProjectInfo = (agent: string, project: string, signal?: AbortSignal) => json<{ can_create_worktree: boolean }>(`/api/v1/agents/${encodeURIComponent(agent)}/projects/${encodeURIComponent(project)}/info`, signal)
+export const addProject = (csrf: string, agent: string, directory: string, name?: string) => mutate('/api/v1/projects', csrf, { agent_id: agent, directory_id: directory, ...(name === undefined ? { kind: 'attach' } : { kind: 'create', name }) })
+export const syncProject = (csrf: string, agent: string, project: string) => mutate(`/api/v1/agents/${encodeURIComponent(agent)}/projects/${encodeURIComponent(project)}/sync`, csrf)
+export type ArchivePreview = { session_ids: string[]; fingerprint: string; can_archive: boolean; reason: string | null }
+export const fetchArchivePreview = (session: string, signal?: AbortSignal) => json<ArchivePreview>(`/api/v1/codex/sessions/${encodeURIComponent(session)}/archive-preview`, signal)
+export const archiveSession = (csrf: string, session: string, fingerprint: string) => mutate(`/api/v1/codex/sessions/${encodeURIComponent(session)}/archive`, csrf, { fingerprint })
+export const unarchiveSession = (csrf: string, session: string) => mutate(`/api/v1/codex/sessions/${encodeURIComponent(session)}/unarchive`, csrf)

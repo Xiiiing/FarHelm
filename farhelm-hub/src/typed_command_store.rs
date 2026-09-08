@@ -224,7 +224,7 @@ impl TypedCommandStore {
         tx.execute(
             "UPDATE typed_commands SET state=?1,updated_at_unix=?2,data_json=?3,detail=?4,payload_json=?5
               WHERE command_id=?6",
-            params![state_name(report.state),as_i64(now)?,report.data.as_ref().map(|data| serde_json::to_string(&public_result(data))).transpose()?,report.detail.as_ref().map(|_|"Agent operation failed; inspect Agent diagnostics"),payload_json,report.command_id],
+            params![state_name(report.state),as_i64(now)?,report.data.as_ref().map(|data| serde_json::to_string(&public_result(data))).transpose()?,report.detail.as_deref().map(public_detail),payload_json,report.command_id],
         )?;
         tx.commit()?;
         if legacy_body {
@@ -334,6 +334,10 @@ const fn action_name(action: CommandAction) -> &'static str {
         CommandAction::CodexTurnInterrupt => "codex.turn.interrupt",
         CommandAction::CodexScheduleCreate => "codex.schedule.create",
         CommandAction::CodexScheduleCancel => "codex.schedule.cancel",
+        CommandAction::ProjectAdd => "project.add",
+        CommandAction::ProjectSync => "project.sync",
+        CommandAction::CodexSessionArchive => "codex.session.archive",
+        CommandAction::CodexSessionUnarchive => "codex.session.unarchive",
         CommandAction::ProjectApprove => "project.approve",
     }
 }
@@ -346,6 +350,10 @@ fn parse_action(value: &str) -> rusqlite::Result<CommandAction> {
         "codex.turn.interrupt" => Ok(CommandAction::CodexTurnInterrupt),
         "codex.schedule.create" => Ok(CommandAction::CodexScheduleCreate),
         "codex.schedule.cancel" => Ok(CommandAction::CodexScheduleCancel),
+        "project.add" => Ok(CommandAction::ProjectAdd),
+        "project.sync" => Ok(CommandAction::ProjectSync),
+        "codex.session.archive" => Ok(CommandAction::CodexSessionArchive),
+        "codex.session.unarchive" => Ok(CommandAction::CodexSessionUnarchive),
         "project.approve" => Ok(CommandAction::ProjectApprove),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
@@ -357,7 +365,7 @@ pub(crate) fn ensure_action_schema(connection: &Connection) -> Result<()> {
         [],
         |row| row.get(0),
     )?;
-    if schema.contains("codex.schedule.create") {
+    if schema.contains("project.add") {
         return Ok(());
     }
     connection.execute_batch(
@@ -366,7 +374,7 @@ pub(crate) fn ensure_action_schema(connection: &Connection) -> Result<()> {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             command_id TEXT NOT NULL UNIQUE,
             agent_id TEXT NOT NULL,
-            action TEXT NOT NULL CHECK (action IN ('codex.session.create','codex.session.resume','codex.turn.start','codex.turn.steer','codex.turn.interrupt','codex.schedule.create','codex.schedule.cancel','project.approve')),
+            action TEXT NOT NULL CHECK (action IN ('codex.session.create','codex.session.resume','codex.turn.start','codex.turn.steer','codex.turn.interrupt','codex.schedule.create','codex.schedule.cancel','project.approve','project.add','project.sync','codex.session.archive','codex.session.unarchive')),
             payload_json TEXT NOT NULL,
             state TEXT NOT NULL CHECK (state IN ('queued','delivered','accepted','completed','failed','expired')),
             idempotency_key TEXT NOT NULL UNIQUE,
@@ -426,6 +434,39 @@ fn json_conversion(index: usize) -> impl FnOnce(serde_json::Error) -> rusqlite::
     }
 }
 
+fn public_detail(detail: &str) -> &'static str {
+    [
+        "project_root_revoked",
+        "project_root_is_container",
+        "project_directory_expired",
+        "project_directory_changed",
+        "project_directory_unavailable",
+        "project_directory_permission",
+        "project_invalid_name",
+        "project_name_conflict",
+        "project_creation_unconfirmed",
+        "project_candidate_missing",
+        "project_history_sync_failed",
+        "project_not_approved",
+        "codex_session_archived",
+        "codex_archive_busy",
+        "codex_archive_unverified",
+        "codex_archive_changed",
+        "codex_archive_unapproved",
+        "codex_archive_unsaved",
+        "codex_session_in_use",
+        "model_choice_unavailable",
+        "codex_handoff_busy",
+        "codex_handoff_unsaved",
+        "codex_handoff_background",
+        "codex_handoff_unconfirmed",
+        "codex_handoff_unverified",
+    ]
+    .into_iter()
+    .find(|code| *code == detail)
+    .unwrap_or("Agent operation failed; inspect Agent diagnostics")
+}
+
 fn public_result(data: &Value) -> Value {
     let mut out = serde_json::Map::new();
     for key in [
@@ -434,6 +475,8 @@ fn public_result(data: &Value) -> Value {
         "schedule_id",
         "cancelled",
         "approved",
+        "project_id",
+        "candidate_id",
         "status",
     ] {
         if let Some(value) = data.get(key) {

@@ -21,6 +21,10 @@ use sha2::{Digest, Sha256};
 #[path = "execution_store.rs"]
 pub(crate) mod execution;
 pub use execution::ScriptReport;
+#[path = "session_lifecycle.rs"]
+pub(crate) mod lifecycle;
+#[path = "project_store.rs"]
+pub(crate) mod projects;
 
 const LOG_TAIL_LIMIT: u64 = 1024 * 1024;
 const PROMPT_LIMIT: usize = 32 * 1024;
@@ -307,6 +311,7 @@ impl ExperimentStore {
         ))
     }
 
+    #[cfg(test)]
     pub fn approve_candidates(
         &self,
         candidate_ids: &[String],
@@ -399,6 +404,11 @@ impl ExperimentStore {
         );
         let connection = self.lock()?;
         let transaction = crate::migrations::write_transaction(&connection)?;
+        if registration.success_prompt.is_some()
+            && let Some(id) = registration.session_id.as_deref()
+        {
+            lifecycle::writable(&transaction, id)?;
+        }
         transaction.execute(
             "INSERT INTO experiment_watches (
                 watch_id, project_id, project_root, name, pid, proc_start_time, uid, log_path,
@@ -744,6 +754,8 @@ impl ExperimentStore {
     ) -> Result<()> {
         let connection = self.lock()?;
         let transaction = crate::migrations::write_transaction(&connection)?;
+        if transaction.query_row("SELECT EXISTS(SELECT 1 FROM session_lifecycle WHERE session_id=?1 AND operation_id IS NOT NULL)",[session_id],|r|r.get::<_,bool>(0))? {return Ok(());}
+        transaction.execute("INSERT INTO session_lifecycle(session_id,archived) VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET archived=excluded.archived",params![session_id,archived])?;
         transaction.execute(
             "INSERT OR IGNORE INTO codex_session_bindings (session_id,project_id,cwd,mode,updated_at_unix) VALUES (?1,?2,?3,'inspect',?4)",
             params![session_id,project_id,cwd.to_string_lossy(),as_i64(updated)?],
@@ -881,6 +893,25 @@ impl ExperimentStore {
             "INSERT INTO remote_codex_commands (command_id,action,expires_at_unix,payload_json,state,updated_at_unix) VALUES (?1,?2,?3,?4,?5,?6)",
             params![command.command_id,action_name(command.action),as_i64(command.expires_at_unix)?,serde_json::to_string(payload)?,if now>=command.expires_at_unix{"expired"}else{"accepted"},as_i64(now)?],
         )?;
+        if let Some(id) = payload["session_id"].as_str()
+            && !matches!(
+                command.action,
+                CommandAction::CodexSessionArchive
+                    | CommandAction::CodexSessionUnarchive
+                    | CommandAction::CodexScheduleCancel
+            )
+            && let Err(error) = lifecycle::writable(&connection, id)
+        {
+            connection.execute(
+                "UPDATE remote_codex_commands SET state='failed',detail=?2 WHERE command_id=?1",
+                params![
+                    command.command_id,
+                    projects::public_error(&error).unwrap_or("codex_archive_unverified")
+                ],
+            )?;
+            connection.commit()?;
+            return Ok(());
+        }
         if command.action == CommandAction::CodexTurnStart {
             execution::enqueue(
                 &connection,
@@ -988,6 +1019,25 @@ impl ExperimentStore {
         );
         let connection = self.lock()?;
         let tx = crate::migrations::write_transaction(&connection)?;
+        if state == farhelm_protocol::CommandState::Failed
+            && tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM archive_operations WHERE command_id=?1)",
+                [command_id],
+                |r| r.get::<_, bool>(0),
+            )?
+        {
+            return Ok(());
+        }
+        if state == farhelm_protocol::CommandState::Completed {
+            let saved: Option<String> = tx.query_row("SELECT data_json FROM remote_codex_commands WHERE command_id=?1 AND state='completed'",[command_id],|r|r.get(0)).optional()?;
+            if let Some(saved) = saved {
+                ensure!(
+                    data == Some(&serde_json::from_str::<Value>(&saved)?),
+                    "command completion conflicts"
+                );
+                return Ok(());
+            }
+        }
         ensure!(tx.execute(
             "UPDATE remote_codex_commands SET state=?1,data_json=?2,detail=?3,terminal_reported=0,updated_at_unix=?4 WHERE command_id=?5 AND state='running'",
             params![if state==farhelm_protocol::CommandState::Completed{"completed"}else{"failed"},data.map(serde_json::to_string).transpose()?,detail,as_i64(now)?,command_id]
@@ -1090,7 +1140,7 @@ impl ExperimentStore {
         let connection = self.lock()?;
         let transaction = crate::migrations::write_transaction(&connection)?;
         let mut statement = transaction.prepare(
-            "SELECT command_id,payload_json,action FROM remote_codex_commands WHERE state='running'",
+            "SELECT command_id,payload_json,action FROM remote_codex_commands WHERE state='running' AND command_id NOT IN (SELECT command_id FROM archive_operations)",
         )?;
         let rows = statement
             .query_map([], |row| {
@@ -1484,6 +1534,10 @@ const fn action_name(action: CommandAction) -> &'static str {
         CommandAction::CodexTurnInterrupt => "codex.turn.interrupt",
         CommandAction::CodexScheduleCreate => "codex.schedule.create",
         CommandAction::CodexScheduleCancel => "codex.schedule.cancel",
+        CommandAction::ProjectAdd => "project.add",
+        CommandAction::ProjectSync => "project.sync",
+        CommandAction::CodexSessionArchive => "codex.session.archive",
+        CommandAction::CodexSessionUnarchive => "codex.session.unarchive",
         CommandAction::ProjectApprove => "project.approve",
     }
 }
@@ -1497,6 +1551,10 @@ fn parse_action(value: &str) -> rusqlite::Result<CommandAction> {
         "codex.turn.interrupt" => Ok(CommandAction::CodexTurnInterrupt),
         "codex.schedule.create" => Ok(CommandAction::CodexScheduleCreate),
         "codex.schedule.cancel" => Ok(CommandAction::CodexScheduleCancel),
+        "project.add" => Ok(CommandAction::ProjectAdd),
+        "project.sync" => Ok(CommandAction::ProjectSync),
+        "codex.session.archive" => Ok(CommandAction::CodexSessionArchive),
+        "codex.session.unarchive" => Ok(CommandAction::CodexSessionUnarchive),
         "project.approve" => Ok(CommandAction::ProjectApprove),
         _ => Err(rusqlite::Error::InvalidQuery),
     }

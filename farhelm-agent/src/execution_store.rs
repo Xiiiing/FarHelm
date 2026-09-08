@@ -17,6 +17,7 @@ pub(crate) fn migrate(connection: &Connection) -> Result<()> {
 }
 
 pub(super) fn enqueue(connection: &Connection, job: &str, session: &str) -> Result<()> {
+    lifecycle::writable(connection, session)?;
     connection.execute(
         "INSERT OR IGNORE INTO execution_queue(job_id,session_id) VALUES(?1,?2)",
         params![job, session],
@@ -59,6 +60,7 @@ fn insert_schedule(connection: &Connection, payload: &Value, now: u64) -> Result
     let id = required_payload_string(payload, "schedule_id")?;
     let project = required_payload_string(payload, "project_id")?;
     let session = required_payload_string(payload, "session_id")?;
+    lifecycle::writable(connection, session)?;
     let prompt = required_payload_string(payload, "prompt")?;
     ensure!(
         prompt.len() <= PROMPT_LIMIT,
@@ -683,7 +685,7 @@ mod tests {
         let version: i64 = c
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         // V0.6 guards schema <= 1; opening this live database is a refused rollback.
         assert!(version > 1);
     }

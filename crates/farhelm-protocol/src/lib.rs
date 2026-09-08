@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 pub mod live;
+pub mod projects;
 
 pub const FARHELM_PROTOCOL: &str = "farhelm/1";
 
@@ -59,6 +60,8 @@ impl AgentHeartbeat {
                 "codex.model_choice".to_owned(),
                 "codex.native_identity".to_owned(),
                 "agent.live".to_owned(),
+                "project.management".to_owned(),
+                "codex.session_archive".to_owned(),
             ],
             protocol: FARHELM_PROTOCOL.to_owned(),
             agent_id: agent_id.into(),
@@ -125,6 +128,14 @@ pub enum CommandAction {
     CodexScheduleCancel,
     #[serde(rename = "project.approve")]
     ProjectApprove,
+    #[serde(rename = "project.add")]
+    ProjectAdd,
+    #[serde(rename = "project.sync")]
+    ProjectSync,
+    #[serde(rename = "codex.session.archive")]
+    CodexSessionArchive,
+    #[serde(rename = "codex.session.unarchive")]
+    CodexSessionUnarchive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,6 +309,8 @@ pub struct CodexSessionListResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionDisplayRequest {
+    #[serde(default)]
+    pub visible_only: bool,
     pub mode: String,
     #[serde(default)]
     pub session_ids: Vec<String>,
@@ -719,7 +732,8 @@ pub fn public_event_payload(event_type: &str, payload: &serde_json::Value) -> se
             "updated_at_unix",
             "revision",
         ],
-        "project.discovered" | "project.updated" => &[
+        "project.discovered" | "project.updated" | "project.sync.updated" => &[
+            "sync_state",
             "candidate_id",
             "display_name",
             "suggested_project_id",
@@ -835,7 +849,7 @@ mod tests {
                 "agent_id": "gpu-a",
                 "hostname": "trainer-a",
                 "agent_version": "0.1.0",
-                "capabilities": ["codex.ephemeral_submit", "codex.session_display", "codex.item_offsets", "codex.native", "codex.session_context", "codex.model_choice", "codex.native_identity", "agent.live"]
+                "capabilities": ["codex.ephemeral_submit", "codex.session_display", "codex.item_offsets", "codex.native", "codex.session_context", "codex.model_choice", "codex.native_identity", "agent.live", "project.management", "codex.session_archive"]
             })
         );
     }

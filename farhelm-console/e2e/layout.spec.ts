@@ -37,7 +37,8 @@ test.beforeEach(async ({ page }) => {
     contentType: 'application/json',
     body: JSON.stringify({ protocol: 'farhelm/1', experiments: [{ watch_id: 'watch-a', agent_id: 'gpu-a', project_id: 'cc08', name: 'exp42', pid: 12345, state: 'watching', updated_at_unix: 2_000_000_000 }] }),
   }))
-  await page.route('**/api/v1/projects', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ protocol: 'farhelm/1', projects: [] }) }))
+  await page.route('**/api/v1/project-preferences', (route) => route.fulfill({ json: { revision: 0, projects: [] } }))
+  await page.route('**/api/v1/projects', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ protocol: 'farhelm/1', projects: [{ candidate_id: 'p', agent_id: 'gpu-a', suggested_project_id: 'cc08', display_name: 'cc08', state: 'approved', session_count: 2 }] }) }))
   await page.route('**/api/v1/codex/sessions?*', (route) => route.fulfill({
     contentType: 'application/json',
     body: JSON.stringify({ protocol: 'farhelm/1', sessions: [{ session_id: 'ses-a', agent_id: 'gpu-a', project_id: 'cc08', mode: 'inspect', state: 'idle', updated_at_unix: 2_000_000_000 }] }),
@@ -158,7 +159,7 @@ test('project hover and session selection paint one background through pointer a
     await page.getByLabel('给 Codex 发送指令').fill('折叠项目后保留草稿')
     if (page.viewportSize()!.width < 768) await page.getByRole('button', { name: '打开会话列表' }).click()
     const rail = page.locator('.codex-rail:visible'), heading = rail.locator('.session-group-heading').first()
-    const outer = rail.locator('.ant-conversations-group-title').first()
+    const outer = rail.locator('.project-group-header').first()
     await heading.hover()
     await expect(heading).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)')
     await expect(outer).toHaveCSS('height', '44px')
@@ -204,7 +205,7 @@ test('agent page renders validated Hub data', async ({ page }) => {
   await page.goto('/agents')
   await expect(page.getByRole('heading', { name: '服务器' })).toBeVisible()
   await expect(page.getByText('trainer-a')).toBeVisible()
-  await expect(page.getByText('gpu-a')).toBeVisible()
+  await expect(page.getByText('gpu-a', { exact: true })).toBeVisible()
   await expect(page.getByText('在线', { exact: true })).toBeVisible()
 })
 

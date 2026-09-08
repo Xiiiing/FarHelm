@@ -6,5 +6,6 @@
   "project_id": "cc08",
   "archived": "all",
   "cursor": null,
-  "limit": 50
+  "limit": 50,
+  "visible_only": false
 }

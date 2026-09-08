@@ -5,17 +5,17 @@ import { keys, queryClient, mergeSession } from '../../api/cache'
 import { errorText, formalTitle } from './presentation'
 export type ArchiveFilter = 'false' | 'true' | 'all'
 
-export function useSessions(csrf: string, query: string, archived: ArchiveFilter, agent?: string, project?: string) {
+export function useSessions(csrf: string, query: string, archived: ArchiveFilter, agent?: string, project?: string, visibleOnly = true, preferenceRevision = 0) {
   const [search, setSearch] = useState(query)
   useEffect(() => { const timer = setTimeout(() => setSearch(query.trim()), 250); return () => clearTimeout(timer) }, [query])
-  const filtered = Boolean(search || agent || project)
+  const filtered = Boolean(search)
   const listing = useInfiniteQuery({
-    queryKey: ['codex', 'sessions', archived, agent ?? '', project ?? '', search],
+    queryKey: ['codex', 'sessions', archived, agent ?? '', project ?? '', search, visibleOnly, preferenceRevision],
     initialPageParam: undefined as string | undefined,
     queryFn: async ({ pageParam, signal }): Promise<DisplayPage> => {
       const page = filtered
-        ? await fetchSessionDisplay(csrf, { mode: 'search', query: search, archived, agent_id: agent, project_id: project, cursor: pageParam }, signal)
-        : { ...await fetchSessionPage(undefined, archived, pageParam, signal), incomplete_agents: [] }
+        ? await fetchSessionDisplay(csrf, { mode: 'search', query: search, archived, agent_id: agent, project_id: project, cursor: pageParam, visible_only: visibleOnly }, signal)
+        : { ...await fetchSessionPage(project, archived, pageParam, signal, visibleOnly, agent), incomplete_agents: [] }
       page.sessions = page.sessions.map(mergeSession)
       for (const session of page.sessions) queryClient.setQueryData(keys.session(session.session_id), session)
       return page

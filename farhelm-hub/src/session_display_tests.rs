@@ -92,6 +92,127 @@ fn same_second_metadata_and_late_execution_cannot_erase_title_mode_or_running_st
     );
 }
 
+#[test]
+fn lifecycle_receipts_fence_late_metadata_and_rename_does_not_restore_archived_threads() {
+    let state = test_state();
+    state
+        .events
+        .ingest(
+            "gpu-a",
+            &[session_event("s", 1, "idle", json!("original"), "metadata")],
+        )
+        .unwrap();
+    state
+        .events
+        .ingest(
+            "gpu-a",
+            &[session_event("s", 10, "archived", Value::Null, "lifecycle")],
+        )
+        .unwrap();
+    for kind in ["metadata", "execution"] {
+        let mut late = session_event("s", 9, "idle", Value::Null, kind);
+        late.event_id = format!("late-{kind}");
+        state.events.ingest("gpu-a", &[late]).unwrap();
+    }
+    assert_eq!(
+        serde_json::to_value(state.events.session("s").unwrap()).unwrap()["state"],
+        "archived"
+    );
+    state
+        .events
+        .ingest(
+            "gpu-a",
+            &[session_event("s", 11, "idle", json!("new name"), "name")],
+        )
+        .unwrap();
+    let archived = state.events.session("s").unwrap().unwrap();
+    assert_eq!(archived.title.as_deref(), Some("new name"));
+    assert_eq!(serde_json::to_value(archived).unwrap()["state"], "archived");
+    state
+        .events
+        .ingest(
+            "gpu-a",
+            &[session_event("s", 12, "idle", Value::Null, "lifecycle")],
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(state.events.session("s").unwrap()).unwrap()["state"],
+        "idle"
+    );
+}
+
+#[tokio::test]
+async fn visible_search_relays_allowed_projects_before_agent_pagination() {
+    let state = test_state();
+    for (i, p) in ["visible", "hidden"].into_iter().enumerate() {
+        state.events.ingest("gpu-a",&[AgentEvent{protocol:FARHELM_PROTOCOL.into(),agent_id:"gpu-a".into(),event_id:format!("p-{p}"),sequence:i as u64+1,event_type:"project.updated".into(),created_at_unix:1,payload:json!({"candidate_id":format!("c-{p}"),"display_name":p,"suggested_project_id":p,"session_count":100,"state":"approved","updated_at_unix":1})}]).unwrap();
+    }
+    let user = state.config.admin_user.clone();
+    let request = json!({"revision":0,"projects":[{"agent_id":"gpu-a","project_id":"hidden","display_name":null,"hidden":true,"pinned":false}]});
+    let save = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/project-preferences")
+        .header(header::COOKIE, browser_cookie())
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-csrf-token", "test-csrf")
+        .header("idempotency-key", "hidden-projects-request")
+        .body(Body::from(request.to_string()))
+        .unwrap();
+    assert_eq!(
+        app(state.clone()).oneshot(save).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(state.events.project_preferences(&user).unwrap().revision, 1);
+    let mut event = session_event("s", 3, "idle", Value::Null, "metadata");
+    event.payload["project_id"] = json!("visible");
+    state.events.ingest("gpu-a", &[event]).unwrap();
+    state.agents.write().await.insert(
+        "gpu-a".into(),
+        StoredAgent {
+            codex: None,
+            capabilities: vec!["codex.session_display".into(), "project.management".into()],
+            hostname: "a".into(),
+            agent_version: "0.11.0".into(),
+            last_seen_unix: unix_time(),
+            credential_state: AgentCredentialState::Paired,
+        },
+    );
+    let agent_state = state.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let request = agent_state
+                .read_broker
+                .lock()
+                .await
+                .queues
+                .get_mut("gpu-a")
+                .and_then(VecDeque::pop_front);
+            if let Some(request) = request {
+                assert_eq!(request.params["allowed_projects"], json!(["visible"]));
+                let (_, sender, _) = agent_state
+                    .read_broker
+                    .lock()
+                    .await
+                    .waiters
+                    .remove(&request.request_id)
+                    .unwrap();
+                sender.send(AgentReadReportRequest{request_id:request.request_id.clone(),protocol:FARHELM_PROTOCOL.into(),agent_id:"gpu-a".into(),ok:true,data:Some(json!({"sessions":[{"session_id":"s","display_label":"synthetic match","updated_at_unix":100}]})),detail:None}).unwrap();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    let response = app(state)
+        .oneshot(display_request(
+            json!({"mode":"search","query":"synthetic","visible_only":true}),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    task.await.unwrap();
+}
+
 #[tokio::test]
 async fn display_requires_login_csrf_and_bounded_requests() {
     let state = test_state();
