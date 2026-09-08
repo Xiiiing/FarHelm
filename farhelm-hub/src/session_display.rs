@@ -35,6 +35,16 @@ async fn relay(
     params: Value,
     deadline: tokio::time::Instant,
 ) -> Result<Value, &'static str> {
+    relay_method(state, agent, "codex.session.display", params, deadline).await
+}
+
+pub(super) async fn relay_method(
+    state: &AppState,
+    agent: &str,
+    method: &str,
+    params: Value,
+    deadline: tokio::time::Instant,
+) -> Result<Value, &'static str> {
     let request_id = format!("read_{}", &random_token()[..20]);
     let (sender, receiver) = oneshot::channel();
     let notify = {
@@ -52,7 +62,7 @@ async fn relay(
             .or_default()
             .push_back(AgentReadRequest {
                 request_id: request_id.clone(),
-                method: "codex.session.display".into(),
+                method: method.into(),
                 params,
             });
         broker

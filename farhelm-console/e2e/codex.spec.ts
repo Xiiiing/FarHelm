@@ -128,7 +128,7 @@ test('compact navigation preserves every destination and aligns the reading colu
   const nav = page.getByRole('navigation', { name: '系统导航' })
   for (const name of ['总览', 'Agent', '实验', 'Codex', '通知', '审计', '设置']) await expect(nav.getByRole('menuitem', { name, exact: true })).toBeVisible()
   expect((await page.locator('.app-sider').boundingBox())!.width).toBe(88)
-  expect((await page.locator('.codex-desktop-rail').boundingBox())!.width).toBe(280)
+  expect((await page.locator('.codex-desktop-rail').boundingBox())!.width).toBe(300)
   const heading = await page.locator('.conversation-title h1').boundingBox()
   const body = await page.locator('.codex-transcript').boundingBox()
   expect(Math.abs(heading!.x - body!.x)).toBeLessThan(2)

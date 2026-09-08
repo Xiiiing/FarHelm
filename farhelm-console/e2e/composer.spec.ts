@@ -2,7 +2,7 @@ import AxeBuilder from '@axe-core/playwright'
 import { expect, test, type Page } from '@playwright/test'
 import type { SessionContext } from '../src/api/features'
 
-async function setup(page: Page, modern = true) {
+export async function setup(page: Page, modern = true) {
   const context: SessionContext = { model: 'gpt-5.4', reasoning_effort: 'high', sandbox: 'danger-full-access', approval_policy: 'never' }
   const state = { context: modern ? context : undefined, reads: 0, creations: [] as { agent_id: string; mode: string; inherit_permissions?: boolean }[] }
   const session = { session_id: 's', agent_id: 'a', project_id: 'p', title: '会话设置验收', mode: 'inspect', state: 'idle', updated_at_unix: 1 }
@@ -14,8 +14,9 @@ async function setup(page: Page, modern = true) {
   await page.route('**/api/v1/**', async route => {
     const path = new URL(route.request().url()).pathname
     if (path.endsWith('/auth/session')) return route.fulfill({ json: { authenticated: true, user: 'admin', csrf_token: 'test', expires_at_unix: 2000000000 } })
-    if (path.endsWith('/agents')) return route.fulfill({ json: { protocol: 'farhelm/1', agents: ['a', 'b'].map(id => ({ agent_id: id, hostname: id, agent_version: '0.8.0', last_seen_unix: 1, online: true, credential_state: 'paired', capabilities: modern ? ['codex.session_context'] : [] })) } })
+    if (path.endsWith('/agents')) return route.fulfill({ json: { protocol: 'farhelm/1', agents: ['a', 'b'].map(id => ({ agent_id: id, hostname: id, agent_version: '0.8.0', last_seen_unix: 1, online: true, credential_state: 'paired', capabilities: modern ? ['codex.session_context', 'codex.model_choice', 'codex.native_identity'] : [] })) } })
     if (path.endsWith('/projects')) return route.fulfill({ json: { protocol: 'farhelm/1', projects: ['a', 'b'].map(id => ({ agent_id: id, candidate_id: 'same-candidate', suggested_project_id: 'p', display_name: '项目', state: 'approved' })) } })
+    if (path.endsWith('/models')) return route.fulfill({ json: { models: [{ model: 'gpt-5.4', display_name: 'GPT-5.4', reasoning_efforts: ['medium', 'high'], default_reasoning_effort: 'medium', is_default: true }, { model: 'local-fast', display_name: 'Local Fast', reasoning_efforts: ['low'], default_reasoning_effort: 'low', is_default: false }] } })
     if (path.endsWith('/transcript')) { state.reads++; return route.fulfill({ json: { session_id: 's', turns: [{ turn_id: 't', status: 'completed', items: [{ item_id: 'i', kind: 'assistant_message', text: '这是合成验收内容。' }] }], context: state.context } }) }
     if (path.endsWith('/codex/sessions') && route.request().method() === 'POST') { state.creations.push(route.request().postDataJSON()); return route.fulfill({ json: { state: 'completed', data: { session_id: 's' } } }) }
     if (path.endsWith('/codex/sessions') || path.endsWith('/session-display')) return route.fulfill({ json: { protocol: 'farhelm/1', sessions: [session], incomplete_agents: [] } })
@@ -58,11 +59,11 @@ test('native model and permissions remain session facts, with readable long and 
   await page.getByRole('button', { name: '刷新对话' }).click()
   const model = page.getByRole('button', { name: /会话模型：custom-model-/ }); await expect(model).toBeVisible()
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
-  await model.click(); await expect(page.locator('.session-settings-details:visible dd').first()).toHaveText(state.context.model!)
+  await model.click(); await expect(page.getByText(`当前模型 ${state.context.model} 不在可用目录中，仍可沿用原设置。`)).toBeVisible()
   await page.keyboard.press('Escape'); await page.getByRole('button', { name: '会话权限：可编辑' }).click()
   await expect(page.getByText('网页暂不支持人工审批；需要你批准的操作会被拒绝，不会自动放行。')).toBeVisible()
   await page.keyboard.press('Escape'); state.context = {}; await page.getByRole('button', { name: '刷新对话' }).click()
-  await expect(page.getByRole('button', { name: '会话模型：模型未提供' })).toBeVisible()
+  await expect(page.getByRole('button', { name: '会话模型：选择模型' })).toBeVisible()
   await expect(page.getByRole('button', { name: '会话权限：跟随 Codex' })).toBeVisible()
   await page.getByLabel('给 Codex 发送指令').fill('保留草稿')
   state.context = { model: 'gpt-5.4', sandbox: 'read-only', approval_policy: 'on-request' }
@@ -96,4 +97,119 @@ test('older Agents are not represented as inheriting native permissions', async 
   await dialog.getByRole('combobox').click(); await page.getByTitle('项目 · a', { exact: true }).click()
   await expect(dialog.getByRole('button', { name: '创建会话', exact: true })).toBeDisabled()
   expect(state.creations).toEqual([])
+})
+
+test('model choices use native options, remain per session and freeze retry settings', async ({ page }) => {
+  await setup(page)
+  const requests: { body: unknown; identity: string | undefined }[] = []
+  await page.route('**/codex/sessions/s/messages', async route => {
+    requests.push({ body: route.request().postDataJSON(), identity: route.request().headers()['idempotency-key'] })
+    if (requests.length === 1) return route.fulfill({ status: 503, json: { error: 'agent_save_unconfirmed' } })
+    return route.fulfill({ json: { state: 'accepted' } })
+  })
+  await page.goto('/codex?session=s')
+  await page.getByRole('button', { name: /会话模型：gpt-5.4/ }).click()
+  await page.getByRole('combobox', { name: '选择模型', exact: true }).click()
+  await page.getByTitle('Local Fast', { exact: true }).click()
+  await expect(page.getByRole('combobox', { name: '选择推理强度' })).toBeVisible()
+  await page.keyboard.press('Escape')
+  await expect(page.getByRole('button', { name: '会话模型：local-fast，推理强度低' })).toBeVisible()
+  await page.getByLabel('给 Codex 发送指令').fill('使用选中的模型')
+  await page.getByRole('button', { name: '发送指令' }).click()
+  await expect(page.getByText('尚未确认 Agent 保存，重试会核对同一次操作')).toBeVisible()
+  await page.getByRole('button', { name: /会话模型：local-fast/ }).click()
+  await page.getByRole('combobox', { name: '选择模型', exact: true }).click()
+  await page.getByTitle('GPT-5.4', { exact: true }).click()
+  await page.keyboard.press('Escape')
+  await page.getByRole('button', { name: '发送指令' }).click()
+  await expect.poll(() => requests.length).toBe(2)
+  expect(requests[0].body).toEqual({ prompt: '使用选中的模型', delivery: 'queue', model_choice: { model: 'local-fast', reasoning_effort: 'low' } })
+  expect(requests[1]).toEqual(requests[0])
+})
+
+test('native identity exposes the same thread and renames only after server completion', async ({ page }) => {
+  await setup(page)
+  const names: string[] = []
+  await page.route('**/codex/sessions/s/native', route => route.fulfill({ json: { session_id: 's', persisted: true, native_name: names.at(-1) ?? 'Codex session', source: 'vscode', history_mode: 'paginated' } }))
+  await page.route('**/codex/sessions/s/name', async route => { names.push(route.request().postDataJSON().name); await new Promise(r => setTimeout(r, 250)); return route.fulfill({ json: { state: 'completed', data: { session_id: 's' } } }) })
+  await page.goto('/codex?session=s')
+  await page.getByRole('button', { name: '会话操作' }).click()
+  await page.getByRole('menuitem', { name: '在原生 Codex 中继续' }).click()
+  const dialog = page.getByRole('dialog', { name: '在原生 Codex 中继续' })
+  await expect(dialog.getByText('会话已保存在服务器 Codex 中')).toBeVisible()
+  await expect(dialog.locator('code')).toHaveText('codex resume s')
+  await dialog.getByRole('button', { name: '重命名会话' }).click()
+  const rename = page.getByRole('dialog', { name: '重命名会话' })
+  await rename.getByLabel('会话名称').fill('跨端统一名称')
+  await rename.getByRole('button', { name: '保存到 Codex' }).click()
+  await expect(rename).toBeHidden()
+  expect(names).toEqual(['跨端统一名称'])
+})
+
+test('composer has one surface and readable text without an inner focus frame', async ({ page }, info) => {
+  await setup(page)
+  for (const colorScheme of ['light', 'dark'] as const) {
+    await page.emulateMedia({ colorScheme }); await page.goto('/codex?session=s')
+    await page.getByLabel('给 Codex 发送指令').fill('中文输入与布局检查')
+    await page.getByLabel('给 Codex 发送指令').focus()
+    const values = await page.evaluate(() => {
+      const style = (selector: string) => getComputedStyle(document.querySelector(selector)!)
+      const input = style('.composer textarea')
+      return { frame: style('.composer').backgroundColor, tools: [...document.querySelectorAll('.composer-control')].map(n => getComputedStyle(n).backgroundColor), border: input.borderTopWidth, outline: input.outlineStyle, body: style('.message-body').fontSize, list: style('.session-copy > span').fontSize, bottom: document.querySelector('.composer-wrap')!.getBoundingClientRect().bottom, height: innerHeight }
+    })
+    expect(values.tools.every(c => c === 'rgba(0, 0, 0, 0)')).toBe(true)
+    expect(values.border).toBe('0px'); expect(values.outline).toBe('none')
+    expect(parseFloat(values.body)).toBeGreaterThanOrEqual(info.project.name === 'mobile' ? 16 : 17)
+    expect(parseFloat(values.list)).toBeGreaterThanOrEqual(15)
+    expect(values.bottom).toBeLessThanOrEqual(values.height)
+  }
+})
+
+test('native handoff reports busy safely and a deliberate retry uses a new operation', async ({ page }) => {
+  await setup(page)
+  let held = true
+  const identities: string[] = []
+  await page.route('**/codex/sessions/s/native', route => route.fulfill({ json: { session_id: 's', persisted: true, held_by_agent: held, native_name: '同一条原生会话' } }))
+  await page.route('**/codex/sessions/s/handoff', route => {
+    identities.push(route.request().headers()['idempotency-key'])
+    return route.fulfill({ json: { command_id: `handoff-${identities.length}`, state: 'accepted' } })
+  })
+  await page.route('**/commands/handoff-*', route => {
+    const failed = route.request().url().endsWith('handoff-1')
+    if (!failed) held = false
+    return route.fulfill({ json: { state: failed ? 'failed' : 'completed', detail: failed ? 'codex_handoff_busy' : undefined, data: { session_id: 's' } } })
+  })
+  await page.goto('/codex?session=s')
+  await page.getByRole('button', { name: '会话操作' }).click()
+  await page.getByRole('menuitem', { name: '在原生 Codex 中继续' }).click()
+  const dialog = page.getByRole('dialog', { name: '在原生 Codex 中继续' })
+  await dialog.getByRole('button', { name: '释放连接后继续' }).click()
+  await expect(dialog.getByText('Agent 正在读取或执行对话，请结束活动任务后再交接')).toBeVisible()
+  expect(held).toBe(true)
+  await dialog.getByRole('button', { name: '释放连接后继续' }).click()
+  await expect(dialog.getByText('已释放 FarHelm 的空闲连接，可以在原生客户端继续。')).toBeVisible()
+  await expect(dialog.getByRole('button', { name: '释放连接后继续' })).toHaveCount(0)
+  expect(new Set(identities).size).toBe(2)
+})
+
+test('model drafts belong to the selected session through rapid navigation', async ({ page }) => {
+  await setup(page)
+  const sessions = ['s', 'other'].map(id => ({ session_id: id, agent_id: 'a', project_id: 'p', title: id === 's' ? '会话设置验收' : '另一模型会话', mode: 'inspect', state: 'idle', updated_at_unix: 1 }))
+  await page.route('**/codex/sessions?*', route => route.fulfill({ json: { protocol: 'farhelm/1', sessions } }))
+  await page.route('**/session-display', route => route.fulfill({ json: { protocol: 'farhelm/1', sessions, incomplete_agents: [] } }))
+  await page.route('**/codex/sessions/other', route => route.fulfill({ json: sessions[1] }))
+  await page.route('**/codex/sessions/other/transcript*', route => route.fulfill({ json: { session_id: 'other', turns: [], context: { model: 'gpt-5.4', reasoning_effort: 'high' } } }))
+  await page.goto('/codex?session=s')
+  await page.getByRole('button', { name: /会话模型：/ }).click()
+  await page.getByRole('combobox', { name: '选择模型', exact: true }).click()
+  await page.getByTitle('Local Fast', { exact: true }).click()
+  await page.keyboard.press('Escape')
+  const choose = async (name: string) => {
+    if (page.viewportSize()!.width < 768) await page.getByRole('button', { name: '打开会话列表' }).click()
+    await page.getByRole('button', { name, exact: true }).filter({ visible: true }).click()
+  }
+  await choose('另一模型会话')
+  await expect(page.getByRole('button', { name: /会话模型：gpt-5.4/ })).toBeVisible()
+  await choose('会话设置验收')
+  await expect(page.getByRole('button', { name: /会话模型：local-fast/ })).toBeVisible()
 })

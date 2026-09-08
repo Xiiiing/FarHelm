@@ -1435,8 +1435,19 @@ async fn execute_remote_command(
             } else {
                 "codex.turn.failed"
             };
-            let error_detail =
-                "Codex operation failed; inspect the local Agent diagnostics".to_owned();
+            let error_detail = [
+                "codex_session_in_use",
+                "model_choice_unavailable",
+                "codex_handoff_busy",
+                "codex_handoff_unsaved",
+                "codex_handoff_background",
+                "codex_handoff_unconfirmed",
+                "codex_handoff_unverified",
+            ]
+            .into_iter()
+            .find(|code| error.chain().any(|e| e.to_string().contains(code)))
+            .unwrap_or("Codex operation failed; inspect the local Agent diagnostics")
+            .to_owned();
             let status = if event_type == "codex.turn.orphaned" {
                 "orphaned"
             } else {
@@ -1479,6 +1490,13 @@ async fn execute_remote_command_inner(
     worker_runtime: &CodexRuntime,
     command: &RemoteCommand,
 ) -> Result<serde_json::Value> {
+    let handoff =
+        command.action == CommandAction::CodexSessionResume && command.payload["handoff"] == true;
+    let _activity = if handoff {
+        None
+    } else {
+        Some(worker_runtime.codex.activity().await)
+    };
     if command.action == CommandAction::ProjectApprove {
         let candidate_ids = command
             .payload
@@ -1530,6 +1548,37 @@ async fn execute_remote_command_inner(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("inspect");
     match command.action {
+        CommandAction::CodexSessionResume if handoff => {
+            let session_id = command.payload["session_id"]
+                .as_str()
+                .context("handoff omitted session")?;
+            let binding = store
+                .session_binding(session_id)?
+                .context("handoff references unknown session")?;
+            ensure!(binding.project_id == project_id, "session_project_mismatch");
+            worker_runtime.codex.handoff(session_id).await
+        }
+        CommandAction::CodexSessionResume if command.payload.get("rename_to").is_some() => {
+            let session_id = command.payload["session_id"]
+                .as_str()
+                .context("rename omitted session")?;
+            let name = command.payload["rename_to"]
+                .as_str()
+                .context("rename omitted name")?;
+            let binding = store
+                .session_binding(session_id)?
+                .context("rename references unknown session")?;
+            ensure!(binding.project_id == project_id, "session_project_mismatch");
+            let result = worker_runtime
+                .codex
+                .call(
+                    "codex.session.rename",
+                    serde_json::json!({"session_id":session_id,"name":name}),
+                )
+                .await?;
+            store.enqueue_event(&format!("{}:rename",command.command_id), "codex.session.updated", &serde_json::json!({"session_id":session_id,"project_id":project_id,"mode":binding.mode,"state":"idle","title":name,"active_turn_id":null,"update_kind":"metadata","updated_at_unix":unix_time()}), unix_time())?;
+            Ok(result)
+        }
         CommandAction::CodexSessionCreate | CommandAction::CodexSessionResume => {
             let method = if command.action == CommandAction::CodexSessionCreate {
                 "codex.session.start"
@@ -1607,7 +1656,13 @@ async fn execute_remote_command_inner(
                 prompt,
                 idempotency_key: command.command_id.clone(),
             };
-            let (_, turn_id) = run_auto_prompt_inner(store, worker_runtime, &job).await?;
+            let choice = command
+                .payload
+                .get("model_choice")
+                .map(|v| serde_json::from_value::<farhelm_protocol::CodexModelChoice>(v.clone()))
+                .transpose()?;
+            let (_, turn_id) =
+                run_auto_prompt_inner(store, worker_runtime, &job, choice.as_ref()).await?;
             Ok(serde_json::json!({"session_id":session_id,"turn_id":turn_id}))
         }
         CommandAction::CodexTurnSteer | CommandAction::CodexTurnInterrupt => {
@@ -1659,7 +1714,7 @@ async fn run_scheduled_prompt(
             prompt: prompt.prompt,
             idempotency_key: prompt.schedule_id.clone(),
         };
-        run_auto_prompt_inner(&store, worker, &job).await
+        run_auto_prompt_inner(&store, worker, &job, None).await
     }
     .await;
     let state = match &result {
@@ -1844,7 +1899,7 @@ async fn run_auto_prompt(
     job: AutoPrompt,
 ) -> Result<()> {
     let store = ExperimentStore::open_async(database).await?;
-    let result = run_auto_prompt_inner(&store, worker_runtime, &job).await;
+    let result = run_auto_prompt_inner(&store, worker_runtime, &job, None).await;
     let now = unix_time();
     match result {
         Ok((session_id, turn_id)) => store.finish_auto_prompt(
@@ -1881,7 +1936,9 @@ async fn run_auto_prompt_inner(
     store: &ExperimentStore,
     worker_runtime: &CodexRuntime,
     job: &AutoPrompt,
+    model_choice: Option<&farhelm_protocol::CodexModelChoice>,
 ) -> Result<(String, String)> {
+    let _activity = worker_runtime.codex.activity().await;
     let (cwd, mode) = if let Some(session_id) = &job.session_id {
         if let Some(binding) = store.session_binding(session_id)? {
             ensure!(
@@ -1942,7 +1999,7 @@ async fn run_auto_prompt_inner(
     }
     enqueue_session_state(store, job, &session_id, &mode, "queued", "session-ready")?;
     let sequence = std::sync::atomic::AtomicU64::new(0);
-    let result = worker_runtime.codex.turn(&session_id, &job.prompt, &job.idempotency_key, |event_type, data| {
+    let result = worker_runtime.codex.turn_with_model(&session_id, &job.prompt, &job.idempotency_key, model_choice, |event_type, data| {
         let event_number = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let payload = serde_json::json!({"operation_id":job.watch_id,"watch_id":job.watch_id,"project_id":job.project_id,"session_id":session_id,"data":data});
         let session_id = &session_id;
@@ -2049,7 +2106,10 @@ async fn read_request(
     store: &ExperimentStore,
     request: farhelm_protocol::AgentReadRequest,
 ) -> Result<AgentReadReportRequest> {
-    let outcome = if request.method == "codex.session.history" {
+    let outcome = if matches!(
+        request.method.as_str(),
+        "codex.session.history" | "codex.models.list" | "codex.session.native"
+    ) {
         let session_id = request
             .params
             .get("session_id")
@@ -2069,9 +2129,16 @@ async fn read_request(
             .codex
             .call(&request.method, request.params)
             .await
-            .and_then(|value| {
-                let page: farhelm_protocol::CodexTranscriptPage = serde_json::from_value(value)?;
-                Ok(serde_json::to_value(page)?)
+            .and_then(|value| match request.method.as_str() {
+                "codex.models.list" => Ok(serde_json::to_value(serde_json::from_value::<
+                    farhelm_protocol::CodexModelList,
+                >(value)?)?),
+                "codex.session.native" => Ok(serde_json::to_value(serde_json::from_value::<
+                    farhelm_protocol::CodexNativeIdentity,
+                >(value)?)?),
+                _ => Ok(serde_json::to_value(serde_json::from_value::<
+                    farhelm_protocol::CodexTranscriptPage,
+                >(value)?)?),
             })
     } else if request.method == "codex.session.display" {
         let ids: Option<Vec<String>> = request

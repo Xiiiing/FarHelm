@@ -129,12 +129,144 @@ async fn native_resume_inherits_settings_and_creation_retains_explicit_legacy_mo
             .filter(|v| v["method"] == "thread/start")
             .collect::<Vec<_>>();
         assert_eq!(starts.len(), 3);
+        assert!(starts.iter().all(|v| v["params"]["ephemeral"] == false));
+        assert!(
+            recorded.iter().all(|v| v["method"] != "thread/name/set"),
+            "new native sessions must not acquire a generic forced name"
+        );
         assert!(starts[0]["params"].get("sandbox").is_none());
         assert!(starts[0]["params"].get("approvalPolicy").is_none());
         assert_eq!(starts[1]["params"]["sandbox"], "read-only");
         assert_eq!(starts[2]["params"]["sandbox"], "workspace-write");
         native.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn model_choices_follow_native_catalog_and_never_override_permissions() {
+    let directory = tempfile::tempdir().unwrap();
+    let bin = fixture(directory.path(), "0.153.4");
+    let record = directory.path().join("model-requests");
+    let script = std::fs::read_to_string(&bin).unwrap()
+        .replace(" [ -n \"$id\" ] || continue", &format!(" [ -n \"$id\" ] || continue\n printf '%s\\n' \"$line\" >> '{}'", record.display()))
+        .replace("  *) result='{}' ;;", r#"  *'"method":"model/list"'*)
+   case "$line" in
+    *'"cursor":"second"'*) result='{"data":[{"model":"local-fast","displayName":"Fast","supportedReasoningEfforts":[{"reasoningEffort":"low"}],"defaultReasoningEffort":"low","hidden":false}],"nextCursor":null}' ;;
+    *) result='{"data":[{"model":"local-deep","displayName":"Deep","supportedReasoningEfforts":[{"reasoningEffort":"medium"},{"reasoningEffort":"high"}],"defaultReasoningEffort":"medium","isDefault":true},{"model":"hidden","hidden":true},{"model":"/private/model"}],"nextCursor":"second"}' ;;
+   esac ;;
+  *) result='{}' ;;"#);
+    transport::write_fixture_executable(&bin, &script);
+    let native = Codex::new(Some(bin));
+    native
+        .call(
+            "codex.session.start",
+            json!({"cwd":"/tmp/project","mode":"inspect","inherit_permissions":true}),
+        )
+        .await
+        .unwrap();
+    let catalog = native.call("codex.models.list", json!({})).await.unwrap();
+    assert_eq!(catalog["models"].as_array().unwrap().len(), 2);
+    let good = farhelm_protocol::CodexModelChoice {
+        model: "local-deep".into(),
+        reasoning_effort: "high".into(),
+    };
+    native
+        .turn_with_model("new", "hello", "chosen", Some(&good), |_, _| async {
+            Ok(())
+        })
+        .await
+        .unwrap();
+    for invalid in [
+        farhelm_protocol::CodexModelChoice {
+            model: "local-fast".into(),
+            reasoning_effort: "high".into(),
+        },
+        farhelm_protocol::CodexModelChoice {
+            model: "missing".into(),
+            reasoning_effort: "low".into(),
+        },
+    ] {
+        assert!(
+            native
+                .turn_with_model("new", "hello", "invalid", Some(&invalid), |_, _| async {
+                    Ok(())
+                })
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("model_choice_unavailable")
+        );
+    }
+    native.shutdown().await;
+    let requests: Vec<Value> = std::fs::read_to_string(record)
+        .unwrap()
+        .lines()
+        .map(|v| serde_json::from_str(v).unwrap())
+        .collect();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|v| v["method"] == "model/list")
+            .count(),
+        2,
+        "cached catalog must avoid redundant native reads"
+    );
+    let turns: Vec<_> = requests
+        .iter()
+        .filter(|v| v["method"] == "turn/start")
+        .collect();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0]["params"]["model"], "local-deep");
+    assert_eq!(turns[0]["params"]["effort"], "high");
+    assert!(turns[0]["params"].get("sandboxPolicy").is_none());
+    assert!(turns[0]["params"].get("approvalPolicy").is_none());
+}
+
+#[tokio::test]
+async fn native_rename_updates_index_and_rejects_invalid_names() {
+    let directory = tempfile::tempdir().unwrap();
+    let native = Codex::new(Some(fixture(directory.path(), "0.153.4")));
+    native
+        .call(
+            "codex.sessions.list",
+            json!({"project_path":"/tmp/project","archived":"all"}),
+        )
+        .await
+        .unwrap();
+    native
+        .call(
+            "codex.session.rename",
+            json!({"session_id":"s","name":"可在原生客户端找到的名称"}),
+        )
+        .await
+        .unwrap();
+    let listing = native
+        .call(
+            "codex.sessions.list",
+            json!({"project_path":"/tmp/project","archived":"all"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listing["sessions"][0]["title"], "可在原生客户端找到的名称");
+    assert!(
+        native
+            .call(
+                "codex.session.rename",
+                json!({"session_id":"s","name":"Codex session"})
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        native
+            .call(
+                "codex.session.rename",
+                json!({"session_id":"s","name":"/private/path"})
+            )
+            .await
+            .is_err()
+    );
+    native.shutdown().await;
 }
 
 #[tokio::test]
@@ -522,4 +654,102 @@ async fn loaded_empty_thread_can_send_and_interleaved_items_keep_offsets_before_
         2
     );
     native.shutdown().await;
+}
+
+#[tokio::test]
+async fn handoff_refuses_active_unsaved_and_background_work_then_closes_stdio() {
+    let directory = tempfile::tempdir().unwrap();
+    let bin = directory.path().join("codex");
+    let row_path = directory.path().join("row");
+    let terminal_path = directory.path().join("terminals");
+    let rollout = directory.path().join("rollout");
+    let closed = directory.path().join("closed");
+    let mut row = json!({"thread":{"id":"s","cwd":"/tmp/project","path":rollout,"status":{"type":"idle"},"turns":[]}});
+    std::fs::write(&row_path, row.to_string()).unwrap();
+    std::fs::write(&terminal_path, r#"{"data":[],"nextCursor":null}"#).unwrap();
+    transport::write_fixture_executable(
+        &bin,
+        &r#"#!/bin/sh
+if [ "$1" = '--version' ]; then printf 'codex-cli 0.153.4\n'; exit 0; fi
+while IFS= read -r line; do
+ id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+ [ -n "$id" ] || continue
+ case "$line" in
+  *'"method":"initialize"'*) result='{"userAgent":"fixture"}' ;;
+  *'"method":"account/read"'*) result='{"requiresOpenaiAuth":false,"account":null}' ;;
+  *'"method":"thread/start"'*|*'"method":"thread/read"'*) result=$(cat 'ROW') ;;
+  *'"method":"thread/loaded/list"'*) result='{"data":["s"],"nextCursor":null}' ;;
+  *'"method":"thread/backgroundTerminals/list"'*) result=$(cat 'TERMINALS') ;;
+  *) result='{}' ;;
+ esac
+ printf '{"id":%s,"result":%s}\n' "$id" "$result"
+done
+printf 'closed\n' >> 'CLOSED'
+"#
+        .replace("ROW", row_path.to_str().unwrap())
+        .replace("TERMINALS", terminal_path.to_str().unwrap())
+        .replace("CLOSED", closed.to_str().unwrap()),
+    );
+    let native = Codex::new(Some(bin));
+    native
+        .call(
+            "codex.session.start",
+            json!({"cwd":"/tmp/project","mode":"inspect"}),
+        )
+        .await
+        .unwrap();
+    let connection = native.connection().await.unwrap();
+    let active = native.activity().await;
+    assert!(
+        native
+            .handoff("s")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("codex_handoff_busy")
+    );
+    drop(active);
+    assert!(
+        native
+            .handoff("s")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("codex_handoff_unsaved")
+    );
+    std::fs::write(&rollout, "synthetic").unwrap();
+    row["thread"]["status"]["type"] = json!("active");
+    std::fs::write(&row_path, row.to_string()).unwrap();
+    assert!(
+        native
+            .handoff("s")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("codex_handoff_busy")
+    );
+    row["thread"]["status"]["type"] = json!("idle");
+    std::fs::write(&row_path, row.to_string()).unwrap();
+    std::fs::write(
+        &terminal_path,
+        r#"{"data":[{"command":"PRIVATE_COMMAND","cwd":"PRIVATE_PATH"}],"nextCursor":null}"#,
+    )
+    .unwrap();
+    let error = native.handoff("s").await.unwrap_err().to_string();
+    assert_eq!(error, "codex_handoff_background");
+    assert!(connection.alive.load(Ordering::Acquire));
+    assert!(!closed.exists());
+    std::fs::write(&terminal_path, r#"{"data":[],"nextCursor":null}"#).unwrap();
+    assert_eq!(
+        native.handoff("s").await.unwrap(),
+        json!({"session_id":"s"})
+    );
+    assert!(!connection.alive.load(Ordering::Acquire));
+    assert_eq!(std::fs::read_to_string(closed).unwrap(), "closed\n");
+    // A duplicate handoff cannot restart a process or acquire a fresh native writer.
+    assert_eq!(
+        native.handoff("s").await.unwrap(),
+        json!({"session_id":"s"})
+    );
+    assert!(native.inner.connection.lock().await.is_none());
 }

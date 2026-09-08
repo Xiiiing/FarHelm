@@ -9,6 +9,12 @@ export type CodexSession = { session_id: string; agent_id: string; project_id: s
 export type TranscriptItem = { item_id: string; kind: 'user_message' | 'assistant_message' | 'command_summary' | 'file_change_summary' | 'error'; text: string; text_offset?: number; text_complete?: boolean; status?: string; exit_code?: number; duration_ms?: number; streaming?: boolean }
 export type TranscriptTurn = { turn_id: string; status: string; started_at_unix?: number; completed_at_unix?: number; items: TranscriptItem[] }
 export type SessionContext = { model?: string; reasoning_effort?: string; sandbox?: string; approval_policy?: string; approvals_reviewer?: string }
+export type ModelChoice = { model: string; reasoning_effort: string }
+export type ModelOption = { model: string; display_name: string; reasoning_efforts: string[]; default_reasoning_effort: string; is_default: boolean }
+export type NativeIdentity = { session_id: string; persisted: boolean; held_by_agent?: boolean; native_name?: string; source?: string; history_mode?: string }
+export function fetchModels(sessionId: string, signal?: AbortSignal) { return json<{ models: ModelOption[] }>(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/models`, signal) }
+export function fetchNativeIdentity(sessionId: string, signal?: AbortSignal) { return json<NativeIdentity>(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/native`, signal) }
+export function renameSession(csrf: string, sessionId: string, name: string) { return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/name`, csrf, { name }) }
 export type TranscriptPage = { older_loaded?: boolean; protocol?: string; session_id: string; turns: TranscriptTurn[]; context?: SessionContext; next_cursor?: string; continuation?: { kind: 'message' | 'history'; turn_id: string; item_id: string; text_offset: number } }
 export type DisplayPage = { sessions: CodexSession[]; next_cursor?: string; incomplete_agents: { agent_id: string; reason: string }[] }
 export async function fetchSessionDisplay(csrf: string, request: { mode: 'labels' | 'search'; session_ids?: string[]; query?: string; agent_id?: string; project_id?: string; archived?: 'false' | 'true' | 'all'; cursor?: string }, signal?: AbortSignal): Promise<DisplayPage> {
@@ -68,14 +74,24 @@ const pendingOperations = new Map<string, string>()
 const savedReceipts = new Map<string, { identity: string; key: string }>()
 let receiptGeneration = 0
 export function clearOperationReceipts() { pendingOperations.clear(); savedReceipts.clear(); receiptGeneration++ }
-export type Operation = { command_id?: string; state?: string; status_url?: string; data?: { turn_id?: string; session_id?: string }; result?: { turn_id?: string; session_id?: string } }
+export type Operation = { command_id?: string; state?: string; detail?: string; status_url?: string; data?: { turn_id?: string; session_id?: string }; result?: { turn_id?: string; session_id?: string } }
+const codexErrors: Record<string, string> = {
+  codex_session_in_use: '会话正由其他 Codex 客户端占用，请关闭那边的会话连接后再发送',
+  model_choice_unavailable: '所选模型或推理强度已不可用，请重新选择',
+  codex_handoff_busy: 'Agent 正在读取或执行对话，请结束活动任务后再交接',
+  codex_handoff_unsaved: 'Agent 还有尚未落盘的空会话，请先发送消息并等待保存',
+  codex_handoff_background: 'Codex 还有后台终端任务，请先在原客户端处理完再交接',
+  codex_handoff_unverified: '暂时无法确认 Codex 已空闲，连接尚未释放，请稍后重试',
+  codex_handoff_unconfirmed: '连接退出尚未确认，请重新核对原生会话状态',
+}
+export function codexOperationError(detail?: string) { return codexErrors[detail ?? ''] }
 export class ApiError extends Error {
   constructor(message: string, public code: string, public status: number) { super(message); this.name = 'ApiError' }
 }
 async function apiError(response: Response) {
   const value = await response.json().catch(() => ({})) as { error?: string }
-  const errors: Record<string, string> = { operation_expired: '这次操作已过期，草稿已保留；核对状态后可修改指令重新提交', operation_failed: '这次操作已失败，草稿已保留；请先核对执行结果', agent_offline: 'Agent 离线，连接恢复后重试', agent_upgrade_required: '请先升级 Agent 至 V0.9.0', agent_save_unconfirmed: '尚未确认 Agent 保存，重试会核对同一次操作', invalid_schedule_time: '时间必须在 60 秒至 365 天之间', session_is_not_running: '当前会话已没有活动对话', visible_turn_changed: '活动对话已改变，请刷新后再操作', idempotency_conflict: '操作身份与之前的请求冲突' }
-  return new ApiError(errors[value.error ?? ''] ?? (response.status === 401 ? '登录已过期，请重新登录' : `请求失败（HTTP ${response.status}）${value.error ? `：${value.error}` : ''}`), value.error ?? 'request_failed', response.status)
+  const errors: Record<string, string> = { operation_expired: '这次操作已过期，草稿已保留；核对状态后可修改指令重新提交', operation_failed: '这次操作已失败，草稿已保留；请先核对执行结果', agent_offline: 'Agent 离线，连接恢复后重试', agent_upgrade_required: '当前 Agent 尚不支持此功能，请更新 Agent', agent_save_unconfirmed: '尚未确认 Agent 保存，重试会核对同一次操作', invalid_schedule_time: '时间必须在 60 秒至 365 天之间', session_is_not_running: '当前会话已没有活动对话', visible_turn_changed: '活动对话已改变，请刷新后再操作', idempotency_conflict: '操作身份与之前的请求冲突', invalid_model_choice: '模型或推理强度无效，请重新选择', model_change_requires_queue: '切换模型需要排队下一轮', invalid_session_name: '请输入 1–128 字的明确名称，不能包含路径或控制字符' }
+  return new ApiError(errors[value.error ?? ''] ?? codexErrors[value.error ?? ''] ?? (response.status === 401 ? '登录已过期，请重新登录' : `请求失败（HTTP ${response.status}）${value.error ? `：${value.error}` : ''}`), value.error ?? 'request_failed', response.status)
 }
 export async function mutate(url: string, csrf: string, body?: unknown, method = 'POST', operationId?: string): Promise<Operation> {
   const generation = receiptGeneration
@@ -113,7 +129,10 @@ export async function waitForCommand(operation: Operation): Promise<Operation> {
         if (!status?.state || !['completed', 'failed', 'expired', 'unknown', 'orphaned'].includes(status.state)) return
         clearTimeout(timer); unsubscribe()
         if (status.state === 'completed') { savedReceipts.delete(id); resolve(status) }
-        else reject(new Error(`操作结果：${status.state}`))
+        else {
+          if (['failed', 'expired'].includes(status.state)) savedReceipts.delete(id)
+          reject(new Error(codexErrors[status.detail ?? ''] ?? `操作结果：${status.state}`))
+        }
       }
       const observer = new QueryObserver<Operation>(queryClient, { queryKey: keys.operation(id), queryFn: ({ signal }) => json<Operation>(`/api/v1/commands/${encodeURIComponent(id)}`, signal), staleTime: Infinity })
       unsubscribe = observer.subscribe(check)
@@ -129,11 +148,14 @@ export async function waitForCommand(operation: Operation): Promise<Operation> {
 export function createSession(csrf: string, agentId: string, projectId: string, mode: 'inspect' | 'edit', inheritPermissions = false) {
   return mutate('/api/v1/codex/sessions', csrf, { agent_id: agentId, project_id: projectId, mode, ...(inheritPermissions ? { inherit_permissions: true } : {}) })
 }
-export function sendMessage(csrf: string, sessionId: string, prompt: string, delivery: 'queue' | 'steer', turnId?: string, operationId?: string) {
-  return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/messages`, csrf, { prompt, delivery, ...(delivery === 'steer' ? { turn_id: turnId } : {}) }, 'POST', operationId)
+export function sendMessage(csrf: string, sessionId: string, prompt: string, delivery: 'queue' | 'steer', turnId?: string, operationId?: string, modelChoice?: ModelChoice) {
+  return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/messages`, csrf, { prompt, delivery, ...(delivery === 'steer' ? { turn_id: turnId } : {}), ...(modelChoice ? { model_choice: modelChoice } : {}) }, 'POST', operationId)
 }
 export function interruptSession(csrf: string, sessionId: string, turnId?: string) {
   return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/interrupt`, csrf, { turn_id: turnId })
+}
+export function handoffSession(csrf: string, sessionId: string) {
+  return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/handoff`, csrf, {})
 }
 export function createSchedule(csrf: string, sessionId: string, prompt: string, trigger: ScheduleTrigger) {
   return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/schedules`, csrf, { prompt, trigger })

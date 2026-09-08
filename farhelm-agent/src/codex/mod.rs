@@ -1,6 +1,8 @@
 //! Local Codex is the transcript/authentication authority. No vendor body is a Hub record.
 mod context;
+mod handoff;
 pub mod history;
+mod models;
 mod protocol;
 #[cfg(test)]
 mod tests;
@@ -49,6 +51,8 @@ struct Inner {
     inflight: Mutex<HashMap<String, WeakShared<SharedRead>>>,
     status: watch::Sender<CodexStatus>,
     loaded: RwLock<HashMap<String, LoadedThread>>,
+    models: Mutex<Option<(Instant, farhelm_protocol::CodexModelList)>>,
+    activity: RwLock<()>,
 }
 struct LoadedThread {
     thread: Value,
@@ -72,6 +76,8 @@ impl Codex {
                 reads: Arc::new(Semaphore::new(4)),
                 inflight: Mutex::new(HashMap::new()),
                 loaded: RwLock::new(HashMap::new()),
+                models: Mutex::new(None),
+                activity: RwLock::new(()),
                 status: watch::channel(CodexStatus {
                     state: "starting".into(),
                     version: None,
@@ -88,6 +94,7 @@ impl Codex {
         self.inner.status.subscribe()
     }
     pub async fn warm(&self) -> Result<()> {
+        let _activity = self.activity().await;
         let connection = self.connection().await?;
         self.refresh_account(&connection).await
     }
@@ -335,7 +342,14 @@ impl Codex {
     }
 
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
-        if !matches!(method, "codex.session.history" | "codex.session.display") {
+        let _activity = self.activity().await;
+        if !matches!(
+            method,
+            "codex.session.history"
+                | "codex.session.display"
+                | "codex.models.list"
+                | "codex.session.native"
+        ) {
             return self.call_inner(method, params).await;
         }
         let key = serde_json::to_string(&(method, &params))?;
@@ -367,6 +381,70 @@ impl Codex {
     async fn call_inner(&self, method: &str, params: Value) -> Result<Value> {
         let _permit = self.inner.reads.acquire().await?;
         match method {
+            "codex.models.list" => Ok(serde_json::to_value(self.model_list().await?)?),
+            "codex.session.native" => {
+                let id = params["session_id"]
+                    .as_str()
+                    .context("session_id_missing")?;
+                let value = self
+                    .connection()
+                    .await?
+                    .request("thread/read", json!({"threadId":id,"includeTurns":false}))
+                    .await?;
+                let thread = &value["thread"];
+                ensure!(thread["id"] == id, "session_identity_mismatch");
+                let persisted = thread["ephemeral"] != true
+                    && thread["path"]
+                        .as_str()
+                        .is_some_and(|p| std::path::Path::new(p).is_file());
+                let native_name = thread["name"]
+                    .as_str()
+                    .filter(|s| s.chars().count() <= 128)
+                    .map(history::redact_paths);
+                Ok(serde_json::to_value(
+                    farhelm_protocol::CodexNativeIdentity {
+                        session_id: id.into(),
+                        persisted,
+                        held_by_agent: self.inner.loaded.read().await.contains_key(id),
+                        native_name,
+                        source: thread["source"]
+                            .as_str()
+                            .filter(|s| {
+                                matches!(*s, "cli" | "vscode" | "exec" | "appServer" | "unknown")
+                            })
+                            .map(str::to_owned),
+                        history_mode: thread["historyMode"]
+                            .as_str()
+                            .filter(|s| matches!(*s, "legacy" | "paginated"))
+                            .map(str::to_owned),
+                    },
+                )?)
+            }
+            "codex.session.rename" => {
+                let id = params["session_id"]
+                    .as_str()
+                    .context("session_id_missing")?;
+                let name = params["name"].as_str().context("session_name_missing")?;
+                ensure!(
+                    farhelm_protocol::valid_session_name(name),
+                    "invalid_session_name"
+                );
+                self.connection()
+                    .await?
+                    .request("thread/name/set", json!({"threadId":id,"name":name}))
+                    .await?;
+                let mut index = self.inner.index.write().await;
+                index.revision += 1;
+                let revision = index.revision;
+                index.changed.insert(id.into(), revision);
+                if let Some(row) = index.rows.get_mut(id) {
+                    row["name"] = json!(name);
+                }
+                if let Some(loaded) = self.inner.loaded.write().await.get_mut(id) {
+                    loaded.thread["name"] = json!(name);
+                }
+                Ok(json!({"session_id":id}))
+            }
             "codex.projects.discover" => {
                 let rows = self.index(true).await?;
                 let mut projects = BTreeMap::<String, Value>::new();
@@ -555,6 +633,9 @@ impl Codex {
                     return Ok(thread_result(&loaded.thread));
                 }
                 let mut request = json!({"cwd":params["cwd"]});
+                if method == "codex.session.start" {
+                    request["ephemeral"] = json!(false);
+                }
                 // Resuming belongs to Codex: explicit overrides here would erase the user's
                 // persisted permission profile and approval policy. Legacy explicit creation
                 // still supports inspect/edit; the Console opts into native project defaults.
@@ -590,9 +671,6 @@ impl Codex {
                     .await?;
                 let thread = &response["thread"];
                 ensure!(thread["cwd"] == params["cwd"], "session_project_mismatch");
-                if method == "codex.session.start" {
-                    connection.request("thread/name/set",json!({"threadId":thread["id"],"name":history::formal_title(&thread["name"]).unwrap_or_else(||"Codex session".into())})).await?;
-                }
                 let mut row = thread.clone();
                 row["archived"] = json!(false);
                 if let Some(id) = row["id"].as_str() {
@@ -606,7 +684,11 @@ impl Codex {
                             context: context::project(&response, None),
                         },
                     );
-                    self.inner.index.write().await.rows.insert(id, row);
+                    let mut index = self.inner.index.write().await;
+                    index.revision += 1;
+                    let revision = index.revision;
+                    index.changed.insert(id.clone(), revision);
+                    index.rows.insert(id, row);
                 }
                 Ok(thread_result(thread))
             }
@@ -647,17 +729,59 @@ impl Codex {
         }
     }
 
+    #[cfg(test)]
     pub async fn turn<F, Fut>(
         &self,
         session: &str,
         prompt: &str,
         operation: &str,
+        emit: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&'static str, Value) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        self.turn_with_model(session, prompt, operation, None, emit)
+            .await
+    }
+
+    pub async fn model_list(&self) -> Result<farhelm_protocol::CodexModelList> {
+        let mut cached = self.inner.models.lock().await;
+        if let Some((time, models)) = &*cached
+            && time.elapsed() < Duration::from_secs(30)
+        {
+            return Ok(models.clone());
+        }
+        let connection = self.connection().await?;
+        let models = tokio::time::timeout(Duration::from_secs(15), models::list(&connection))
+            .await
+            .context("codex_models_timeout")??;
+        *cached = Some((Instant::now(), models.clone()));
+        Ok(models)
+    }
+
+    pub async fn turn_with_model<F, Fut>(
+        &self,
+        session: &str,
+        prompt: &str,
+        operation: &str,
+        choice: Option<&farhelm_protocol::CodexModelChoice>,
         mut emit: F,
     ) -> Result<String>
     where
         F: FnMut(&'static str, Value) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
+        let _activity = self.activity().await;
+        if let Some(choice) = choice {
+            ensure!(choice.is_valid(), "invalid_model_choice");
+            let models = self.model_list().await?;
+            ensure!(
+                models.models.iter().any(|m| m.model == choice.model
+                    && m.reasoning_efforts.contains(&choice.reasoning_effort)),
+                "model_choice_unavailable"
+            );
+        }
         let connection = self.connection().await?;
         let mut events = connection.events.subscribe();
         if let Some(loaded) = self.inner.loaded.write().await.get_mut(session) {
@@ -670,6 +794,8 @@ impl Codex {
                     thread_id: session,
                     input: [UserInput::Text { text: prompt }],
                     client_user_message_id: operation,
+                    model: choice.map(|c| c.model.as_str()),
+                    effort: choice.map(|c| c.reasoning_effort.as_str()),
                 })?,
             )
             .await

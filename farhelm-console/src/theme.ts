@@ -2,7 +2,7 @@ import { theme, type ThemeConfig } from 'antd'
 
 export type ColorMode = 'light' | 'dark'
 
-export const uiFont = '"Manrope Variable", "Noto Sans SC Variable", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif'
+export const uiFont = '-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans SC Variable", "Microsoft YaHei", system-ui, sans-serif'
 export const palettes = {
   light: { canvas: '#F7F7F7', surface: '#FFFFFF', raised: '#F0F0F0', border: '#E3E3E3', text: '#181818', muted: '#666666', danger: '#181818', selection: '#EAEAEA' },
   dark: { canvas: '#171717', surface: '#212121', raised: '#303030', border: '#414141', text: '#F5F5F5', muted: '#B5B5B5', danger: '#F5F5F5', selection: '#383838' },
@@ -72,6 +72,7 @@ const common: ThemeConfig['token'] = {
   borderRadiusLG: 20,
   borderRadiusSM: 10,
   controlHeight: 44,
+  fontSize: 15,
   fontFamily: uiFont,
   fontFamilyCode:
     'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace',

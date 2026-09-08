@@ -22,7 +22,7 @@ type Reply = std::result::Result<Value, String>;
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Reply>>>>;
 
 pub struct Connection {
-    stdin: Arc<AsyncMutex<ChildStdin>>,
+    stdin: Arc<AsyncMutex<Option<ChildStdin>>>,
     pending: Pending,
     next_id: AtomicU64,
     pub alive: Arc<AtomicBool>,
@@ -42,9 +42,9 @@ impl Connection {
             .kill_on_drop(true)
             .spawn()
             .context("codex_start_failed")?;
-        let stdin = Arc::new(AsyncMutex::new(
+        let stdin = Arc::new(AsyncMutex::new(Some(
             child.stdin.take().context("codex_stdin_missing")?,
-        ));
+        )));
         let stdout = child.stdout.take().context("codex_stdout_missing")?;
         let pending: Pending = Arc::default();
         let alive = Arc::new(AtomicBool::new(true));
@@ -113,7 +113,14 @@ impl Connection {
                     if let Some(sender) = sender {
                         let result = if value.get("error").is_some() {
                             // Vendor error text may contain prompts, paths or credentials.
-                            Err(format!("codex_request_rejected:{}", value["error"]["code"]))
+                            if value["error"]["message"]
+                                .as_str()
+                                .is_some_and(|s| s.contains("already has an active writer"))
+                            {
+                                Err("codex_session_in_use".into())
+                            } else {
+                                Err(format!("codex_request_rejected:{}", value["error"]["code"]))
+                            }
                         } else {
                             Ok(value["result"].clone())
                         };
@@ -202,6 +209,18 @@ impl Connection {
         let _ = child.wait().await;
         self.reader.abort();
     }
+
+    /// Only called after the owner verifies that every loaded thread is idle.
+    /// Closing stdin lets Codex flush and release its writers without a forced kill.
+    pub async fn close_idle(&self) -> Result<()> {
+        self.stdin.lock().await.take();
+        tokio::time::timeout(Duration::from_secs(5), self.child.lock().await.wait())
+            .await
+            .context("codex_handoff_unconfirmed")??;
+        self.alive.store(false, Ordering::Release);
+        self.reader.abort();
+        Ok(())
+    }
 }
 
 impl Drop for Connection {
@@ -221,13 +240,15 @@ impl Drop for PendingGuard {
     }
 }
 
-async fn write_json(stdin: &AsyncMutex<ChildStdin>, value: &Value) -> Result<()> {
+async fn write_json(stdin: &AsyncMutex<Option<ChildStdin>>, value: &Value) -> Result<()> {
     let mut bytes = serde_json::to_vec(value)?;
     ensure!(bytes.len() as u64 <= MAX_FRAME, "codex_request_too_large");
     bytes.push(b'\n');
     stdin
         .lock()
         .await
+        .as_mut()
+        .context("codex_connection_closed")?
         .write_all(&bytes)
         .await
         .context("codex_write_failed")

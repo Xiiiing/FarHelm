@@ -56,6 +56,8 @@ impl AgentHeartbeat {
                 "codex.item_offsets".to_owned(),
                 "codex.native".to_owned(),
                 "codex.session_context".to_owned(),
+                "codex.model_choice".to_owned(),
+                "codex.native_identity".to_owned(),
                 "agent.live".to_owned(),
             ],
             protocol: FARHELM_PROTOCOL.to_owned(),
@@ -560,6 +562,65 @@ pub struct SendCodexMessageRequest {
     pub turn_id: Option<String>,
     #[serde(default = "default_prompt_delivery")]
     pub delivery: PromptDelivery,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_choice: Option<CodexModelChoice>,
+}
+
+/// Explicit next-turn settings, persisted only with the Agent's prompt receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexModelChoice {
+    pub model: String,
+    pub reasoning_effort: String,
+}
+
+impl CodexModelChoice {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        valid_model_id(&self.model) && valid_reasoning_effort(&self.reasoning_effort)
+    }
+}
+
+#[must_use]
+pub fn valid_model_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+}
+
+#[must_use]
+pub fn valid_reasoning_effort(value: &str) -> bool {
+    matches!(
+        value,
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexModelOption {
+    pub model: String,
+    pub display_name: String,
+    pub reasoning_efforts: Vec<String>,
+    pub default_reasoning_effort: String,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexModelList {
+    pub models: Vec<CodexModelOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexNativeIdentity {
+    pub session_id: String,
+    pub persisted: bool,
+    #[serde(default)]
+    pub held_by_agent: bool,
+    pub native_name: Option<String>,
+    pub source: Option<String>,
+    pub history_mode: Option<String>,
 }
 
 const fn default_prompt_delivery() -> PromptDelivery {
@@ -602,6 +663,14 @@ pub fn valid_session_title(title: &str) -> bool {
             | "未命名会话"
             | "新会话"
     )
+}
+
+#[must_use]
+pub fn valid_session_name(name: &str) -> bool {
+    valid_session_title(name)
+        && name.chars().count() <= 128
+        && !name.chars().any(char::is_control)
+        && !name.contains(['/', '\\'])
 }
 
 #[must_use]
@@ -766,7 +835,7 @@ mod tests {
                 "agent_id": "gpu-a",
                 "hostname": "trainer-a",
                 "agent_version": "0.1.0",
-                "capabilities": ["codex.ephemeral_submit", "codex.session_display", "codex.item_offsets", "codex.native", "codex.session_context", "agent.live"]
+                "capabilities": ["codex.ephemeral_submit", "codex.session_display", "codex.item_offsets", "codex.native", "codex.session_context", "codex.model_choice", "codex.native_identity", "agent.live"]
             })
         );
     }
