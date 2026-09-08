@@ -17,8 +17,12 @@
   --radius-composer: 28px;
   --radius-pill: 999px;
   --layout-navigation: 88px;
-  --layout-projects: 280px;
+  --layout-projects: 300px;
   --layout-reading: 960px;
+  --font-label: 15px;
+  --font-detail: 13px;
+  --font-message: 17px;
+  --line-message: 29px;
   --shadow-composer: 0 2px 12px rgb(0 0 0 / 4%);
   --farhelm-border-soft: color-mix(in srgb, var(--farhelm-border) 55%, transparent);
   --farhelm-panel: color-mix(in srgb, var(--farhelm-canvas) 65%, var(--farhelm-surface));

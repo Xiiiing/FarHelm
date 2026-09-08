@@ -7,13 +7,7 @@ pub fn project(value: &Value, previous: Option<&CodexSessionContext>) -> CodexSe
     if let Some(model) = value.get("model") {
         context.model = model
             .as_str()
-            .filter(|name| {
-                !name.is_empty()
-                    && name.len() <= 128
-                    && name
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-            })
+            .filter(|name| farhelm_protocol::valid_model_id(name))
             .map(str::to_owned);
     }
     if let Some(effort) = value.get("reasoningEffort") {

@@ -1,4 +1,4 @@
-# FarHelm V0.9.0 deployment and lifecycle
+# FarHelm V0.10.0 deployment and lifecycle
 
 [简体中文](README.md) · [English](README.en.md)
 
@@ -154,9 +154,9 @@ farhelm-agent uninstall --keep-data
 
 ## Migrating from V0.2.0
 
-Hosts already on `V0.3.0` through `V0.8.0` can run `farhelm-hub update` or `farhelm-agent update` directly. `V0.2.0` must first upgrade to `V0.3.0` to migrate the old layout, then upgrade to V0.9.0.
+Hosts already on `V0.3.0` through `V0.9.0` can run `farhelm-hub update` or `farhelm-agent update` directly. `V0.2.0` must first upgrade to `V0.3.0` to migrate the old layout, then upgrade to V0.10.0.
 
-Lowercase legacy `v0.1.0/v0.2.0` releases are outside the formal update sequence. Remove them with their matching old uninstaller before installing V0.9.0.
+Lowercase legacy `v0.1.0/v0.2.0` releases are outside the formal update sequence. Remove them with their matching old uninstaller before installing V0.10.0.
 
 ## Security notes
 
@@ -189,3 +189,13 @@ On the Hub host, run `sudo farhelm-hub update --version V0.9.0` first. Then run 
 Check device names beside projects, model/permission details, appearance settings, cached session switching, notification pagination/details, and list synchronization after creating/cancelling schedules. Existing server Codex settings continue to apply. Agents without `codex.session_context` must be upgraded before the browser can create sessions with native permissions. Failed submission retries preserve the original operation identity.
 
 Rollback replaces only the executable and retains the current database, configuration, and receipts. Never restore an old queue snapshot. V0.8.0 can still read schema 7, but does not provide the V0.9.0 interface or native permission display features.
+
+## V0.9.0 → V0.10.0
+
+First run `sudo farhelm-hub update --version V0.10.0` on the Hub host, then `farhelm-agent update --version V0.10.0` as the original user on the Agent host, and refresh the browser. Model selection and native session actions require both roles to be upgraded. Projects, sessions, receipts, and schema 7 remain compatible; no re-pairing is needed.
+
+Open a session, click the model name at the bottom right of the composer, choose a model and reasoning effort from the local Codex catalog, and send an instruction. The selection applies to the next queued turn and subsequent conversation. Steering an active turn retains its model; permissions and global configuration remain unchanged. Schedules inherit session settings at execution time.
+
+If a native client cannot find the session, use “Continue in native Codex” in the session menu to check persistence and the ID, then run the copied `codex resume` command as the same user on the same server. Send a message to persist a new empty session, or rename an older generic session to align labels. Desktop lists may need a refresh or reopening the project. Rollback still replaces only the executable and keeps the current database; V0.9.0 lacks the new model picker and native session menu.
+
+If FarHelm still holds the native writer, first choose “Release connection and continue” in that dialog. Active work, background terminals, or unsaved sessions prevent handoff; resolve them and retry. They are never terminated by handoff. Close the native client's session connection before sending from the browser again. Existing schedules continue as planned and are not automatically paused by handoff.

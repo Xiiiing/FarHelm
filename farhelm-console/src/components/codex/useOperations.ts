@@ -1,10 +1,10 @@
 import { useCallback, useRef, useState } from 'react'
 import { useQueries } from '@tanstack/react-query'
-import { ApiError, json, sendMessage, type Operation } from '../../api/features'
+import { ApiError, json, sendMessage, type ModelChoice, type Operation } from '../../api/features'
 import { cacheOperation, keys, queryClient } from '../../api/cache'
 import { errorText } from './presentation'
-export type PendingMessage = { id: string; text: string; state: string; command_id?: string; turn_id?: string; visible_turn_id?: string; delivery: 'queue' | 'steer' }
-export type SessionDraft = { text: string; error?: string; sending: boolean; delivery: 'queue' | 'steer'; pending: PendingMessage[] }
+export type PendingMessage = { id: string; text: string; state: string; detail?: string; command_id?: string; turn_id?: string; visible_turn_id?: string; delivery: 'queue' | 'steer'; model_choice?: ModelChoice }
+export type SessionDraft = { text: string; error?: string; sending: boolean; delivery: 'queue' | 'steer'; pending: PendingMessage[]; model_choice?: ModelChoice }
 const empty: SessionDraft = { text: '', sending: false, delivery: 'queue', pending: [] }
 
 export function useOperations(csrf: string) {
@@ -22,11 +22,11 @@ export function useOperations(csrf: string) {
     const delivery = visibleTurn ? draft.delivery : 'queue'
     const retry = draft.pending.find((p) => p.state === 'unconfirmed' && p.text === text && p.delivery === delivery)
     if (retry?.delivery === 'steer' && retry.visible_turn_id !== visibleTurn) { update(session, (old) => ({ ...old, error: '活动对话已改变，不能将重试指令发送到另一轮；请先核对原操作' })); return }
-    const pending: PendingMessage = retry ? { ...retry, state: 'submitting' } : { id: crypto.randomUUID(), text, state: 'submitting', delivery, visible_turn_id: visibleTurn }
+    const pending: PendingMessage = retry ? { ...retry, state: 'submitting' } : { id: crypto.randomUUID(), text, state: 'submitting', delivery, visible_turn_id: visibleTurn, model_choice: delivery === 'queue' ? draft.model_choice : undefined }
     locks.current.add(session)
     update(session, (old) => ({ ...old, sending: true, error: undefined, pending: [...old.pending.filter((p) => p.id !== pending.id), pending] }))
     try {
-      const receipt = await sendMessage(csrf, session, text, delivery, visibleTurn, pending.id)
+      const receipt = await sendMessage(csrf, session, text, delivery, visibleTurn, pending.id, pending.model_choice)
       if (receipt.command_id) cacheOperation(receipt.command_id, receipt)
       update(session, (old) => ({ ...old, text: old.text.trim() === text ? '' : old.text, pending: old.pending.map((p) => p.id === pending.id ? { ...p, command_id: receipt.command_id, state: receipt.state ?? 'accepted' } : p) }))
     } catch (reason) {
@@ -38,7 +38,7 @@ export function useOperations(csrf: string) {
     const draft = drafts[id] ?? empty
     return { ...draft, pending: draft.pending.map((row) => {
       const receipt = row.command_id ? queryClient.getQueryData<Operation>(keys.operation(row.command_id)) : undefined
-      return receipt ? { ...row, state: receipt.state ?? row.state, turn_id: receipt.data?.turn_id ?? receipt.result?.turn_id ?? row.turn_id } : row
+      return receipt ? { ...row, state: receipt.state ?? row.state, detail: receipt.detail, turn_id: receipt.data?.turn_id ?? receipt.result?.turn_id ?? row.turn_id } : row
     }) }
   }, update, send }
 }

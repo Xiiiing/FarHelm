@@ -128,7 +128,7 @@ test('compact navigation preserves every destination and aligns the reading colu
   const nav = page.getByRole('navigation', { name: '系统导航' })
   for (const name of ['总览', 'Agent', '实验', 'Codex', '通知', '审计', '设置']) await expect(nav.getByRole('menuitem', { name, exact: true })).toBeVisible()
   expect((await page.locator('.app-sider').boundingBox())!.width).toBe(88)
-  expect((await page.locator('.codex-desktop-rail').boundingBox())!.width).toBe(280)
+  expect((await page.locator('.codex-desktop-rail').boundingBox())!.width).toBe(300)
   const heading = await page.locator('.conversation-title h1').boundingBox()
   const body = await page.locator('.codex-transcript').boundingBox()
   expect(Math.abs(heading!.x - body!.x)).toBeLessThan(2)
@@ -425,6 +425,10 @@ test('one MiB message resumes separately from earlier turns without duplicate te
 test('2000 turns load through every page and retain the visible anchor when virtualization starts', async ({ page }, info) => {
   test.skip(info.project.name !== 'desktop', 'Long-history acceptance runs once')
   test.setTimeout(90000)
+  // Delayed layout/measurement must not move the reader when rows switch from
+  // ordinary DOM to estimated virtual heights, or when another page is prepended.
+  const cdp = await page.context().newCDPSession(page)
+  await cdp.send('Emulation.setCPUThrottlingRate', { rate: 4 })
   await setup(page)
   const cursors: number[] = []
   await page.route('**/ses-a/transcript*', (route) => {
@@ -439,6 +443,10 @@ test('2000 turns load through every page and retain the visible anchor when virt
   for (let index = 1; index < 100; index++) {
     const button = page.getByRole('button', { name: '加载更早对话' })
     await button.scrollIntoViewIfNeeded()
+    if (index <= 3) await expect.poll(() => page.locator('.conversation-scroll').evaluate(node => {
+      const bounds = node.getBoundingClientRect()
+      return [...node.querySelectorAll('[data-message-key]')].some(item => { const rect = item.getBoundingClientRect(); return rect.bottom > bounds.top && rect.top < bounds.bottom })
+    })).toBe(true)
     const previous = await page.locator('.conversation-scroll').evaluate((node) => {
       const top = node.getBoundingClientRect().top
       const first = [...node.querySelectorAll<HTMLElement>('[data-message-key]')].find((item) => item.getBoundingClientRect().bottom > top)
@@ -448,12 +456,19 @@ test('2000 turns load through every page and retain the visible anchor when virt
     await expect.poll(() => cursors.length).toBe(index + 1)
     await expect(page.locator('.conversation-scroll [aria-busy="true"]')).toHaveCount(0)
     if (index < 99) await expect(button).toBeEnabled()
-    if (index === 2 && previous) await expect.poll(async () => {
-      return page.locator('.conversation-scroll').evaluate((node, old) => {
-        const item = node.querySelector<HTMLElement>(`[data-message-key="${CSS.escape(old.key!)}"]`)
-        return item ? Math.abs(item.getBoundingClientRect().top - node.getBoundingClientRect().top - old.offset) : 99999
+    if (index <= 3 && previous) await expect.poll(async () => {
+      return page.locator('.conversation-scroll').evaluate(async (node, old) => {
+        let largest = 0
+        // Check sustained position, including delayed ResizeObserver frames.
+        for (let frame = 0; frame < 6; frame++) {
+          await new Promise(requestAnimationFrame)
+          const item = node.querySelector<HTMLElement>(`[data-message-key="${CSS.escape(old.key!)}"]`)
+          largest = Math.max(largest, item ? Math.abs(item.getBoundingClientRect().top - node.getBoundingClientRect().top - old.offset) : 99999)
+        }
+        return largest
       }, previous)
-    }).toBeLessThan(5)
+    }, { message: `Reading anchor after page ${index + 1}` }).toBeLessThan(5)
+    if (index === 3) await cdp.send('Emulation.setCPUThrottlingRate', { rate: 1 })
   }
   expect(new Set(cursors).size).toBe(100)
   await expect(page.getByRole('button', { name: '加载更早对话' })).toHaveCount(0)

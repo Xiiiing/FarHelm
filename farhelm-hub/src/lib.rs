@@ -52,6 +52,9 @@ include!(concat!(env!("OUT_DIR"), "/embedded_console.rs"));
 
 pub const ONLINE_WINDOW_SECS: u64 = 45;
 
+mod codex_settings;
+#[cfg(test)]
+mod codex_settings_tests;
 mod command_store;
 mod event_store;
 mod live;
@@ -346,6 +349,22 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/api/v1/projects", get(list_projects))
         .route("/api/v1/projects/import", post(import_projects))
+        .route(
+            "/api/v1/codex/sessions/{session_id}/models",
+            get(codex_settings::models),
+        )
+        .route(
+            "/api/v1/codex/sessions/{session_id}/native",
+            get(codex_settings::native),
+        )
+        .route(
+            "/api/v1/codex/sessions/{session_id}/name",
+            post(codex_settings::rename),
+        )
+        .route(
+            "/api/v1/codex/sessions/{session_id}/handoff",
+            post(codex_settings::handoff),
+        )
         .route(
             "/api/v1/codex/sessions",
             get(list_codex_sessions).post(create_codex_session),
@@ -1486,6 +1505,16 @@ async fn send_codex_message(
     if request.prompt.is_empty() || request.prompt.len() > 32 * 1024 {
         return api_error(StatusCode::BAD_REQUEST, "invalid_prompt");
     }
+    if request
+        .model_choice
+        .as_ref()
+        .is_some_and(|choice| !choice.is_valid())
+    {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_model_choice");
+    }
+    if request.delivery == PromptDelivery::Steer && request.model_choice.is_some() {
+        return api_error(StatusCode::CONFLICT, "model_change_requires_queue");
+    }
     let Some(key) = idempotency_header(&headers) else {
         return api_error(StatusCode::BAD_REQUEST, "missing_idempotency_key");
     };
@@ -1502,6 +1531,16 @@ async fn send_codex_message(
             return api_error(StatusCode::INTERNAL_SERVER_ERROR, "event_store_failed");
         }
     };
+    if request.model_choice.is_some()
+        && !state
+            .agents
+            .read()
+            .await
+            .get(&session.agent_id)
+            .is_some_and(|a| a.capabilities.iter().any(|c| c == "codex.model_choice"))
+    {
+        return api_error(StatusCode::CONFLICT, "agent_upgrade_required");
+    }
     let (action, turn_id) = match request.delivery {
         PromptDelivery::Queue => (CommandAction::CodexTurnStart, None),
         PromptDelivery::Steer => {
@@ -1514,10 +1553,13 @@ async fn send_codex_message(
             (CommandAction::CodexTurnSteer, Some(turn_id))
         }
     };
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "session_id":session_id,"project_id":session.project_id,"mode":session.mode,
         "turn_id":turn_id,"prompt":request.prompt,"delivery":request.delivery
     });
+    if let Some(choice) = &request.model_choice {
+        payload["model_choice"] = serde_json::json!(choice);
+    }
     drop(request);
     create_typed_response(&state, &session.agent_id, action, payload, key, 300).await
 }

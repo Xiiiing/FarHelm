@@ -124,7 +124,7 @@ async fn live_commands_reads_receipts_replacement_and_transient_privacy() {
             .header("cookie", browser_cookie())
             .header("x-csrf-token", "test-csrf")
             .header("idempotency-key", "live-operation-00001")
-            .json(&json!({"prompt":"SYNTHETIC_PRIVATE_PROMPT_080","delivery":"queue"}))
+            .json(&json!({"prompt":"SYNTHETIC_PRIVATE_PROMPT_080","delivery":"queue","model_choice":{"model":"synthetic-local-model","reasoning_effort":"high"}}))
             .send()
             .await
             .unwrap()
@@ -136,6 +136,10 @@ async fn live_commands_reads_receipts_replacement_and_transient_privacy() {
         command.payload.as_ref().unwrap()["prompt"],
         "SYNTHETIC_PRIVATE_PROMPT_080"
     );
+    assert_eq!(
+        command.payload.as_ref().unwrap()["model_choice"],
+        json!({"model":"synthetic-local-model","reasoning_effort":"high"})
+    );
     let encoded: String = inspect
         .query_row(
             "SELECT payload_json FROM typed_commands WHERE command_id=?1",
@@ -144,6 +148,7 @@ async fn live_commands_reads_receipts_replacement_and_transient_privacy() {
         )
         .unwrap();
     assert!(!encoded.contains("SYNTHETIC_PRIVATE_PROMPT_080"));
+    assert!(!encoded.contains("synthetic-local-model"));
     let report = CommandReportRequest {
         protocol: FARHELM_PROTOCOL.into(),
         agent_id: "gpu-a".into(),

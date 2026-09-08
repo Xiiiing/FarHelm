@@ -72,6 +72,10 @@ pub struct TurnStartParams<'a> {
     pub thread_id: &'a str,
     pub input: [UserInput<'a>; 1],
     pub client_user_message_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<&'a str>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
