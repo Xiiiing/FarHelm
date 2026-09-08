@@ -190,7 +190,9 @@ test('motion communicates work and submission while reduced motion keeps the sam
   await expect(page.locator('.response-activity')).toContainText('Codex 正在处理')
   expect(await page.locator('.activity-indicator i').first().evaluate((node) => node.getAnimations().some((animation) => animation.playState === 'running'))).toBe(true)
   await expect(page.locator('.markdown-table')).toHaveCount(1)
-  await page.locator('.conversation-scroll').evaluate((node) => { node.scrollTop = 0 })
+  await expect(page.locator('.response-activity')).toBeInViewport()
+  await page.locator('.conversation-scroll').hover()
+  await page.mouse.wheel(0, -720)
   await expect(page.getByRole('button', { name: '回到底部', exact: true })).toBeVisible()
   const input = page.getByLabel('给 Codex 发送指令')
   await input.fill('下一轮继续检查')
@@ -223,6 +225,27 @@ test('motion communicates work and submission while reduced motion keeps the sam
   await expect(page.getByRole('button', { name: '中断', exact: true })).toBeVisible()
   await expect(page.getByRole('button', { name: '定时发送', exact: true })).toBeVisible()
   await composerFits(page)
+})
+
+test('interrupt confirmation inherits the page theme and still requires confirmation of the visible turn', async ({ page }) => {
+  const model = await setup(page)
+  model.sessions[0].state = 'running'; model.sessions[0].active_turn_id = 'turn-a'
+  const targets: unknown[] = []
+  await page.route('**/ses-a/interrupt', route => { targets.push(route.request().postDataJSON()); return route.fulfill({ json: { state: 'completed' } }) })
+  for (const colorScheme of ['light', 'dark'] as const) {
+    await page.emulateMedia({ colorScheme }); await page.goto('/codex?session=ses-a')
+    await page.getByRole('button', { name: '中断', exact: true }).click()
+    const dialog = page.getByRole('dialog', { name: '中断当前对话？' })
+    await expect(dialog.locator('.ant-modal-container')).toHaveCSS('background-color', colorScheme === 'dark' ? 'rgb(48, 48, 48)' : 'rgb(240, 240, 240)')
+    await expect(dialog).toContainText('轮次 turn-a')
+    await dialog.getByRole('button', { name: /^取\s*消$/ }).click()
+    expect(targets).toHaveLength(colorScheme === 'light' ? 0 : 1)
+    await expect(dialog).toBeHidden()
+    await page.getByRole('button', { name: '中断', exact: true }).click()
+    await dialog.getByRole('button', { name: '确认中断', exact: true }).click()
+    await expect(dialog).toBeHidden()
+    expect(targets.at(-1)).toEqual({ turn_id: 'turn-a' })
+  }
 })
 
 for (const theme of ['light', 'dark'] as const) for (const size of [{ width: 390, height: 844 }, { width: 1440, height: 900 }, { width: 2550, height: 1233 }]) {

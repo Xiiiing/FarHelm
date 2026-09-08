@@ -27,6 +27,7 @@ export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, sess
   const history = useQuery({ queryKey: keys.history(id ?? ''), enabled: !!id, staleTime: 0, refetchOnMount: 'always', queryFn: async ({ signal }) => cacheHistory(id!, await fetchTranscript(id!, undefined, signal)) })
   const page = history.data; const turns = page?.turns ?? []
   const [readingMore, setReadingMore] = useState(false)
+  const [modal, modalHolder] = Modal.useModal()
   const [moreError, setMoreError] = useState<Error>()
   const [newMessages, setNewMessages] = useState(false)
   const [away, setAway] = useState(false)
@@ -96,7 +97,7 @@ export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, sess
   const interrupt = () => {
     if (!session?.active_turn_id) return
     const target = session
-    Modal.confirm({ title: '中断当前对话？', content: <><p>{sessionName(target)}</p><p>轮次 {target.active_turn_id}。本次回复将停止，已执行的修改不会撤销。</p></>, okText: '确认中断', cancelText: '取消', okButtonProps: { danger: true }, onOk: async () => {
+    modal.confirm({ title: '中断当前对话？', content: <><p>{sessionName(target)}</p><p>轮次 {target.active_turn_id}。本次回复将停止，已执行的修改不会撤销。</p></>, okText: '确认中断', cancelText: '取消', okButtonProps: { danger: true }, onOk: async () => {
       try { await waitForCommand(await interruptSession(csrf, target.session_id, target.active_turn_id)) }
       catch (error) { if (active.current) onDraft((old) => ({ ...old, error: errorText(error) })); throw error }
     } })
@@ -123,6 +124,7 @@ export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, sess
     onSend(visibleTurn); sender.current?.focus({ preventScroll: true })
   }
   return <section className={`codex-conversation ${!id ? 'conversation-unselected' : ''}`}>
+    {modalHolder}
     <header className="conversation-head">
       <div className="conversation-identity">
         <Button className="mobile-only" type="text" icon={<MenuOutlined />} onClick={onRail} aria-label="打开会话列表" />

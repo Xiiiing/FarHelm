@@ -22,7 +22,7 @@
 .archive-tabs .ant-segmented-item { min-width: 48px; color: var(--farhelm-muted); border-radius: 11px; }
 .archive-tabs .ant-segmented-item-label { min-height: 44px; line-height: 44px; padding-inline: 9px; }
 .archive-tabs .ant-segmented-item-selected, .archive-tabs .ant-segmented-thumb { border-radius: 11px; box-shadow: 0 1px 3px rgb(0 0 0 / 7%); background: var(--farhelm-surface); }
-.archive-tabs .ant-segmented-item-selected { color: var(--farhelm-text); font-weight: 600; }
+.archive-tabs .ant-segmented-item-selected { color: var(--farhelm-accent-ink); font-weight: 600; }
 .rail-heading-actions { display: flex; align-items: center; gap: 4px; }
 .rail-heading-actions > .ant-btn { min-height: 44px; min-width: 44px; color: var(--farhelm-muted); }
 .rail-heading-actions > .scope-active { color: var(--farhelm-accent-ink); background: var(--farhelm-accent-soft); }
@@ -34,21 +34,25 @@
 .active-session-scope .ant-btn { min-width: 44px; color: inherit; }
 .codex-session-groups { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; margin: 0 -4px; padding: 0 2px; }
 .session-conversations { padding: 0 !important; background: transparent; }
-.session-conversations .ant-conversations-group-title { min-height: 44px; padding: 0 4px !important; gap: 4px; }
+.session-conversations .ant-conversations-group-title { height: 44px; min-height: 44px; padding: 0 4px !important; gap: 4px; border-radius: var(--radius-control); transition: background-color var(--motion-press) var(--ease-out); }
+.session-conversations .ant-conversations-group-title:hover, .session-conversations .ant-conversations-group-title:active { background: var(--farhelm-raised); }
 .session-conversations .ant-conversations-group-label { flex: 1; min-width: 0; }
 .session-group-heading.ant-btn { display: flex; justify-content: flex-start; width: 100%; min-width: 0; min-height: 44px; height: auto; padding: 4px 0; gap: 8px; text-align: left; color: var(--farhelm-text); font-size: 14px; }
+/* The Conversations row owns the background; its accessible button must not paint another pill. */
+.session-group-heading.ant-btn, .session-select.ant-btn { background: transparent !important; box-shadow: none; }
+.session-group-heading.ant-btn:not(:disabled):active, .session-select.ant-btn:not(:disabled):active { transform: none; }
 .session-group-heading > .anticon { color: var(--farhelm-muted); flex: none; }
 .session-group-heading .project-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
 .session-group-heading .project-device { flex-shrink: 0; max-width: 38%; overflow: hidden; text-overflow: ellipsis; color: var(--farhelm-muted); font-size: 12px; font-weight: 400; }
 .session-group-heading .ant-badge { flex: none; }
 .session-conversations .ant-conversations-list { margin-left: 12px; padding-left: 4px; gap: 2px; }
 .session-conversations .session-row { height: auto; min-height: 44px; position: relative; margin: 2px 0; padding: 0 !important; border-radius: var(--radius-control); }
-.session-conversations .session-row:hover { background: var(--farhelm-raised) !important; }
+.session-conversations .session-row:hover:not(.ant-conversations-item-active), .session-conversations .session-row:active:not(.ant-conversations-item-active) { background: var(--farhelm-raised) !important; }
 .session-conversations .ant-conversations-item-active { background: var(--farhelm-accent-soft) !important; }
 .session-conversations .ant-conversations-label { min-width: 0; width: 100%; color: var(--farhelm-text); }
 .session-select.ant-btn { display: flex; justify-content: flex-start; gap: 8px; min-width: 0; height: auto; min-height: 44px; margin: 0; padding: 6px 8px; color: inherit; text-align: left; transform: none; }
 .session-select.ant-btn:hover { background: transparent !important; }
-.session-select[aria-current='page'] { font-weight: 500; color: var(--farhelm-text); }
+.session-select[aria-current='page'] { font-weight: 600; color: var(--farhelm-accent-ink); }
 .session-select[aria-current='page'] .session-time { color: color-mix(in srgb, var(--farhelm-muted) 82%, var(--farhelm-text)); }
 .session-copy { flex: 1; min-width: 0; display: grid; gap: 4px; }
 .session-copy > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; line-height: 22px; }
@@ -173,7 +177,7 @@
 .settings-detail-note { color: var(--farhelm-muted); font-size: 12px; line-height: 20px; }
 .create-session-form .ant-checkbox-wrapper { min-height: 44px; align-items: center; }
 .send-action.ant-btn { min-width: 44px; width: 44px; padding: 0; flex: none; border-radius: var(--radius-pill); font-size: 20px; box-shadow: none; }
-.send-action.ant-btn:not(:disabled), .send-action.ant-btn:not(:disabled):hover { color: var(--farhelm-surface); background: var(--farhelm-text); border-color: transparent; }
+.send-action.ant-btn:not(:disabled), .send-action.ant-btn:not(:disabled):hover { color: var(--farhelm-on-accent); background: var(--farhelm-accent); border-color: transparent; }
 .send-action.ant-btn:disabled { background: var(--farhelm-raised); border-color: transparent; color: var(--farhelm-muted); }
 .send-action .anticon { transition: transform var(--motion-press) var(--ease-out); }
 .send-action:not(:disabled):hover .anticon { transform: translateY(-2px); }

@@ -14,15 +14,16 @@ describe('appearance colors', () => {
     for (const mode of ['light', 'dark'] as const) {
       for (const choice of [...accentPresets.map(({ id }) => id), '#FFFFFF', '#000000', '#FFFF00', '#777777', '#FF00FF', '#00FFFF'] as const) {
         const colors = createPalette(mode, choice)
-        for (const background of [colors.canvas, colors.surface, colors.raised, colors.selection]) {
+        for (const background of [colors.canvas, colors.surface, colors.raised, colors.selection, colors['accent-soft']]) {
           expect(contrastRatio(colors.accent, background), `${mode}/${choice}/${background}`).toBeGreaterThanOrEqual(4.5)
           expect(contrastRatio(colors.text, background)).toBeGreaterThanOrEqual(4.5)
           expect(contrastRatio(colors.muted, background)).toBeGreaterThanOrEqual(4.5)
         }
         expect(contrastRatio(colors.accent, colors['on-accent'])).toBeGreaterThanOrEqual(4.5)
-        // Accent changes must not tint the reading surface or selected message row.
+        // Reading surfaces stay neutral; interactive selection uses the chosen accent.
         expect(colors.surface).toBe(createPalette(mode, 'graphite').surface)
         expect(colors.selection).toBe(createPalette(mode, 'graphite').selection)
+        expect(colors.danger).toBe(colors.text)
       }
     }
   })

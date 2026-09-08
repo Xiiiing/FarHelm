@@ -115,6 +115,72 @@ test('appearance presets and custom colors persist without writing to Hub', asyn
   expect(writes).toEqual([])
 })
 
+test('one theme color reaches navigation, selected sessions and primary actions while the logo keeps its brand', async ({ page }) => {
+  for (const [mode, color] of [['浅色', '#00865A'], ['深色', '#AA33FF']]) {
+    await page.goto('/settings')
+    await page.getByRole('radiogroup', { name: '显示模式' }).getByText(mode, { exact: true }).click()
+    await page.getByLabel('自定义颜色', { exact: true }).fill(color)
+    await page.getByRole('button', { name: '应用颜色' }).click()
+    await page.goto('/codex?session=ses-a')
+    await page.getByLabel('给 Codex 发送指令').fill('主题切换时仍保留的草稿')
+    const themeColors = await page.evaluate(() => {
+      const rgb = (name: string) => { const hex = getComputedStyle(document.documentElement).getPropertyValue(name).trim(); return `rgb(${[1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16)).join(', ')})` }
+      return { accent: rgb('--farhelm-accent'), soft: rgb('--farhelm-accent-soft') }
+    })
+    await expect(page.getByRole('button', { name: '发送指令' })).toHaveCSS('background-color', themeColors.accent)
+    const activeNavigation = page.locator('.app-sider .ant-menu-item-selected, .mobile-nav button.active').filter({ visible: true })
+    await expect(activeNavigation).toHaveCSS('color', themeColors.accent)
+    await expect(activeNavigation).toHaveCSS('background-color', themeColors.soft)
+    const logo = page.locator('.brand img, .mobile-brand img').filter({ visible: true })
+    const brand = await logo.evaluate(async (node: HTMLImageElement) => {
+      await node.decode()
+      const canvas = document.createElement('canvas'); canvas.width = canvas.height = 96
+      const ctx = canvas.getContext('2d')!; ctx.drawImage(node, 0, 0, 96, 96)
+      const filters = []; let parent: Element | null = node
+      while (parent) { filters.push(getComputedStyle(parent).filter); parent = parent.parentElement }
+      return { pixel: [...ctx.getImageData(30, 30, 1, 1).data], filters }
+    })
+    expect(brand.pixel).toEqual([34, 199, 169, 255]); expect(brand.filters.every(v => v === 'none')).toBe(true)
+    if (page.viewportSize()!.width < 768) await page.getByRole('button', { name: '打开会话列表' }).click()
+    const selected = page.locator('.codex-rail:visible .session-select[aria-current="page"]')
+    await expect(selected).toHaveCSS('color', themeColors.accent)
+    await expect(page.locator('.codex-rail:visible .ant-conversations-item-active')).toHaveCSS('background-color', themeColors.soft)
+    for (const path of ['/', '/agents', '/experiments', '/notifications', '/audit', '/settings']) {
+      await page.goto(path)
+      await expect(page.locator('.app-sider .ant-menu-item-selected, .mobile-nav button.active').filter({ visible: true })).toHaveCSS('color', themeColors.accent)
+    }
+  }
+})
+
+test('project hover and session selection paint one background through pointer and keyboard actions', async ({ page }, info) => {
+  for (const colorScheme of ['light', 'dark'] as const) {
+    await page.emulateMedia({ colorScheme }); await page.goto('/codex?session=ses-a')
+    await page.getByLabel('给 Codex 发送指令').fill('折叠项目后保留草稿')
+    if (page.viewportSize()!.width < 768) await page.getByRole('button', { name: '打开会话列表' }).click()
+    const rail = page.locator('.codex-rail:visible'), heading = rail.locator('.session-group-heading').first()
+    const outer = rail.locator('.ant-conversations-group-title').first()
+    await heading.hover()
+    await expect(heading).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)')
+    await expect(outer).toHaveCSS('height', '44px')
+    const hover = await outer.evaluate(n => getComputedStyle(n).backgroundColor)
+    expect(hover).not.toBe('rgba(0, 0, 0, 0)')
+    await page.mouse.down()
+    await expect(heading).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)')
+    await expect(heading).toHaveCSS('transform', 'none')
+    await expect(outer).toHaveCSS('background-color', hover)
+    await rail.screenshot({ path: info.outputPath(`single-layer-${colorScheme}.png`) })
+    await page.mouse.up(); await expect(heading).toHaveAttribute('aria-expanded', 'false')
+    await heading.focus(); await page.keyboard.press('Space'); await expect(heading).toHaveAttribute('aria-expanded', 'true')
+    const selected = rail.locator('.session-select[aria-current="page"]'), row = rail.locator('.ant-conversations-item-active')
+    const selectedColor = await row.evaluate(n => getComputedStyle(n).backgroundColor)
+    await selected.hover(); await page.mouse.down()
+    await expect(selected).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)')
+    await expect(row).toHaveCSS('background-color', selectedColor)
+    await page.mouse.up(); await expect(page).toHaveURL(/session=ses-a/)
+    await expect(page.getByLabel('给 Codex 发送指令')).toHaveValue('折叠项目后保留草稿')
+  }
+})
+
 test('extreme custom colors keep appearance controls readable and within the mobile viewport', async ({ page }, info) => {
   test.setTimeout(60_000)
   await page.goto('/settings')

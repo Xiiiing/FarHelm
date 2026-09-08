@@ -34,12 +34,12 @@ export function AppearanceSettings({ preference, onPreference, accent, onAccent 
     <div className="appearance-layout">
       <div className="appearance-controls">
         <div className="appearance-field"><span id="appearance-mode-label">显示模式</span><Segmented block aria-labelledby="appearance-mode-label" value={preference} onChange={onPreference} options={[{ value: 'system', label: '跟随系统' }, { value: 'light', label: '浅色' }, { value: 'dark', label: '深色' }]} /></div>
-        <div className="appearance-field"><span id="accent-label">强调色</span><div className="accent-choices" role="group" aria-labelledby="accent-label">
+        <div className="appearance-field"><span id="accent-label">主题色</span><p className="appearance-help">用于主要按钮、选中状态、链接和焦点。Logo 保留品牌原色。</p><div className="accent-choices" role="group" aria-labelledby="accent-label">
           {accentPresets.map((preset) => <Button key={preset.id} type="text" className="accent-choice" aria-pressed={accent === preset.id} onClick={() => onAccent(preset.id)}><span className="accent-swatch" style={{ backgroundColor: preset.color }} aria-hidden /><span>{preset.label}</span></Button>)}
         </div></div>
         <CustomColor key={accent} accent={accent} onAccent={onAccent} />
       </div>
-      <div className="appearance-preview" role="img" aria-label="当前外观预览：中性对话背景与所选强调色">
+      <div className="appearance-preview" role="img" aria-label="当前外观预览：黑白基础背景与所选主题色">
         <span className="appearance-preview-label">预览</span>
         <div className="preview-user">检查一下训练结果</div>
         <div className="preview-response"><strong>Codex</strong><p>训练已完成。我们来看看结果。</p><span className="preview-link">查看实验详情 →</span></div>
