@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 pub mod live;
+pub mod native;
 pub mod projects;
 
 pub const FARHELM_PROTOCOL: &str = "farhelm/1";
@@ -62,6 +63,10 @@ impl AgentHeartbeat {
                 "agent.live".to_owned(),
                 "project.management".to_owned(),
                 "codex.session_archive".to_owned(),
+                "codex.native_control".to_owned(),
+                "codex.interactions".to_owned(),
+                "codex.skills".to_owned(),
+                "codex.images".to_owned(),
             ],
             protocol: FARHELM_PROTOCOL.to_owned(),
             agent_id: agent_id.into(),
@@ -136,6 +141,8 @@ pub enum CommandAction {
     CodexSessionArchive,
     #[serde(rename = "codex.session.unarchive")]
     CodexSessionUnarchive,
+    #[serde(rename = "codex.native.operation")]
+    CodexNativeOperation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -334,6 +341,7 @@ pub enum CodexTranscriptItemKind {
     AssistantMessage,
     CommandSummary,
     FileChangeSummary,
+    Image,
     Error,
 }
 
@@ -352,6 +360,10 @@ pub struct CodexTranscriptItem {
     pub exit_code: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_resource_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -559,6 +571,8 @@ pub struct CreateCodexSessionRequest {
     pub mode: CodexSessionMode,
     #[serde(default)]
     pub inherit_permissions: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_directory_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -849,7 +863,7 @@ mod tests {
                 "agent_id": "gpu-a",
                 "hostname": "trainer-a",
                 "agent_version": "0.1.0",
-                "capabilities": ["codex.ephemeral_submit", "codex.session_display", "codex.item_offsets", "codex.native", "codex.session_context", "codex.model_choice", "codex.native_identity", "agent.live", "project.management", "codex.session_archive"]
+                "capabilities": ["codex.ephemeral_submit", "codex.session_display", "codex.item_offsets", "codex.native", "codex.session_context", "codex.model_choice", "codex.native_identity", "agent.live", "project.management", "codex.session_archive", "codex.native_control", "codex.interactions", "codex.skills", "codex.images"]
             })
         );
     }

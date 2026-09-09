@@ -1,4 +1,4 @@
-# FarHelm V0.11.0 部署与生命周期
+# FarHelm V0.12.0 部署与生命周期
 
 [简体中文](README.md) · [English](README.en.md)
 
@@ -200,20 +200,22 @@ V0.7 的页面通知通过现有 SSE 和持久通知中心工作，无需 VAPID 
 
 若 FarHelm 仍占用原生写入连接，先在该弹窗点击“释放连接后继续”。存在活动任务、后台终端或未保存会话时会拒绝交接，处理完后可重试；不会终止它们。原生客户端用完后关闭会话连接，再回到网页发送。已有定时任务仍按计划执行，不会因交接自动暂停。
 
-## V0.11.0 升级
+## V0.12.0 升级
 
-先升级 Hub，再以原用户升级各台 Agent；升级前结束正在执行的会话并备份配置和数据库。各角色唯一迁移入口将 schema 7 升级为 8，保留项目、会话、授权、收据和执行身份，无需重新配对：
+先升级 Hub，再以原用户升级各台 Agent；升级前结束正在执行的会话并备份配置和数据库。各角色唯一迁移入口将 schema 8 升级为 9，保留项目、会话、授权、收据和执行身份，无需重新配对：
 
 ```bash
 # Hub
-sudo farhelm-hub update --version V0.11.0
+sudo farhelm-hub update --version V0.12.0
 sudo farhelm-hub status
 
 # 各台 Agent，不使用 sudo
-farhelm-agent update --version V0.11.0
+farhelm-agent update --version V0.12.0
 farhelm-agent status
 ```
 
+本版将 Hub 与 Agent 数据库升级到 schema 9。若新服务启动失败且数据库已经迁移，更新器只会自动恢复兼容 V0.12.0 或更高版本的旧二进制。
+
 更新后重新打开网页，在“项目管理”中添加项目和选择展示范围。目录根授权通过 Agent 本地 `project roots add/list/remove` 管理；原生归档范围检查需要 Codex 0.153.4 或以上版本。
 
-V0.10.0 及更早程序拒绝 schema 8；回退需要兼容 schema 8 的修复程序，不要用旧数据库快照覆盖已完成操作的收据。新目录和生命周期命令只发给声明相应能力的 Agent，未升级服务器会显示升级提示。
+V0.11.0 及更早程序拒绝 schema 9；回退需要兼容 schema 9 的修复程序，不要用旧数据库快照覆盖已完成操作的收据。新能力只发给声明相应 capability 的 Agent，未升级服务器会显示升级提示。

@@ -17,6 +17,7 @@ export function useProjects(csrf: string) {
     onError: (error) => { if (error instanceof ApiError && error.code === 'project_preferences_conflict') void preferences.refetch() },
   })
   const projects = (catalog.data ?? []).map((p) => ({ ...p, display_name: preference(p).display_name ?? p.display_name }))
-  const approved = projects.filter((p) => p.state === 'approved').sort((a, b) => Number(preference(b).pinned) - Number(preference(a).pinned) || (b.last_activity_unix ?? 0) - (a.last_activity_unix ?? 0) || projectKey(a).localeCompare(projectKey(b)))
+  const manual = projects.some((p) => preference(p).manual_order !== undefined)
+  const approved = projects.filter((p) => p.state === 'approved').sort((a, b) => manual ? (preference(a).manual_order ?? Number.MAX_SAFE_INTEGER) - (preference(b).manual_order ?? Number.MAX_SAFE_INTEGER) : Number(preference(b).pinned) - Number(preference(a).pinned) || (b.last_activity_unix ?? 0) - (a.last_activity_unix ?? 0) || projectKey(a).localeCompare(projectKey(b)))
   return { catalog, preferences, projects, approved, visible: approved.filter((p) => !preference(p).hidden), preference, save }
 }

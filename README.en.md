@@ -4,14 +4,21 @@
   <p><strong>A remote control plane for personal research and GPU training environments</strong></p>
   <p>See training-host status from your phone and safely extend remote control without exposing inbound ports on training machines.</p>
   <p>
-    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.11.0">V0.11.0</a> ·
+    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.12.0">V0.12.0</a> ·
     <a href="./deploy/README.en.md">Deployment guide</a> ·
     <a href="./README.md">简体中文</a>
   </p>
 </div>
 
 > [!IMPORTANT]
-> `V0.11.0` completes project and session workflows: discovered-project import, existing-directory attachment, empty-project creation, multiple visible projects, account-synced preferences, and native session archive/restore. Upgrade existing installations with `sudo farhelm-hub update` on Hub first, then `farhelm-agent update` as the original user on each Agent; no re-pairing is needed. This version migrates to schema 8, which older binaries cannot open for a direct rollback.
+> `V0.12.0` brings the server-side Codex native queue, approvals and questions, plan/review/goal controls, Skills, images, sections, history operations, and temporary tasks into the existing remote workspace. Upgrade Hub first and then every Agent. This version migrates to schema 9 and prevents an incompatible automatic rollback.
+
+## Native Codex remote control (V0.12.0)
+
+- FarHelm remains the remote input, approval, and presentation layer; Codex, tools, files, and Skills continue to run on the selected Agent.
+- The web UI and native clients share Codex queue and task state, including live approvals, questions, goals, reviews, settings, and history operations.
+- Skill and server image paths are never exposed to the browser. Images use bounded chunk uploads and support PNG, JPEG, and WebP, up to four images and 20 MiB each.
+- Schema 8 is migrated in place to schema 9. After migration, binaries older than V0.12.0 are not restored automatically.
 
 ## Quick install
 

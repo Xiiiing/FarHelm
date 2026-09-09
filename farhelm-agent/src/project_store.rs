@@ -1,7 +1,7 @@
 //! Local directory capabilities and recoverable project registration. No paths leave this module.
 use super::*;
 use farhelm_protocol::projects::{
-    DirectoryPage, ProjectDirectory, ProjectInfo, ProjectRoots, valid_directory_name,
+    DirectoryPage, ProjectDirectory, ProjectInfo, ProjectMember, ProjectRoots, valid_directory_name,
 };
 use std::{
     ffi::CString,
@@ -236,6 +236,7 @@ fn approve_path(c: &Connection, path: &Path, now: u64) -> Result<ProjectCandidat
     };
     ensure!(candidate.path == path, "project_directory_changed");
     c.execute("INSERT INTO approved_projects(project_id,path,updated_at_unix) VALUES(?1,?2,?3) ON CONFLICT(project_id) DO UPDATE SET updated_at_unix=excluded.updated_at_unix",params![candidate.suggested_project_id,path.to_string_lossy(),as_i64(now)?])?;
+    c.execute("INSERT OR IGNORE INTO project_members(project_id,directory_id,path,is_primary,position) VALUES(?1,?2,?3,1,0)",params![candidate.suggested_project_id,random_id("mem_"),path.to_string_lossy()])?;
     c.execute("INSERT INTO discovered_projects VALUES(?1,?2,?3,?4,?5,'approved',?6) ON CONFLICT(path) DO UPDATE SET state='approved',updated_at_unix=excluded.updated_at_unix",params![candidate.candidate_id,path.to_string_lossy(),candidate.display_name,candidate.suggested_project_id,as_i64(candidate.session_count)?,as_i64(now)?])?;
     c.execute("INSERT INTO project_sync VALUES(?1,'pending',?2) ON CONFLICT(project_id) DO UPDATE SET state='pending',updated_at=excluded.updated_at",params![candidate.suggested_project_id,as_i64(now)?])?;
     Ok(candidate)
@@ -480,6 +481,34 @@ impl ExperimentStore {
         let c = self.lock()?;
         if let Some(saved)=c.query_row("SELECT data_json FROM remote_codex_commands WHERE command_id=?1 AND state='completed'",[command],|r|r.get::<_,String>(0)).optional()? {return Ok(serde_json::from_str(&saved)?);}
         let directory_id = required_payload_string(payload, "directory_id")?;
+        if payload["kind"] == "attach_to" {
+            let project = required_payload_string(payload, "project_id")?;
+            ensure!(
+                c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM approved_projects WHERE project_id=?1)",
+                    [project],
+                    |r| r.get::<_, bool>(0)
+                )?,
+                "project_not_approved"
+            );
+            let tx = crate::migrations::write_transaction(&c)?;
+            let directory = resolve(&tx, directory_id, now)?;
+            ensure!(!directory.relative.is_empty(), "project_root_is_container");
+            let path = canonical_directory(&directory)?;
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT directory_id FROM project_members WHERE project_id=?1 AND path=?2",
+                    params![project, path.to_string_lossy()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let member = existing.unwrap_or_else(|| random_id("mem_"));
+            tx.execute("INSERT OR IGNORE INTO project_members(project_id,directory_id,path,is_primary,position) VALUES(?1,?2,?3,0,COALESCE((SELECT MAX(position)+1 FROM project_members WHERE project_id=?1),1))",params![project,member,path.to_string_lossy()])?;
+            let result = json!({"project_id":project,"directory_id":member});
+            tx.execute("UPDATE remote_codex_commands SET state='completed',data_json=?2,detail=NULL,terminal_reported=0,updated_at_unix=?3 WHERE command_id=?1 AND state='running'",params![command,serde_json::to_string(&result)?,as_i64(now)?])?;
+            tx.commit()?;
+            return Ok(result);
+        }
         let creating = payload["kind"] == "create";
         if creating {
             let name = required_payload_string(payload, "name")?;
@@ -627,8 +656,8 @@ impl ExperimentStore {
     }
 
     pub fn project_info(&self, project: &str) -> Result<ProjectInfo> {
-        let path: String = self
-            .lock()?
+        let connection = self.lock()?;
+        let path: String = connection
             .query_row(
                 "SELECT path FROM approved_projects WHERE project_id=?1",
                 [project],
@@ -641,9 +670,52 @@ impl ExperimentStore {
             .args(["-C", &path, "rev-parse", "--verify", "HEAD^{commit}"])
             .output()
             .context("project_git_unavailable")?;
+        let mut statement=connection.prepare("SELECT directory_id,path,is_primary FROM project_members WHERE project_id=?1 ORDER BY position,directory_id")?;
+        let directories = statement
+            .query_map([project], |row| {
+                let path: String = row.get(1)?;
+                Ok(ProjectMember {
+                    directory_id: row.get(0)?,
+                    name: Path::new(&path)
+                        .file_name()
+                        .and_then(|v| v.to_str())
+                        .unwrap_or("目录")
+                        .to_owned(),
+                    is_primary: row.get(2)?,
+                    can_create_worktree: std::process::Command::new("git")
+                        .args(["-C", &path, "rev-parse", "--verify", "HEAD^{commit}"])
+                        .output()
+                        .map(|output| output.status.success())
+                        .unwrap_or(false),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(ProjectInfo {
             can_create_worktree: output.status.success(),
+            directories,
         })
+    }
+
+    pub fn project_member_path(&self, project: &str, member: &str) -> Result<PathBuf> {
+        let path: String = self
+            .lock()?
+            .query_row(
+                "SELECT path FROM project_members WHERE project_id=?1 AND directory_id=?2",
+                params![project, member],
+                |r| r.get(0),
+            )
+            .context("project_directory_unavailable")?;
+        let path = fs::canonicalize(path).context("project_directory_unavailable")?;
+        open_absolute(&path)?;
+        Ok(path)
+    }
+
+    pub fn project_contains_path(&self, project: &str, path: &Path) -> Result<bool> {
+        Ok(self.lock()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM project_members WHERE project_id=?1 AND path=?2)",
+            params![project, path.to_string_lossy()],
+            |r| r.get(0),
+        )?)
     }
 }
 
@@ -899,12 +971,12 @@ mod tests {
                 .unwrap()
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            8
+            9
         );
         store
             .lock()
             .unwrap()
-            .pragma_update(None, "user_version", 9)
+            .pragma_update(None, "user_version", 10)
             .unwrap();
         drop(store);
         assert!(ExperimentStore::open(&db).is_err());

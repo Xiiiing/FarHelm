@@ -35,17 +35,26 @@ pub enum AddProjectRequest {
         directory_id: String,
         name: String,
     },
+    AttachTo {
+        agent_id: String,
+        project_id: String,
+        directory_id: String,
+    },
 }
 
 impl AddProjectRequest {
     pub fn agent_id(&self) -> &str {
         match self {
-            Self::Attach { agent_id, .. } | Self::Create { agent_id, .. } => agent_id,
+            Self::Attach { agent_id, .. }
+            | Self::Create { agent_id, .. }
+            | Self::AttachTo { agent_id, .. } => agent_id,
         }
     }
     pub fn directory_id(&self) -> &str {
         match self {
-            Self::Attach { directory_id, .. } | Self::Create { directory_id, .. } => directory_id,
+            Self::Attach { directory_id, .. }
+            | Self::Create { directory_id, .. }
+            | Self::AttachTo { directory_id, .. } => directory_id,
         }
     }
 }
@@ -58,6 +67,8 @@ pub struct ProjectPreference {
     pub display_name: Option<String>,
     pub hidden: bool,
     pub pinned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_order: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +87,17 @@ pub struct UpdateProjectPreferences {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectInfo {
+    pub can_create_worktree: bool,
+    #[serde(default)]
+    pub directories: Vec<ProjectMember>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectMember {
+    pub directory_id: String,
+    pub name: String,
+    pub is_primary: bool,
+    #[serde(default)]
     pub can_create_worktree: bool,
 }
 
@@ -103,6 +125,10 @@ pub fn valid_directory_id(id: &str) -> bool {
     id.len() == 36
         && (id.starts_with("dir_") || id.starts_with("rtd_"))
         && id[4..].bytes().all(|c| c.is_ascii_hexdigit())
+}
+
+pub fn valid_member_id(id: &str) -> bool {
+    id.len() == 36 && id.starts_with("mem_") && id[4..].bytes().all(|c| c.is_ascii_hexdigit())
 }
 
 #[cfg(test)]

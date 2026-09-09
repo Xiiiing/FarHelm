@@ -671,6 +671,11 @@ fn apply_materialized_view(
             )?;
         }
         "codex.session.updated" => {
+            let candidate = required_string(&event.payload, "session_id")?;
+            let deleted: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM session_tombstones WHERE session_id=?1 AND agent_id=?2)", params![candidate,agent_id], |row| row.get(0))?;
+            if deleted {
+                return Ok(());
+            }
             let mut value = event.payload.clone();
             if let Value::Object(ref mut map) = value {
                 map.insert("agent_id".to_owned(), Value::String(agent_id.to_owned()));
@@ -713,6 +718,15 @@ fn apply_materialized_view(
                     connection.execute("UPDATE codex_sessions SET title=?1 WHERE session_id=?2 AND agent_id=?3", params![title, session.session_id,agent_id])?;
                 }
             }
+        }
+        "codex.session.deleted" => {
+            let session = required_string(&event.payload, "session_id")?;
+            let operation = required_string(&event.payload, "operation_id")?;
+            connection.execute("INSERT INTO session_tombstones(session_id,agent_id,operation_id,deleted_at_unix) VALUES(?1,?2,?3,?4) ON CONFLICT(session_id) DO NOTHING", params![session,agent_id,operation,as_i64(event.payload["updated_at_unix"].as_u64().unwrap_or(event.created_at_unix))?])?;
+            connection.execute(
+                "DELETE FROM codex_sessions WHERE session_id=?1 AND agent_id=?2",
+                params![session, agent_id],
+            )?;
         }
         "codex.schedule.updated" => {
             let id = format!(

@@ -419,6 +419,8 @@ pub async fn update(check: bool, requested: Option<&str>, allow_major: bool) -> 
     write_atomic(&paths.config, config.encode()?.as_bytes(), 0o600)?;
     install_binary(&executable.path, &paths.binary, &paths.previous)?;
     if let Err(error) = restart_and_check().await {
+        ensure_rollback_compatible(&paths.database, &paths.previous)
+            .context("Agent update failed and automatic rollback is unsafe")?;
         swap_with_previous(&paths.binary, &paths.previous)?;
         systemctl_checked(ServiceScope::User, &["restart", UNIT_NAME])?;
         return Err(error).context("Agent update failed; previous binary restored");
@@ -430,6 +432,7 @@ pub async fn update(check: bool, requested: Option<&str>, allow_major: bool) -> 
 pub async fn rollback() -> Result<()> {
     require_user()?;
     let paths = AgentPaths::discover()?;
+    ensure_rollback_compatible(&paths.database, &paths.previous)?;
     swap_with_previous(&paths.binary, &paths.previous)?;
     if let Err(error) = restart_and_check().await {
         swap_with_previous(&paths.binary, &paths.previous)?;
@@ -437,6 +440,40 @@ pub async fn rollback() -> Result<()> {
         return Err(error).context("Agent rollback failed; original binary restored");
     }
     println!("FarHelm Agent rolled back successfully.");
+    Ok(())
+}
+
+fn ensure_rollback_compatible(database: &Path, binary: &Path) -> Result<()> {
+    if !database.is_file() {
+        return Ok(());
+    }
+    let connection = rusqlite::Connection::open_with_flags(
+        database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let schema: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if schema < 9 {
+        return Ok(());
+    }
+    let output = Command::new(binary)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("failed to inspect rollback binary {}", binary.display()))?;
+    ensure!(
+        output.status.success(),
+        "rollback binary version check failed"
+    );
+    let stdout =
+        String::from_utf8(output.stdout).context("rollback binary version is not UTF-8")?;
+    let version = stdout
+        .split_whitespace()
+        .last()
+        .and_then(|value| semver::Version::parse(value.trim_start_matches(['v', 'V'])).ok())
+        .context("rollback binary did not report a valid version")?;
+    ensure!(
+        version >= semver::Version::new(0, 12, 0),
+        "database schema {schema} is incompatible with rollback binary {version}; keeping the current binary"
+    );
     Ok(())
 }
 

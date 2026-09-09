@@ -1,4 +1,4 @@
-# FarHelm V0.11.0 deployment and lifecycle
+# FarHelm V0.12.0 deployment and lifecycle
 
 [简体中文](README.md) · [English](README.en.md)
 
@@ -200,20 +200,22 @@ If a native client cannot find the session, use “Continue in native Codex” i
 
 If FarHelm still holds the native writer, first choose “Release connection and continue” in that dialog. Active work, background terminals, or unsaved sessions prevent handoff; resolve them and retry. They are never terminated by handoff. Close the native client's session connection before sending from the browser again. Existing schedules continue as planned and are not automatically paused by handoff.
 
-## Upgrading to V0.11.0
+## Upgrading to V0.12.0
 
-Upgrade Hub first, then each Agent as its original user; finish active sessions and back up configuration and databases beforehand. Each role's single migration entry point upgrades schema 7 to 8, preserving projects, sessions, authorizations, receipts, and execution identities without re-pairing:
+Upgrade Hub first, then each Agent as its original user; finish active sessions and back up configuration and databases beforehand. Each role's single migration entry point upgrades schema 8 to 9, preserving projects, sessions, authorizations, receipts, and execution identities without re-pairing:
 
 ```bash
 # Hub
-sudo farhelm-hub update --version V0.11.0
+sudo farhelm-hub update --version V0.12.0
 sudo farhelm-hub status
 
 # Each Agent, without sudo
-farhelm-agent update --version V0.11.0
+farhelm-agent update --version V0.12.0
 farhelm-agent status
 ```
 
+This release upgrades Hub and Agent databases to schema 9. If the new service fails after migration, the updater only restores a previous binary compatible with V0.12.0 or later.
+
 Reopen the browser after upgrading, then use Project Management to add projects and choose which ones to display. Manage root authorization locally with Agent `project roots add/list/remove`. Native archive impact checks require Codex 0.153.4 or later.
 
-V0.10.0 and older binaries refuse schema 8. Rollback requires a schema-8-compatible repair build; never overwrite completed-operation receipts with an older database snapshot. New directory and lifecycle commands are sent only to Agents declaring the corresponding capabilities; other servers show an upgrade prompt.
+V0.11.0 and older binaries refuse schema 9. Rollback requires a schema-9-compatible repair build; never overwrite completed-operation receipts with an older database snapshot. New capabilities are sent only to Agents declaring them; other servers show an upgrade prompt.

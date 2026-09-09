@@ -72,7 +72,7 @@ export function CodexPage({ csrf, agents }: { csrf: string; agents: AgentSummary
   }
   const rail = <aside className="codex-rail" aria-label="项目和会话">
     <div className="codex-rail-head"><h2>会话</h2><div className="rail-heading-actions"><Button type="text" icon={<SettingOutlined />} onClick={manage} aria-label="项目管理" />{projects.length > 0 && <ScopeFilter value={scope} options={scopes} onChange={setScope} />}<Button type="text" className="new-session-button" icon={<PlusOutlined />} onClick={() => newSession()} aria-label="新建会话">新建</Button></div></div>
-    <Input className="session-search" allowClear prefix={<SearchOutlined />} suffix={<kbd className="desktop-only">{navigator.platform.includes('Mac') ? '⌘ K' : 'Ctrl K'}</kbd>} placeholder="搜索全部会话" aria-label="搜索全部会话" value={query} onChange={(e) => setQuery(e.target.value)} />
+    <Input className="session-search" allowClear prefix={<SearchOutlined />} suffix={<kbd className="desktop-only">{navigator.platform.includes('Mac') ? '⌘ K' : 'Ctrl K'}</kbd>} placeholder="搜索全部会话" aria-label="搜索全部会话" value={query} onChange={(e) => { setQuery(e.target.value); if (!e.target.value) setIncludeHidden(false) }} />
     <div className="session-filter-row"><Segmented block className="archive-tabs" value={archive} onChange={(value) => { setArchive(value as ArchiveFilter) }} options={[{ label: '当前', value: 'false' }, { label: '归档', value: 'true' }, { label: '全部', value: 'all' }]} /></div>
     {query && <Checkbox checked={includeHidden} onChange={(e) => setIncludeHidden(e.target.checked)}>包含隐藏项目</Checkbox>}
     {!model.visible.length && model.approved.length > 0 && <Alert type="info" title="全部项目已隐藏" action={<Button onClick={manage}>恢复项目显示</Button>} />}

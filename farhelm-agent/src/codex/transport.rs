@@ -20,6 +20,12 @@ use tokio::{
 const MAX_FRAME: u64 = 8 * 1024 * 1024;
 type Reply = std::result::Result<Value, String>;
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Reply>>>>;
+#[derive(Clone)]
+struct PendingServerRequest {
+    wire_id: Value,
+    request: Value,
+}
+type ServerRequests = Arc<Mutex<HashMap<String, PendingServerRequest>>>;
 
 pub struct Connection {
     stdin: Arc<AsyncMutex<Option<ChildStdin>>>,
@@ -27,6 +33,7 @@ pub struct Connection {
     next_id: AtomicU64,
     pub alive: Arc<AtomicBool>,
     pub events: broadcast::Sender<Value>,
+    server_requests: ServerRequests,
     child: AsyncMutex<Child>,
     reader: tokio::task::AbortHandle,
 }
@@ -49,11 +56,13 @@ impl Connection {
         let pending: Pending = Arc::default();
         let alive = Arc::new(AtomicBool::new(true));
         let (events, _) = broadcast::channel(4096);
-        let (input, replies, healthy, notices) = (
+        let server_requests: ServerRequests = Arc::default();
+        let (input, replies, healthy, notices, requests) = (
             stdin.clone(),
             pending.clone(),
             alive.clone(),
             events.clone(),
+            server_requests.clone(),
         );
         let reader = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
@@ -73,25 +82,33 @@ impl Connection {
                 };
                 if let Some(method) = value["method"].as_str() {
                     if !value["id"].is_null() {
-                        // FarHelm does not offer an approval UI. Never silently grant
-                        // elevated permissions or let an unanswered approval hang a turn.
-                        let result = match method {
+                        if matches!(
+                            method,
                             "item/commandExecution/requestApproval"
-                            | "item/fileChange/requestApproval" => {
-                                Some(json!({"decision":"decline"}))
+                                | "item/fileChange/requestApproval"
+                                | "item/permissions/requestApproval"
+                                | "item/tool/requestUserInput"
+                        ) {
+                            let token = format!("req_{:032x}", rand::random::<u128>());
+                            let inserted = requests.lock().ok().is_some_and(|mut pending| {
+                                if pending.len() >= 64 {
+                                    return false;
+                                }
+                                pending.insert(
+                                    token.clone(),
+                                    PendingServerRequest {
+                                        wire_id: value["id"].clone(),
+                                        request: value.clone(),
+                                    },
+                                );
+                                true
+                            });
+                            if inserted {
+                                let _ = notices.send(json!({"method":"farhelm/serverRequest","params":{"requestToken":token,"threadId":value["params"]["threadId"],"turnId":value["params"]["turnId"],"requestMethod":method}}));
+                                continue;
                             }
-                            "item/permissions/requestApproval" => {
-                                Some(json!({"permissions":{},"scope":"turn"}))
-                            }
-                            "item/tool/requestUserInput" => Some(json!({"answers":{}})),
-                            _ => None,
-                        };
-                        let response = match result {
-                            Some(result) => json!({"id":value["id"],"result":result}),
-                            None => {
-                                json!({"id":value["id"],"error":{"code":-32601,"message":"Unsupported FarHelm client request"}})
-                            }
-                        };
+                        }
+                        let response = json!({"id":value["id"],"error":{"code":-32601,"message":"Unsupported or saturated FarHelm client request"}});
                         if !matches!(
                             tokio::time::timeout(
                                 Duration::from_secs(5),
@@ -103,6 +120,12 @@ impl Connection {
                             break;
                         }
                     } else {
+                        if method == "serverRequest/resolved" {
+                            let request_id = &value["params"]["requestId"];
+                            if let Ok(mut pending) = requests.lock() {
+                                pending.retain(|_, item| &item.wire_id != request_id);
+                            }
+                        }
                         let _ = notices.send(value);
                     }
                 } else if let Some(id) = value["id"].as_u64() {
@@ -136,6 +159,9 @@ impl Connection {
             {
                 let _ = sender.send(Err("codex_connection_closed".to_owned()));
             }
+            if let Ok(mut pending) = requests.lock() {
+                pending.clear();
+            }
             let _ = notices.send(json!({"method":"farhelm/disconnected"}));
         });
         let connection = Arc::new(Self {
@@ -144,6 +170,7 @@ impl Connection {
             next_id: AtomicU64::new(1),
             alive,
             events,
+            server_requests,
             child: AsyncMutex::new(child),
             reader: reader.abort_handle(),
         });
@@ -210,6 +237,49 @@ impl Connection {
         self.reader.abort();
     }
 
+    pub fn pending_server_requests(&self) -> Vec<Value> {
+        let Ok(pending) = self.server_requests.lock() else {
+            return Vec::new();
+        };
+        pending
+            .iter()
+            .map(|(token, item)| {
+                let mut value = item.request.clone();
+                if let Some(map) = value.as_object_mut() {
+                    map.remove("id");
+                    map.insert("requestToken".into(), json!(token));
+                }
+                value
+            })
+            .collect()
+    }
+
+    pub async fn answer_server_request(&self, token: &str, answer: Value) -> Result<Value> {
+        let pending = self
+            .server_requests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("codex_server_request_poisoned"))?
+            .remove(token)
+            .context("codex_server_request_resolved")?;
+        if let Err(error) = validate_server_answer(&pending.request, &answer) {
+            self.server_requests
+                .lock()
+                .map_err(|_| anyhow::anyhow!("codex_server_request_poisoned"))?
+                .insert(token.to_owned(), pending);
+            return Err(error);
+        }
+        if let Err(error) =
+            write_json(&self.stdin, &json!({"id":pending.wire_id,"result":answer})).await
+        {
+            self.server_requests
+                .lock()
+                .map_err(|_| anyhow::anyhow!("codex_server_request_poisoned"))?
+                .insert(token.to_owned(), pending);
+            return Err(error);
+        }
+        Ok(json!({"request_token":token,"state":"answered"}))
+    }
+
     /// Only called after the owner verifies that every loaded thread is idle.
     /// Closing stdin lets Codex flush and release its writers without a forced kill.
     pub async fn close_idle(&self) -> Result<()> {
@@ -220,6 +290,72 @@ impl Connection {
         self.alive.store(false, Ordering::Release);
         self.reader.abort();
         Ok(())
+    }
+}
+
+fn validate_server_answer(request: &Value, answer: &Value) -> Result<()> {
+    let method = request["method"]
+        .as_str()
+        .context("invalid_server_request")?;
+    match method {
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            let decision = answer["decision"]
+                .as_str()
+                .context("invalid_approval_answer")?;
+            ensure!(
+                matches!(
+                    decision,
+                    "accept" | "acceptForSession" | "decline" | "cancel"
+                ),
+                "invalid_approval_answer"
+            );
+            if let Some(available) = request["params"]["availableDecisions"].as_array() {
+                ensure!(
+                    available.iter().any(|v| v.as_str() == Some(decision)),
+                    "approval_decision_unavailable"
+                );
+            }
+        }
+        "item/permissions/requestApproval" => {
+            ensure!(
+                answer["permissions"].is_object(),
+                "invalid_permission_answer"
+            );
+            ensure!(
+                matches!(
+                    answer["scope"].as_str().unwrap_or("turn"),
+                    "turn" | "session"
+                ),
+                "invalid_permission_scope"
+            );
+            ensure!(
+                permission_subset(&answer["permissions"], &request["params"]["permissions"]),
+                "permission_grant_expands_request"
+            );
+            if let Some(strict) = answer.get("strictAutoReview") {
+                ensure!(strict.is_boolean(), "invalid_strict_auto_review");
+            }
+        }
+        "item/tool/requestUserInput" => {
+            ensure!(answer["answers"].is_object(), "invalid_user_input_answer")
+        }
+        _ => bail!("unsupported_server_request"),
+    }
+    Ok(())
+}
+
+fn permission_subset(granted: &Value, requested: &Value) -> bool {
+    match (granted, requested) {
+        (Value::Object(granted), Value::Object(requested)) => granted.iter().all(|(key, value)| {
+            requested
+                .get(key)
+                .is_some_and(|expected| permission_subset(value, expected))
+        }),
+        (Value::Array(granted), Value::Array(requested)) => granted
+            .iter()
+            .all(|value| requested.iter().any(|expected| value == expected)),
+        (Value::Bool(false), Value::Bool(_)) => true,
+        _ => granted == requested,
     }
 }
 
@@ -357,6 +493,24 @@ pub(super) fn write_fixture_executable(path: &Path, script: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn permission_answers_cannot_expand_native_request() {
+        let request = json!({"method":"item/permissions/requestApproval","params":{"permissions":{"network":{"enabled":true},"fileSystem":{"read":["/a"]}}}});
+        assert!(
+            validate_server_answer(
+                &request,
+                &json!({"permissions":{"network":{"enabled":true}},"scope":"turn"})
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_server_answer(
+                &request,
+                &json!({"permissions":{"fileSystem":{"read":["/b"]}},"scope":"turn"})
+            )
+            .is_err()
+        );
+    }
     fn executable(directory: &Path, name: &str, script: &str) -> PathBuf {
         let path = directory.join(name);
         write_fixture_executable(&path, script);
@@ -411,10 +565,18 @@ done
             .is_err()
         );
         assert!(connection.pending.lock().unwrap().is_empty());
-        assert_eq!(
-            connection.request("approval", json!({})).await.unwrap()["declined"],
-            true
-        );
+        let approval_connection = connection.clone();
+        let approval =
+            tokio::spawn(async move { approval_connection.request("approval", json!({})).await });
+        let request_event = events.recv().await.unwrap();
+        assert_eq!(request_event["method"], "farhelm/serverRequest");
+        let token = request_event["params"]["requestToken"].as_str().unwrap();
+        assert_eq!(connection.pending_server_requests().len(), 1);
+        connection
+            .answer_server_request(token, json!({"decision":"decline"}))
+            .await
+            .unwrap();
+        assert_eq!(approval.await.unwrap().unwrap()["declined"], true);
         connection.shutdown().await;
         assert!(!connection.alive.load(Ordering::Acquire));
     }

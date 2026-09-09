@@ -5,8 +5,8 @@ import { PROTOCOL_VERSION } from './health'
 export type ExperimentState = 'watching' | 'succeeded' | 'failed' | 'unknown' | 'cancelled'
 export type Experiment = { watch_id: string; agent_id: string; project_id: string; name: string; pid: number; state: ExperimentState; session_id?: string; detail?: string; updated_at_unix: number }
 export type SessionState = 'creating' | 'idle' | 'queued' | 'running' | 'interrupting' | 'failed' | 'orphaned' | 'archived'
-export type CodexSession = { session_id: string; agent_id: string; project_id: string; mode: 'inspect' | 'edit'; state: SessionState; title?: string; display_label?: string; active_turn_id?: string; updated_at_unix: number; revision?: number }
-export type TranscriptItem = { item_id: string; kind: 'user_message' | 'assistant_message' | 'command_summary' | 'file_change_summary' | 'error'; text: string; text_offset?: number; text_complete?: boolean; status?: string; exit_code?: number; duration_ms?: number; streaming?: boolean }
+export type CodexSession = { session_id: string; agent_id: string; project_id: string; mode: 'inspect' | 'edit'; state: SessionState; title?: string; display_label?: string; section_id?: string; section_name?: string; active_turn_id?: string; updated_at_unix: number; revision?: number }
+export type TranscriptItem = { item_id: string; kind: 'user_message' | 'assistant_message' | 'command_summary' | 'file_change_summary' | 'image' | 'error'; text: string; text_offset?: number; text_complete?: boolean; status?: string; exit_code?: number; duration_ms?: number; image_resource_id?: string; mime_type?: string; streaming?: boolean }
 export type TranscriptTurn = { turn_id: string; status: string; started_at_unix?: number; completed_at_unix?: number; items: TranscriptItem[] }
 export type SessionContext = { model?: string; reasoning_effort?: string; sandbox?: string; approval_policy?: string; approvals_reviewer?: string }
 export type ModelChoice = { model: string; reasoning_effort: string }
@@ -15,6 +15,48 @@ export type NativeIdentity = { session_id: string; persisted: boolean; held_by_a
 export function fetchModels(sessionId: string, signal?: AbortSignal) { return json<{ models: ModelOption[] }>(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/models`, signal) }
 export function fetchNativeIdentity(sessionId: string, signal?: AbortSignal) { return json<NativeIdentity>(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/native`, signal) }
 export function renameSession(csrf: string, sessionId: string, name: string) { return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/name`, csrf, { name }) }
+export type NativeReadKind = 'queue' | 'sections' | 'goal' | 'skills' | 'settings' | 'permissions' | 'delete_impact' | 'pending_interactions' | 'image_resource'
+export type NativeRead<T = unknown> = { revision: string; data: T }
+export function fetchNativeControl<T = unknown>(sessionId: string, kind: NativeReadKind, signal?: AbortSignal, forceReload = false) {
+  return json<NativeRead<T>>(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/native-control?${new URLSearchParams({ kind, ...(forceReload ? { force_reload: 'true' } : {}) })}`, signal)
+}
+export async function fetchNativeImage(sessionId: string, resourceId: string, signal?: AbortSignal) {
+  const chunks: Uint8Array[] = []; let offset = 0
+  for (;;) {
+    const params = new URLSearchParams({ kind: 'image_resource', resource_id: resourceId, offset: String(offset) })
+    const value = await json<{ next_offset: number; eof: boolean; mime_type: string; data_base64: string }>(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/native-control?${params}`, signal)
+    const binary = atob(value.data_base64); chunks.push(Uint8Array.from(binary, (character) => character.charCodeAt(0)))
+    if (value.eof) return URL.createObjectURL(new Blob(chunks as BlobPart[], { type: value.mime_type }))
+    if (!Number.isSafeInteger(value.next_offset) || value.next_offset <= offset) throw new Error('图片分片无效'); offset = value.next_offset
+  }
+}
+export type NativeOperation =
+  | { operation: 'queue_add'; input: ({ type: 'text'; text: string } | { type: 'skill'; skill_id: string } | { type: 'image'; attachment_id: string })[]; client_message_id: string }
+  | { operation: 'queue_update'; submission_id: string; input: ({ type: 'text'; text: string } | { type: 'skill'; skill_id: string } | { type: 'image'; attachment_id: string })[]; revision: string }
+  | { operation: 'queue_delete'; submission_id: string; revision: string }
+  | { operation: 'queue_reorder'; submission_ids: string[]; revision: string }
+  | { operation: 'queue_start'; submission_id?: string; revision: string }
+  | { operation: 'section_create'; name: string }
+  | { operation: 'section_rename'; section_id: string; name: string }
+  | { operation: 'section_delete'; section_id: string }
+  | { operation: 'section_move'; section_id?: string; before_thread_id?: string }
+  | { operation: 'compact' }
+  | { operation: 'fork'; last_turn_id: string; ephemeral: boolean }
+  | { operation: 'revert'; before_turn_id: string }
+  | { operation: 'delete'; impact_fingerprint: string }
+  | { operation: 'goal_set'; objective?: string; status?: 'active' | 'paused' | 'blocked' | 'usage_limited' | 'budget_limited' | 'complete'; token_budget?: number }
+  | { operation: 'goal_clear' }
+  | { operation: 'thread_settings'; settings: { model?: string; reasoning_effort?: string; approval_policy?: string; approvals_reviewer?: string; collaboration_mode?: string; permissions?: string; service_tier?: string } }
+  | { operation: 'turn_settings'; turn_id: string; settings: { model?: string; reasoning_effort?: string; approvals_reviewer?: string; service_tier?: string } }
+  | { operation: 'review'; target: { type: 'uncommitted_changes' } | { type: 'base_branch'; branch: string } | { type: 'commit'; sha: string } }
+  | { operation: 'interaction_answer'; request_token: string; answer: unknown }
+  | { operation: 'attachment_begin'; attachment_id: string; mime_type: string; size_bytes: number; ephemeral: boolean }
+  | { operation: 'attachment_chunk'; attachment_id: string; offset: number; data_base64: string }
+  | { operation: 'attachment_finish'; attachment_id: string }
+export function operateNative(csrf: string, sessionId: string, operation: NativeOperation) {
+  const key = crypto.randomUUID()
+  return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/native-control`, csrf, { idempotency_key: key, ...operation }, 'POST', key)
+}
 export type TranscriptPage = { older_loaded?: boolean; protocol?: string; session_id: string; turns: TranscriptTurn[]; context?: SessionContext; next_cursor?: string; continuation?: { kind: 'message' | 'history'; turn_id: string; item_id: string; text_offset: number } }
 export type DisplayPage = { sessions: CodexSession[]; next_cursor?: string; incomplete_agents: { agent_id: string; reason: string }[] }
 export async function fetchSessionDisplay(csrf: string, request: { mode: 'labels' | 'search'; session_ids?: string[]; query?: string; agent_id?: string; project_id?: string; archived?: 'false' | 'true' | 'all'; cursor?: string; visible_only?: boolean }, signal?: AbortSignal): Promise<DisplayPage> {
@@ -164,8 +206,8 @@ export async function waitForCommand(operation: Operation): Promise<Operation> {
   }
 }
 
-export function createSession(csrf: string, agentId: string, projectId: string, mode: 'inspect' | 'edit', inheritPermissions = false) {
-  return mutate('/api/v1/codex/sessions', csrf, { agent_id: agentId, project_id: projectId, mode, ...(inheritPermissions ? { inherit_permissions: true } : {}) })
+export function createSession(csrf: string, agentId: string, projectId: string, mode: 'inspect' | 'edit', inheritPermissions = false, primaryDirectoryId?: string) {
+  return mutate('/api/v1/codex/sessions', csrf, { agent_id: agentId, project_id: projectId, mode, ...(inheritPermissions ? { inherit_permissions: true } : {}), ...(primaryDirectoryId ? { primary_directory_id: primaryDirectoryId } : {}) })
 }
 export function sendMessage(csrf: string, sessionId: string, prompt: string, delivery: 'queue' | 'steer', turnId?: string, operationId?: string, modelChoice?: ModelChoice) {
   return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/messages`, csrf, { prompt, delivery, ...(delivery === 'steer' ? { turn_id: turnId } : {}), ...(modelChoice ? { model_choice: modelChoice } : {}) }, 'POST', operationId)
@@ -234,7 +276,7 @@ export async function disablePush(csrf: string): Promise<void> {
   await subscription.unsubscribe()
 }
 
-export type ProjectPreference = { agent_id: string; project_id: string; display_name: string | null; hidden: boolean; pinned: boolean }
+export type ProjectPreference = { agent_id: string; project_id: string; display_name: string | null; hidden: boolean; pinned: boolean; manual_order?: number }
 export type ProjectPreferences = { revision: number; projects: ProjectPreference[] }
 export async function fetchProjectPreferences() { const value = await json<ProjectPreferences>('/api/v1/project-preferences'); if (!Number.isSafeInteger(value.revision) || !Array.isArray(value.projects)) throw new Error('项目展示设置读取失败，请更新 Hub 并重试'); return value }
 export async function saveProjectPreferences(csrf: string, revision: number, projects: ProjectPreference[]) { return await mutate('/api/v1/project-preferences', csrf, { revision, projects }, 'PUT') as unknown as ProjectPreferences }
@@ -242,8 +284,9 @@ export type ProjectDirectory = { directory_id: string; name: string }
 export type DirectoryPage = { directory: ProjectDirectory; parent_id: string | null; entries: ProjectDirectory[]; next_cursor: string | null }
 export const fetchProjectRoots = (agent: string, signal?: AbortSignal) => json<{ roots: ProjectDirectory[] }>(`/api/v1/agents/${encodeURIComponent(agent)}/project-roots`, signal)
 export const fetchProjectDirectories = (agent: string, directory: string, cursor?: string, signal?: AbortSignal) => json<DirectoryPage>(`/api/v1/agents/${encodeURIComponent(agent)}/project-directories?${new URLSearchParams({ directory_id: directory, ...(cursor ? { cursor } : {}) })}`, signal)
-export const fetchProjectInfo = (agent: string, project: string, signal?: AbortSignal) => json<{ can_create_worktree: boolean }>(`/api/v1/agents/${encodeURIComponent(agent)}/projects/${encodeURIComponent(project)}/info`, signal)
-export const addProject = (csrf: string, agent: string, directory: string, name?: string) => mutate('/api/v1/projects', csrf, { agent_id: agent, directory_id: directory, ...(name === undefined ? { kind: 'attach' } : { kind: 'create', name }) })
+export type ProjectMember = { directory_id: string; name: string; is_primary: boolean; can_create_worktree: boolean }
+export const fetchProjectInfo = (agent: string, project: string, signal?: AbortSignal) => json<{ can_create_worktree: boolean; directories?: ProjectMember[] }>(`/api/v1/agents/${encodeURIComponent(agent)}/projects/${encodeURIComponent(project)}/info`, signal)
+export const addProject = (csrf: string, agent: string, directory: string, name?: string, projectId?: string) => mutate('/api/v1/projects', csrf, { agent_id: agent, directory_id: directory, ...(projectId ? { kind: 'attach_to', project_id: projectId } : name === undefined ? { kind: 'attach' } : { kind: 'create', name }) })
 export const syncProject = (csrf: string, agent: string, project: string) => mutate(`/api/v1/agents/${encodeURIComponent(agent)}/projects/${encodeURIComponent(project)}/sync`, csrf)
 export type ArchivePreview = { session_ids: string[]; fingerprint: string; can_archive: boolean; reason: string | null }
 export const fetchArchivePreview = (session: string, signal?: AbortSignal) => json<ArchivePreview>(`/api/v1/codex/sessions/${encodeURIComponent(session)}/archive-preview`, signal)

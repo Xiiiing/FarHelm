@@ -61,6 +61,7 @@ mod live;
 #[cfg(test)]
 mod live_tests;
 mod migrations;
+mod native_control;
 mod notification_routes;
 mod project_management;
 mod session_display;
@@ -393,6 +394,10 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/api/v1/codex/sessions/{session_id}/native",
             get(codex_settings::native),
+        )
+        .route(
+            "/api/v1/codex/sessions/{session_id}/native-control",
+            get(native_control::read).post(native_control::operate),
         )
         .route(
             "/api/v1/codex/sessions/{session_id}/name",
@@ -1510,7 +1515,13 @@ async fn create_codex_session(
     headers: HeaderMap,
     Json(request): Json<CreateCodexSessionRequest>,
 ) -> Response {
-    if !valid_agent_id(&request.agent_id) || !valid_project_id(&request.project_id) {
+    if !valid_agent_id(&request.agent_id)
+        || !valid_project_id(&request.project_id)
+        || request
+            .primary_directory_id
+            .as_deref()
+            .is_some_and(|id| !farhelm_protocol::projects::valid_member_id(id))
+    {
         return api_error(StatusCode::BAD_REQUEST, "invalid_session");
     }
     let Some(key) = idempotency_header(&headers) else {
@@ -1534,6 +1545,9 @@ async fn create_codex_session(
     let mut payload = serde_json::json!({"project_id":request.project_id,"mode":request.mode});
     if request.inherit_permissions {
         payload["inherit_permissions"] = serde_json::json!(true);
+    }
+    if let Some(directory) = request.primary_directory_id {
+        payload["primary_directory_id"] = serde_json::json!(directory);
     }
     create_typed_response(
         &state,
@@ -2059,7 +2073,7 @@ async fn create_typed_response(
     idempotency_key: &str,
     ttl: u64,
 ) -> Response {
-    let has_body = payload.get("prompt").is_some();
+    let has_body = typed_command_store::payload_has_private_body(&payload, action);
     let saved = if has_body {
         let agent = agent_id.to_owned();
         let key = idempotency_key.to_owned();

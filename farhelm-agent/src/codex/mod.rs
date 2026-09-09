@@ -15,6 +15,7 @@ use futures_util::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
     future::Future,
@@ -53,6 +54,8 @@ struct Inner {
     status: watch::Sender<CodexStatus>,
     loaded: RwLock<HashMap<String, LoadedThread>>,
     models: Mutex<Option<(Instant, farhelm_protocol::CodexModelList)>>,
+    skills: RwLock<HashMap<String, NativeSkill>>,
+    image_resources: RwLock<HashMap<String, NativeImage>>,
     activity: RwLock<()>,
     lifecycle: Mutex<()>,
 }
@@ -61,6 +64,18 @@ struct LoadedThread {
     mode: String,
     has_turns: bool,
     context: farhelm_protocol::CodexSessionContext,
+}
+#[derive(Clone)]
+struct NativeSkill {
+    name: String,
+    path: PathBuf,
+    cwd: PathBuf,
+}
+#[derive(Clone)]
+struct NativeImage {
+    session: String,
+    path: PathBuf,
+    mime: String,
 }
 #[derive(Clone)]
 pub struct Codex {
@@ -79,6 +94,8 @@ impl Codex {
                 inflight: Mutex::new(HashMap::new()),
                 loaded: RwLock::new(HashMap::new()),
                 models: Mutex::new(None),
+                skills: RwLock::new(HashMap::new()),
+                image_resources: RwLock::new(HashMap::new()),
                 activity: RwLock::new(()),
                 lifecycle: Mutex::new(()),
                 status: watch::channel(CodexStatus {
@@ -149,6 +166,8 @@ impl Codex {
             old.shutdown().await;
         }
         self.inner.loaded.write().await.clear();
+        self.inner.skills.write().await.clear();
+        self.inner.image_resources.write().await.clear();
         let result: Result<(Arc<Connection>, String)> = async {
             let explicit = self.inner.bin.clone();
             let bin = tokio::task::spawn_blocking(move || transport::discover(explicit.as_deref()))
@@ -448,6 +467,7 @@ impl Codex {
                 }
                 Ok(json!({"session_id":id}))
             }
+            "codex.native.read" => self.native_read(&params).await,
             "codex.projects.discover" => {
                 let rows = self.index(true).await?;
                 let mut projects = BTreeMap::<String, Value>::new();
@@ -604,22 +624,22 @@ impl Codex {
                     });
                     (result.data, result.next_cursor, settings)
                 };
-                crate::runtime_tasks::blocking(move || {
+                let page_session = session.clone();
+                let mut page = crate::runtime_tasks::blocking(move || {
                     history::bounded_page(
-                        &session,
+                        &page_session,
                         &turns,
                         upstream.as_deref(),
                         next.as_deref(),
                         &resume,
                     )
                 })
-                .await
-                .and_then(|mut page| {
-                    if let Some(settings) = settings {
-                        page["context"] = serde_json::to_value(settings)?;
-                    }
-                    Ok(page)
-                })
+                .await?;
+                self.register_native_images(&session, &mut page).await?;
+                if let Some(settings) = settings {
+                    page["context"] = serde_json::to_value(settings)?;
+                }
+                Ok(page)
             }
             "codex.session.start" | "codex.session.resume" => {
                 let connection = self.connection().await?;
@@ -730,6 +750,290 @@ impl Codex {
             }
             _ => bail!("unsupported_codex_method"),
         }
+    }
+
+    pub async fn native_operation(
+        &self,
+        session: &str,
+        operation: &farhelm_protocol::native::NativeOperation,
+        attachments: &HashMap<String, PathBuf>,
+    ) -> Result<Value> {
+        use farhelm_protocol::native::{GoalStatus, NativeOperation, ReviewTarget};
+        ensure!(operation.is_valid(), "invalid_native_operation");
+        let connection = self.connection().await?;
+        let revision_check = |value: &Value, expected: &str| -> Result<()> {
+            ensure!(
+                native_revision(value) == expected,
+                "native_snapshot_conflict"
+            );
+            Ok(())
+        };
+        match operation {
+            NativeOperation::QueueAdd { input, client_message_id } => {
+                let input = self.native_inputs(session, input, attachments).await?;
+                connection.request("thread/queue/add", json!({"threadId":session,"input":input,"clientUserMessageId":client_message_id})).await
+            }
+            NativeOperation::QueueUpdate { submission_id, input, revision } => {
+                let queue = connection.request("thread/queue/list", json!({"threadId":session})).await?;
+                revision_check(&queue, revision)?;
+                connection.request("thread/queue/update", json!({"threadId":session,"queuedSubmissionId":submission_id,"input":self.native_inputs(session, input, attachments).await?})).await
+            }
+            NativeOperation::QueueDelete { submission_id, revision } => {
+                let queue = connection.request("thread/queue/list", json!({"threadId":session})).await?;
+                revision_check(&queue, revision)?;
+                connection.request("thread/queue/delete", json!({"threadId":session,"queuedSubmissionId":submission_id})).await
+            }
+            NativeOperation::QueueReorder { submission_ids, revision } => {
+                let queue = connection.request("thread/queue/list", json!({"threadId":session})).await?;
+                revision_check(&queue, revision)?;
+                connection.request("thread/queue/reorder", json!({"threadId":session,"queuedSubmissionIds":submission_ids})).await
+            }
+            NativeOperation::QueueStart { submission_id, revision } => {
+                let queue = connection.request("thread/queue/list", json!({"threadId":session})).await?;
+                revision_check(&queue, revision)?;
+                connection.request("thread/queue/start", json!({"threadId":session,"queuedSubmissionId":submission_id})).await
+            }
+            NativeOperation::SectionCreate { name } => connection.request("threadSection/create", json!({"name":name})).await,
+            NativeOperation::SectionRename { section_id, name } => connection.request("threadSection/update", json!({"sectionId":section_id,"name":name})).await,
+            NativeOperation::SectionDelete { section_id } => connection.request("threadSection/delete", json!({"sectionId":section_id})).await,
+            NativeOperation::SectionMove { section_id, before_thread_id } => connection.request("thread/section/move", json!({"threadId":session,"sectionId":section_id,"beforeThreadId":before_thread_id})).await,
+            NativeOperation::Fork { last_turn_id, ephemeral } => connection.request("thread/fork", json!({"threadId":session,"lastTurnId":last_turn_id,"ephemeral":ephemeral,"excludeTurns":true})).await,
+            NativeOperation::Revert { before_turn_id } => connection.request("thread/revert", json!({"threadId":session,"beforeTurnId":before_turn_id})).await,
+            NativeOperation::Delete { .. } => connection.request("thread/delete", json!({"threadId":session})).await,
+            NativeOperation::Compact => connection.request("thread/compact/start", json!({"threadId":session})).await,
+            NativeOperation::GoalSet { objective, status, token_budget } => {
+                let status = status.map(|s| match s { GoalStatus::Active=>"active",GoalStatus::Paused=>"paused",GoalStatus::Blocked=>"blocked",GoalStatus::UsageLimited=>"usageLimited",GoalStatus::BudgetLimited=>"budgetLimited",GoalStatus::Complete=>"complete" });
+                connection.request("thread/goal/set", json!({"threadId":session,"objective":objective,"status":status,"tokenBudget":token_budget})).await
+            }
+            NativeOperation::GoalClear => connection.request("thread/goal/clear", json!({"threadId":session})).await,
+            NativeOperation::ThreadSettings { settings } => connection.request("thread/settings/update", settings_params(session, None, settings)).await,
+            NativeOperation::TurnSettings { turn_id, settings } => connection.request("turn/settings/update", settings_params(session, Some(turn_id), settings)).await,
+            NativeOperation::Review { target } => {
+                let target = match target { ReviewTarget::UncommittedChanges=>json!({"type":"uncommittedChanges"}),ReviewTarget::BaseBranch{branch}=>json!({"type":"baseBranch","branch":branch}),ReviewTarget::Commit{sha}=>json!({"type":"commit","sha":sha}) };
+                connection.request("review/start", json!({"threadId":session,"target":target})).await
+            }
+            NativeOperation::InteractionAnswer { request_token, answer } => connection.answer_server_request(request_token, answer.clone()).await,
+            NativeOperation::AttachmentBegin { .. } | NativeOperation::AttachmentChunk { .. } | NativeOperation::AttachmentFinish { .. } => bail!("attachment_operation_misrouted"),
+        }
+    }
+
+    async fn native_read(&self, params: &Value) -> Result<Value> {
+        let session = params["session_id"]
+            .as_str()
+            .context("session_id_missing")?;
+        let connection = self.connection().await?;
+        let value = match params["kind"]
+            .as_str()
+            .context("native_read_kind_missing")?
+        {
+            "queue" => {
+                connection
+                    .request("thread/queue/list", json!({"threadId":session}))
+                    .await?
+            }
+            "sections" => {
+                connection
+                    .request("threadSection/list", json!({"limit":100}))
+                    .await?
+            }
+            "goal" => {
+                connection
+                    .request("thread/goal/get", json!({"threadId":session}))
+                    .await?
+            }
+            "skills" => return self.native_skills(&connection, params).await,
+            "settings" => {
+                let thread = connection
+                    .request(
+                        "thread/read",
+                        json!({"threadId":session,"includeTurns":false}),
+                    )
+                    .await?;
+                let modes = connection
+                    .request("collaborationMode/list", json!({}))
+                    .await?;
+                let models = connection
+                    .request("model/list", json!({"includeHidden":false}))
+                    .await?;
+                json!({"thread":thread,"modes":modes["data"],"models":models["data"]})
+            }
+            "permissions" => {
+                connection
+                    .request(
+                        "permissionProfile/list",
+                        json!({"limit":100,"cwd":params["cwd"]}),
+                    )
+                    .await?
+            }
+            "pending_interactions" => {
+                return Ok(json!({"data":connection.pending_server_requests()}));
+            }
+            "image_resource" => return self.native_image_resource(session, params).await,
+            _ => bail!("invalid_native_read_kind"),
+        };
+        Ok(json!({"revision":native_revision(&value),"data":value}))
+    }
+
+    async fn register_native_images(&self, session: &str, page: &mut Value) -> Result<()> {
+        let cwd = self
+            .inner
+            .loaded
+            .read()
+            .await
+            .get(session)
+            .and_then(|loaded| loaded.thread["cwd"].as_str().map(PathBuf::from));
+        let mut additions = Vec::new();
+        for turn in page["turns"].as_array_mut().into_iter().flatten() {
+            for item in turn["items"].as_array_mut().into_iter().flatten() {
+                let Some(raw) = item
+                    .as_object_mut()
+                    .and_then(|map| map.remove("native_image_path"))
+                else {
+                    continue;
+                };
+                // The App Server path is private even when the session was evicted
+                // between the native history read and this projection pass.
+                let Some(cwd) = cwd.as_ref() else { continue };
+                let Some(raw) = raw.as_str() else { continue };
+                let Ok(path) = std::fs::canonicalize(raw) else {
+                    continue;
+                };
+                if !path.starts_with(cwd)
+                    || !path.is_file()
+                    || std::fs::metadata(&path)?.len() > 20 * 1024 * 1024
+                {
+                    continue;
+                }
+                let mime = match path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .as_deref()
+                {
+                    Some("png") => "image/png",
+                    Some("jpg") | Some("jpeg") => "image/jpeg",
+                    Some("webp") => "image/webp",
+                    _ => continue,
+                }
+                .to_owned();
+                let id = format!("img_{:032x}", rand::random::<u128>());
+                item["image_resource_id"] = json!(id);
+                item["mime_type"] = json!(mime);
+                additions.push((
+                    id,
+                    NativeImage {
+                        session: session.to_owned(),
+                        path,
+                        mime,
+                    },
+                ));
+            }
+        }
+        let mut resources = self.inner.image_resources.write().await;
+        if resources.len().saturating_add(additions.len()) > 4096 {
+            resources.clear();
+        }
+        resources.extend(additions);
+        Ok(())
+    }
+
+    async fn native_image_resource(&self, session: &str, params: &Value) -> Result<Value> {
+        use base64::Engine;
+        use std::io::{Read, Seek, SeekFrom};
+        let id = params["resource_id"]
+            .as_str()
+            .context("image_resource_missing")?;
+        let offset = params["offset"].as_u64().unwrap_or(0);
+        let image = self
+            .inner
+            .image_resources
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .context("image_resource_expired")?;
+        ensure!(image.session == session, "image_resource_session_mismatch");
+        let mut file = std::fs::File::open(&image.path)?;
+        let size = file.metadata()?.len();
+        ensure!(
+            offset <= size && size <= 20 * 1024 * 1024,
+            "image_resource_invalid"
+        );
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = vec![0; 256 * 1024];
+        let count = file.read(&mut bytes)?;
+        bytes.truncate(count);
+        Ok(
+            json!({"resource_id":id,"offset":offset,"next_offset":offset+count as u64,"eof":offset+count as u64>=size,"mime_type":image.mime,"data_base64":base64::engine::general_purpose::STANDARD.encode(bytes)}),
+        )
+    }
+
+    async fn native_skills(&self, connection: &Connection, params: &Value) -> Result<Value> {
+        let cwd = PathBuf::from(params["cwd"].as_str().context("cwd_missing")?);
+        let mut value = connection.request("skills/list", json!({"cwds":[cwd],"forceReload":params["force_reload"].as_bool().unwrap_or(false)})).await?;
+        let mut resolved = Vec::new();
+        for entry in value["data"]
+            .as_array_mut()
+            .context("skills_list_invalid")?
+        {
+            for skill in entry["skills"]
+                .as_array_mut()
+                .context("skills_list_invalid")?
+            {
+                let path = PathBuf::from(skill["path"].as_str().context("skill_path_missing")?);
+                let name = skill["name"]
+                    .as_str()
+                    .context("skill_name_missing")?
+                    .to_owned();
+                let id = format!("skill_{:032x}", rand::random::<u128>());
+                skill
+                    .as_object_mut()
+                    .context("skill_invalid")?
+                    .remove("path");
+                skill["skillId"] = json!(id);
+                resolved.push((
+                    id,
+                    NativeSkill {
+                        name,
+                        path,
+                        cwd: cwd.clone(),
+                    },
+                ));
+            }
+        }
+        let mut skills = self.inner.skills.write().await;
+        if skills.len().saturating_add(resolved.len()) > 4096 {
+            skills.clear();
+        }
+        skills.extend(resolved);
+        Ok(json!({"revision":native_revision(&value),"data":value}))
+    }
+
+    async fn native_inputs(
+        &self,
+        session: &str,
+        input: &[farhelm_protocol::native::NativeInput],
+        attachments: &HashMap<String, PathBuf>,
+    ) -> Result<Vec<Value>> {
+        use farhelm_protocol::native::NativeInput;
+        let cwd = self
+            .inner
+            .loaded
+            .read()
+            .await
+            .get(session)
+            .and_then(|loaded| loaded.thread["cwd"].as_str().map(PathBuf::from))
+            .context("session_not_loaded")?;
+        let skills = self.inner.skills.read().await;
+        input.iter().map(|item| match item {
+            NativeInput::Text { text } => Ok(json!({"type":"text","text":text})),
+            NativeInput::Skill { skill_id } => {
+                let skill = skills.get(skill_id).context("skill_not_resolved")?;
+                ensure!(skill.cwd == cwd, "skill_project_mismatch");
+                Ok(json!({"type":"skill","name":skill.name,"path":skill.path}))
+            }
+            NativeInput::Image { attachment_id } => Ok(json!({"type":"localImage","path":attachments.get(attachment_id).context("attachment_not_resolved")?})),
+        }).collect()
     }
 
     #[cfg(test)]
@@ -868,6 +1172,48 @@ fn thread_result(row: &Value) -> Value {
     json!({"session_id":row["id"],"cwd":row["cwd"],"title":history::formal_title(&row["name"]),"archived":row["archived"],"updated_at_unix":row["updatedAt"],"created_at_unix":row["createdAt"]})
 }
 
+fn native_revision(value: &Value) -> String {
+    Sha256::digest(serde_json::to_vec(value).unwrap_or_default())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn settings_params(
+    session: &str,
+    turn: Option<&String>,
+    settings: &farhelm_protocol::native::NativeSettings,
+) -> Value {
+    let mut value = json!({"threadId":session});
+    if let Some(turn) = turn {
+        value["turnId"] = json!(turn);
+    }
+    if let Some(model) = &settings.model {
+        value["model"] = json!(model);
+    }
+    if let Some(effort) = &settings.reasoning_effort {
+        value["effort"] = json!(effort);
+    }
+    if turn.is_none() {
+        if let Some(policy) = &settings.approval_policy {
+            value["approvalPolicy"] = json!(policy);
+        }
+        if let Some(profile) = &settings.permissions {
+            value["permissions"] = json!(profile);
+        }
+        if let Some(mode) = &settings.collaboration_mode {
+            value["collaborationMode"] = json!({"mode":mode,"settings":{"model":settings.model.as_deref().unwrap_or("default"),"reasoning_effort":settings.reasoning_effort,"developer_instructions":null}});
+        }
+    }
+    if let Some(reviewer) = &settings.approvals_reviewer {
+        value["approvalsReviewer"] = json!(reviewer);
+    }
+    if let Some(tier) = &settings.service_tier {
+        value["serviceTier"] = json!(tier);
+    }
+    value
+}
+
 fn display_page(rows: &[Value], params: &Value) -> Value {
     let query = params["query"]
         .as_str()
@@ -885,7 +1231,7 @@ fn display_page(rows: &[Value], params: &Value) -> Value {
         let updated=row["updatedAt"].as_u64().unwrap_or(0);
         if let Some(at)=after["updated_at_unix"].as_u64() && (std::cmp::Reverse(updated),agent,id)<=(std::cmp::Reverse(at),after["agent_id"].as_str().unwrap_or_default(),after["session_id"].as_str().unwrap_or_default()) {return None;}
         let label=title.unwrap_or_else(||history::redact_paths(preview).split_whitespace().collect::<Vec<_>>().join(" ").chars().take(80).collect());
-        Some(json!({"session_id":id,"project_id":binding["project_id"],"display_label":if label.is_empty() {Value::Null} else {json!(label)},"updated_at_unix":updated}))
+        Some(json!({"session_id":id,"project_id":binding["project_id"],"display_label":if label.is_empty() {Value::Null} else {json!(label)},"section_id":row["section"]["id"],"section_name":row["section"]["name"],"updated_at_unix":updated}))
     }).collect::<Vec<_>>();
     matches.sort_by(|a, b| {
         b["updated_at_unix"]

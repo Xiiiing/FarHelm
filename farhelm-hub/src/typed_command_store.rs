@@ -56,7 +56,7 @@ impl TypedCommandStore {
         );
         let expires = now.checked_add(ttl).context("command expiry overflowed")?;
         let payload_json = serde_json::to_string(payload)?;
-        let ephemeral = payload.get("prompt").is_some();
+        let ephemeral = payload_has_private_body(payload, action);
         let stored_payload = if ephemeral {
             serde_json::to_string(
                 &serde_json::json!({"redacted":true,"ephemeral":true,"bytes":payload_json.len(),"sha256":hex_digest(&payload_json),"session_id":payload.get("session_id"),"project_id":payload.get("project_id"),"schedule_id":payload.get("schedule_id"),"trigger":payload.get("trigger")}),
@@ -299,6 +299,20 @@ impl TypedCommandStore {
     }
 }
 
+pub(crate) fn payload_has_private_body(payload: &Value, action: CommandAction) -> bool {
+    if payload.get("prompt").is_some() {
+        return true;
+    }
+    action == CommandAction::CodexNativeOperation
+        && payload
+            .get("native_operation")
+            .cloned()
+            .and_then(|value| {
+                serde_json::from_value::<farhelm_protocol::native::NativeOperation>(value).ok()
+            })
+            .is_some_and(|operation| operation.contains_private_body())
+}
+
 fn hex_digest(value: &str) -> String {
     Sha256::digest(value.as_bytes())
         .iter()
@@ -339,6 +353,7 @@ const fn action_name(action: CommandAction) -> &'static str {
         CommandAction::CodexSessionArchive => "codex.session.archive",
         CommandAction::CodexSessionUnarchive => "codex.session.unarchive",
         CommandAction::ProjectApprove => "project.approve",
+        CommandAction::CodexNativeOperation => "codex.native.operation",
     }
 }
 fn parse_action(value: &str) -> rusqlite::Result<CommandAction> {
@@ -355,6 +370,7 @@ fn parse_action(value: &str) -> rusqlite::Result<CommandAction> {
         "codex.session.archive" => Ok(CommandAction::CodexSessionArchive),
         "codex.session.unarchive" => Ok(CommandAction::CodexSessionUnarchive),
         "project.approve" => Ok(CommandAction::ProjectApprove),
+        "codex.native.operation" => Ok(CommandAction::CodexNativeOperation),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
 }
@@ -365,7 +381,7 @@ pub(crate) fn ensure_action_schema(connection: &Connection) -> Result<()> {
         [],
         |row| row.get(0),
     )?;
-    if schema.contains("project.add") {
+    if schema.contains("codex.native.operation") {
         return Ok(());
     }
     connection.execute_batch(
@@ -374,7 +390,7 @@ pub(crate) fn ensure_action_schema(connection: &Connection) -> Result<()> {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             command_id TEXT NOT NULL UNIQUE,
             agent_id TEXT NOT NULL,
-            action TEXT NOT NULL CHECK (action IN ('codex.session.create','codex.session.resume','codex.turn.start','codex.turn.steer','codex.turn.interrupt','codex.schedule.create','codex.schedule.cancel','project.approve','project.add','project.sync','codex.session.archive','codex.session.unarchive')),
+            action TEXT NOT NULL CHECK (action IN ('codex.session.create','codex.session.resume','codex.turn.start','codex.turn.steer','codex.turn.interrupt','codex.schedule.create','codex.schedule.cancel','project.approve','project.add','project.sync','codex.session.archive','codex.session.unarchive','codex.native.operation')),
             payload_json TEXT NOT NULL,
             state TEXT NOT NULL CHECK (state IN ('queued','delivered','accepted','completed','failed','expired')),
             idempotency_key TEXT NOT NULL UNIQUE,
@@ -571,6 +587,47 @@ mod tests {
                     .windows(marker.len())
                     .any(|window| window == marker.as_bytes()),
                 "prompt leaked into database or WAL"
+            );
+        }
+    }
+
+    #[test]
+    fn native_queue_body_is_memory_only_and_never_reaches_database_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hub.db");
+        let marker = "SYNTHETIC_PRIVATE_NATIVE_QUEUE_BODY_012";
+        let payload = serde_json::json!({
+            "project_id":"p",
+            "session_id":"s",
+            "native_operation":{
+                "operation":"queue_add",
+                "input":[{"type":"text","text":marker}],
+                "client_message_id":"message-1"
+            }
+        });
+        let store = TypedCommandStore::open(&path).unwrap();
+        store
+            .create(
+                "agent",
+                CommandAction::CodexNativeOperation,
+                &payload,
+                "native-operation-key",
+                20,
+                100,
+            )
+            .unwrap();
+        assert_eq!(
+            store.claim("agent", 101).unwrap().unwrap().payload.unwrap()["native_operation"]["input"]
+                [0]["text"],
+            marker
+        );
+        for entry in std::fs::read_dir(directory.path()).unwrap() {
+            let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+            assert!(
+                !bytes
+                    .windows(marker.len())
+                    .any(|window| window == marker.as_bytes()),
+                "native queue body leaked into database or WAL"
             );
         }
     }

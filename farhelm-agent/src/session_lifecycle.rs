@@ -35,6 +35,68 @@ pub(crate) struct ArchiveTarget {
 }
 
 impl ExperimentStore {
+    pub fn mark_temporary_session(&self, session: &str, now: u64) -> Result<()> {
+        self.lock()?.execute(
+            "INSERT OR REPLACE INTO temporary_sessions VALUES(?1,?2)",
+            params![session, as_i64(now)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn cleanup_stale_temporary_sessions(&self, now: u64) -> Result<()> {
+        let sessions = {
+            let c = self.lock()?;
+            let mut s = c.prepare("SELECT session_id FROM temporary_sessions")?;
+            s.query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for session in sessions {
+            self.cleanup_ephemeral_attachments(&session)?;
+            let c = self.lock()?;
+            let tx = crate::migrations::write_transaction(&c)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO session_tombstones VALUES(?1,'service-restart',?2)",
+                params![session, as_i64(now)?],
+            )?;
+            tx.execute(
+                "DELETE FROM codex_session_bindings WHERE session_id=?1",
+                [&session],
+            )?;
+            tx.execute(
+                "DELETE FROM temporary_sessions WHERE session_id=?1",
+                [&session],
+            )?;
+            insert_event(
+                &tx,
+                &format!("temporary-restart:{session}:{now}"),
+                "codex.session.deleted",
+                &json!({"session_id":session,"operation_id":"service-restart","updated_at_unix":now}),
+                now,
+            )?;
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    pub fn tombstone_session(&self, session: &str, operation: &str, now: u64) -> Result<()> {
+        let c = self.lock()?;
+        let tx = crate::migrations::write_transaction(&c)?;
+        tx.execute(
+            "INSERT INTO session_tombstones VALUES(?1,?2,?3) ON CONFLICT(session_id) DO NOTHING",
+            params![session, operation, as_i64(now)?],
+        )?;
+        tx.execute(
+            "DELETE FROM codex_session_bindings WHERE session_id=?1",
+            [session],
+        )?;
+        tx.execute(
+            "DELETE FROM temporary_sessions WHERE session_id=?1",
+            [session],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn check_session_writable(&self, id: &str) -> Result<()> {
         let c = self.lock()?;
         writable(&c, id)

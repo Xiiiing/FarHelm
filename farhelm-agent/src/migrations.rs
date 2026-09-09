@@ -1,4 +1,4 @@
-//! The only schema-version owner for this role. Older binaries refuse version 8.
+//! The only schema-version owner for this role. Older binaries refuse version 9.
 use anyhow::{Result, ensure};
 use rusqlite::Connection;
 pub(crate) fn write_transaction(
@@ -9,13 +9,26 @@ pub(crate) fn write_transaction(
 pub fn apply(connection: &Connection) -> Result<()> {
     let tx = write_transaction(connection)?;
     let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    ensure!(version <= 8, "database schema is newer than this binary");
+    ensure!(version <= 9, "database schema is newer than this binary");
+    if version == 9 {
+        return Ok(());
+    }
     if version == 8 {
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS project_members(project_id TEXT NOT NULL,directory_id TEXT NOT NULL,path TEXT NOT NULL,is_primary INTEGER NOT NULL CHECK(is_primary IN (0,1)),position INTEGER NOT NULL,PRIMARY KEY(project_id,directory_id));
+             CREATE TABLE IF NOT EXISTS managed_attachments(attachment_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,path TEXT NOT NULL,mime_type TEXT NOT NULL,size_bytes INTEGER NOT NULL,ephemeral INTEGER NOT NULL CHECK(ephemeral IN (0,1)),state TEXT NOT NULL CHECK(state IN ('uploading','ready','failed')),created_at_unix INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS session_tombstones(session_id TEXT PRIMARY KEY,operation_id TEXT NOT NULL,deleted_at_unix INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS temporary_sessions(session_id TEXT PRIMARY KEY,created_at_unix INTEGER NOT NULL);",
+        )?;
+        tx.execute_batch("INSERT OR IGNORE INTO project_members(project_id,directory_id,path,is_primary,position) SELECT project_id,'mem_'||lower(hex(randomblob(16))),path,1,0 FROM approved_projects;")?;
+        tx.pragma_update(None, "user_version", 9)?;
+        tx.commit()?;
         return Ok(());
     }
     if version == 7 {
         crate::experiment_store::projects::migrate(&tx)?;
-        tx.pragma_update(None, "user_version", 8)?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS project_members(project_id TEXT NOT NULL,directory_id TEXT NOT NULL,path TEXT NOT NULL,is_primary INTEGER NOT NULL CHECK(is_primary IN (0,1)),position INTEGER NOT NULL,PRIMARY KEY(project_id,directory_id)); INSERT OR IGNORE INTO project_members(project_id,directory_id,path,is_primary,position) SELECT project_id,'mem_'||lower(hex(randomblob(16))),path,1,0 FROM approved_projects; CREATE TABLE IF NOT EXISTS managed_attachments(attachment_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,path TEXT NOT NULL,mime_type TEXT NOT NULL,size_bytes INTEGER NOT NULL,ephemeral INTEGER NOT NULL CHECK(ephemeral IN (0,1)),state TEXT NOT NULL CHECK(state IN ('uploading','ready','failed')),created_at_unix INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS session_tombstones(session_id TEXT PRIMARY KEY,operation_id TEXT NOT NULL,deleted_at_unix INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS temporary_sessions(session_id TEXT PRIMARY KEY,created_at_unix INTEGER NOT NULL);")?;
+        tx.pragma_update(None, "user_version", 9)?;
         tx.commit()?;
         return Ok(());
     }
@@ -109,7 +122,14 @@ pub fn apply(connection: &Connection) -> Result<()> {
     crate::experiment_store::ensure_remote_command_columns(&tx)?;
     crate::experiment_store::execution::migrate(&tx)?;
     crate::experiment_store::projects::migrate(&tx)?;
-    tx.pragma_update(None, "user_version", 8)?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS project_members(project_id TEXT NOT NULL,directory_id TEXT NOT NULL,path TEXT NOT NULL,is_primary INTEGER NOT NULL CHECK(is_primary IN (0,1)),position INTEGER NOT NULL,PRIMARY KEY(project_id,directory_id));
+         CREATE TABLE IF NOT EXISTS managed_attachments(attachment_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,path TEXT NOT NULL,mime_type TEXT NOT NULL,size_bytes INTEGER NOT NULL,ephemeral INTEGER NOT NULL CHECK(ephemeral IN (0,1)),state TEXT NOT NULL CHECK(state IN ('uploading','ready','failed')),created_at_unix INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS session_tombstones(session_id TEXT PRIMARY KEY,operation_id TEXT NOT NULL,deleted_at_unix INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS temporary_sessions(session_id TEXT PRIMARY KEY,created_at_unix INTEGER NOT NULL);",
+    )?;
+    tx.execute_batch("INSERT OR IGNORE INTO project_members(project_id,directory_id,path,is_primary,position) SELECT project_id,'mem_'||lower(hex(randomblob(16))),path,1,0 FROM approved_projects;")?;
+    tx.pragma_update(None, "user_version", 9)?;
     tx.commit()?;
     Ok(())
 }

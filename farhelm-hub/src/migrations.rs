@@ -1,4 +1,4 @@
-//! The only schema-version owner for this role. Older binaries refuse version 8.
+//! The only schema-version owner for this role. Older binaries refuse version 9.
 use anyhow::{Result, ensure};
 use rusqlite::Connection;
 pub(crate) fn write_transaction(
@@ -10,20 +10,34 @@ pub fn apply(connection: &Connection) -> Result<()> {
     connection.pragma_update(None, "secure_delete", true)?;
     let tx = write_transaction(connection)?;
     let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    ensure!(version <= 8, "database schema is newer than this binary");
+    ensure!(version <= 9, "database schema is newer than this binary");
     tx.execute_batch("CREATE TABLE IF NOT EXISTS hub_maintenance(id INTEGER PRIMARY KEY CHECK(id=1),vacuum_pending INTEGER NOT NULL);")?;
     tx.execute(
         "INSERT OR IGNORE INTO hub_maintenance VALUES(1,?1)",
         [version > 0 && version < 7],
     )?;
+    if version == 9 {
+        tx.commit()?;
+        return finish_maintenance(connection);
+    }
     if version == 8 {
+        crate::typed_command_store::ensure_action_schema(&tx)?;
+        if !table_has_column(&tx, "project_preferences", "manual_order")? {
+            tx.execute_batch("ALTER TABLE project_preferences ADD COLUMN manual_order INTEGER;")?;
+        }
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS session_tombstones(session_id TEXT PRIMARY KEY,agent_id TEXT NOT NULL,operation_id TEXT NOT NULL,deleted_at_unix INTEGER NOT NULL);")?;
+        tx.pragma_update(None, "user_version", 9)?;
         tx.commit()?;
         return finish_maintenance(connection);
     }
     if version == 7 {
         crate::typed_command_store::ensure_action_schema(&tx)?;
         crate::project_management::migrate(&tx)?;
-        tx.pragma_update(None, "user_version", 8)?;
+        if !table_has_column(&tx, "project_preferences", "manual_order")? {
+            tx.execute_batch("ALTER TABLE project_preferences ADD COLUMN manual_order INTEGER;")?;
+        }
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS session_tombstones(session_id TEXT PRIMARY KEY,agent_id TEXT NOT NULL,operation_id TEXT NOT NULL,deleted_at_unix INTEGER NOT NULL);")?;
+        tx.pragma_update(None, "user_version", 9)?;
         tx.commit()?;
         return finish_maintenance(connection);
     }
@@ -173,10 +187,22 @@ pub fn apply(connection: &Connection) -> Result<()> {
     crate::event_store::notifications::migrate(&tx)?;
     crate::event_store::notifications::migrate_history(&tx)?;
     crate::project_management::migrate(&tx)?;
-    tx.pragma_update(None, "user_version", 8)?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS session_tombstones(session_id TEXT PRIMARY KEY,agent_id TEXT NOT NULL,operation_id TEXT NOT NULL,deleted_at_unix INTEGER NOT NULL);")?;
+    tx.pragma_update(None, "user_version", 9)?;
     tx.commit()?;
     finish_maintenance(connection)?;
     Ok(())
+}
+
+fn table_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for name in names {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn finish_maintenance(connection: &Connection) -> Result<()> {

@@ -1,8 +1,9 @@
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useQueries } from '@tanstack/react-query'
 import { ApiError, json, sendMessage, type ModelChoice, type Operation } from '../../api/features'
 import { cacheOperation, keys, queryClient } from '../../api/cache'
 import { errorText } from './presentation'
+import { setUnsavedDraftCount } from '../../pwaUpdate'
 export type PendingMessage = { id: string; text: string; state: string; detail?: string; command_id?: string; turn_id?: string; visible_turn_id?: string; delivery: 'queue' | 'steer'; model_choice?: ModelChoice }
 export type SessionDraft = { text: string; error?: string; sending: boolean; delivery: 'queue' | 'steer'; pending: PendingMessage[]; model_choice?: ModelChoice }
 const empty: SessionDraft = { text: '', sending: false, delivery: 'queue', pending: [] }
@@ -10,6 +11,8 @@ const empty: SessionDraft = { text: '', sending: false, delivery: 'queue', pendi
 export function useOperations(csrf: string) {
   const [drafts, setDrafts] = useState<Record<string, SessionDraft>>({})
   const values = useRef(drafts); const locks = useRef(new Set<string>())
+  useEffect(() => { setUnsavedDraftCount(Object.values(drafts).filter((draft) => draft.text.trim()).length) }, [drafts])
+  useEffect(() => () => setUnsavedDraftCount(0), [])
   const update = useCallback((session: string, change: (old: SessionDraft) => SessionDraft) => {
     const next = { ...values.current, [session]: change(values.current[session] ?? empty) }
     values.current = next; setDrafts(next)

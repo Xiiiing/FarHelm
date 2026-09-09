@@ -21,6 +21,8 @@ use sha2::{Digest, Sha256};
 #[path = "execution_store.rs"]
 pub(crate) mod execution;
 pub use execution::ScriptReport;
+#[path = "attachment_store.rs"]
+pub(crate) mod attachments;
 #[path = "session_lifecycle.rs"]
 pub(crate) mod lifecycle;
 #[path = "project_store.rs"]
@@ -166,10 +168,13 @@ impl ExperimentStore {
             connection.pragma_update(None, "journal_mode", "WAL")?;
         }
         crate::migrations::apply(&connection)?;
-        Ok(Self {
+        let store = Self {
             connection: Arc::new(Mutex::new(connection)),
             path: path.to_owned(),
-        })
+        };
+        store.cleanup_stale_ephemeral_attachments()?;
+        store.cleanup_stale_temporary_sessions(crate::unix_time())?;
+        Ok(store)
     }
 
     pub fn import_config_projects(
@@ -1539,6 +1544,7 @@ const fn action_name(action: CommandAction) -> &'static str {
         CommandAction::CodexSessionArchive => "codex.session.archive",
         CommandAction::CodexSessionUnarchive => "codex.session.unarchive",
         CommandAction::ProjectApprove => "project.approve",
+        CommandAction::CodexNativeOperation => "codex.native.operation",
     }
 }
 
@@ -1556,6 +1562,7 @@ fn parse_action(value: &str) -> rusqlite::Result<CommandAction> {
         "codex.session.archive" => Ok(CommandAction::CodexSessionArchive),
         "codex.session.unarchive" => Ok(CommandAction::CodexSessionUnarchive),
         "project.approve" => Ok(CommandAction::ProjectApprove),
+        "codex.native.operation" => Ok(CommandAction::CodexNativeOperation),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
 }

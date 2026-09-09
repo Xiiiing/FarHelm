@@ -1641,8 +1641,27 @@ async fn execute_remote_command_inner(
     let project = projects
         .get(project_id)
         .context("command references an unapproved project")?;
-    let project_root =
-        fs::canonicalize(&project.path).context("failed to resolve approved project path")?;
+    let project_root = if let Some(member) = command.payload["primary_directory_id"].as_str() {
+        store.project_member_path(project_id, member)?
+    } else if let Some(session) = command.payload["session_id"].as_str() {
+        if let Some(binding) = store.session_binding(session)? {
+            if binding.mode == "inspect" {
+                ensure!(
+                    binding.project_id == project_id
+                        && store.project_contains_path(project_id, &binding.cwd)?,
+                    "session_project_mismatch"
+                );
+                binding.cwd
+            } else {
+                fs::canonicalize(&project.path)
+                    .context("failed to resolve approved project path")?
+            }
+        } else {
+            fs::canonicalize(&project.path).context("failed to resolve approved project path")?
+        }
+    } else {
+        fs::canonicalize(&project.path).context("failed to resolve approved project path")?
+    };
     let mode = command
         .payload
         .get("mode")
@@ -1667,6 +1686,99 @@ async fn execute_remote_command_inner(
                     command.payload["fingerprint"].as_str(),
                 )
                 .await
+        }
+        CommandAction::CodexNativeOperation => {
+            let session_id = command.payload["session_id"]
+                .as_str()
+                .context("native operation omitted session")?;
+            let binding = store
+                .session_binding(session_id)?
+                .context("native operation references unknown session")?;
+            ensure!(binding.project_id == project_id, "session_project_mismatch");
+            let operation: farhelm_protocol::native::NativeOperation =
+                serde_json::from_value(command.payload["native_operation"].clone())?;
+            match &operation {
+                farhelm_protocol::native::NativeOperation::AttachmentBegin {
+                    attachment_id,
+                    mime_type,
+                    size_bytes,
+                    ephemeral,
+                } => {
+                    return store.attachment_begin(
+                        session_id,
+                        attachment_id,
+                        mime_type,
+                        *size_bytes,
+                        *ephemeral,
+                        unix_time(),
+                    );
+                }
+                farhelm_protocol::native::NativeOperation::AttachmentChunk {
+                    attachment_id,
+                    offset,
+                    data_base64,
+                } => {
+                    return store.attachment_chunk(session_id, attachment_id, *offset, data_base64);
+                }
+                farhelm_protocol::native::NativeOperation::AttachmentFinish { attachment_id } => {
+                    return store.attachment_finish(session_id, attachment_id);
+                }
+                _ => {}
+            }
+            let mut attachments = std::collections::HashMap::new();
+            if let farhelm_protocol::native::NativeOperation::QueueAdd { input, .. }
+            | farhelm_protocol::native::NativeOperation::QueueUpdate { input, .. } = &operation
+            {
+                for item in input {
+                    if let farhelm_protocol::native::NativeInput::Image { attachment_id } = item {
+                        attachments.insert(
+                            attachment_id.clone(),
+                            store.attachment_path(session_id, attachment_id)?,
+                        );
+                    }
+                }
+            }
+            let delete_targets =
+                if let farhelm_protocol::native::NativeOperation::Delete { impact_fingerprint } =
+                    &operation
+                {
+                    let preview = worker_runtime
+                        .codex
+                        .archive_preview_for_operation(store, session_id, &command.command_id)
+                        .await?;
+                    ensure!(
+                        preview.fingerprint == *impact_fingerprint,
+                        "codex_delete_changed"
+                    );
+                    preview.session_ids
+                } else {
+                    Vec::new()
+                };
+            let value = worker_runtime
+                .codex
+                .native_operation(session_id, &operation, &attachments)
+                .await?;
+            if let farhelm_protocol::native::NativeOperation::Fork { ephemeral, .. } = operation {
+                let fork = value.get("thread").unwrap_or(&value);
+                let fork_id = fork["id"]
+                    .as_str()
+                    .context("fork response omitted thread id")?;
+                let cwd = fork["cwd"]
+                    .as_str()
+                    .map(PathBuf::from)
+                    .unwrap_or(binding.cwd.clone());
+                store.bind_session(fork_id, project_id, &cwd, &binding.mode, unix_time())?;
+                if ephemeral {
+                    store.mark_temporary_session(fork_id, unix_time())?;
+                }
+                store.enqueue_event(&format!("{}:fork",command.command_id),"codex.session.updated",&serde_json::json!({"session_id":fork_id,"project_id":project_id,"mode":binding.mode,"state":"idle","title":fork.get("name"),"active_turn_id":null,"updated_at_unix":unix_time()}),unix_time())?;
+            }
+            for target in delete_targets {
+                store.cleanup_ephemeral_attachments(&target)?;
+                store.tombstone_session(&target, &command.command_id, unix_time())?;
+                store.enqueue_event(&format!("{}:delete:{target}",command.command_id),"codex.session.deleted",&serde_json::json!({"session_id":target,"operation_id":command.command_id,"updated_at_unix":unix_time()}),unix_time())?;
+            }
+            Ok(value)
         }
         CommandAction::CodexSessionResume if handoff => {
             let session_id = command.payload["session_id"]
@@ -2256,16 +2368,20 @@ async fn read_request(
             .await
     } else if matches!(
         request.method.as_str(),
-        "codex.session.history" | "codex.models.list" | "codex.session.native"
+        "codex.session.history"
+            | "codex.models.list"
+            | "codex.session.native"
+            | "codex.native.read"
     ) {
         let session_id = request
             .params
             .get("session_id")
             .and_then(serde_json::Value::as_str)
-            .context("history read omitted session ID")?;
+            .context("history read omitted session ID")?
+            .to_owned();
         ensure!(
             {
-                let id = session_id.to_owned();
+                let id = session_id.clone();
                 store
                     .background(move |s| s.session_binding(&id))
                     .await?
@@ -2273,21 +2389,43 @@ async fn read_request(
             },
             "history read references an unapproved session"
         );
-        worker
-            .codex
-            .call(&request.method, request.params)
-            .await
-            .and_then(|value| match request.method.as_str() {
-                "codex.models.list" => Ok(serde_json::to_value(serde_json::from_value::<
-                    farhelm_protocol::CodexModelList,
-                >(value)?)?),
-                "codex.session.native" => Ok(serde_json::to_value(serde_json::from_value::<
-                    farhelm_protocol::CodexNativeIdentity,
-                >(value)?)?),
-                _ => Ok(serde_json::to_value(serde_json::from_value::<
-                    farhelm_protocol::CodexTranscriptPage,
-                >(value)?)?),
-            })
+        let mut params = request.params;
+        let mut native_result = None;
+        if request.method == "codex.native.read" {
+            let binding = {
+                let id = session_id.clone();
+                store.background(move |s| s.session_binding(&id)).await?
+            }
+            .context("native read references an unapproved session")?;
+            params["cwd"] = serde_json::json!(binding.cwd);
+            if params["kind"] == "delete_impact" {
+                native_result = Some(serde_json::to_value(
+                    worker.codex.archive_preview(store, &session_id).await?,
+                )?);
+            }
+        }
+        if let Some(value) = native_result {
+            Ok(value)
+        } else {
+            worker
+                .codex
+                .call(&request.method, params)
+                .await
+                .and_then(|value| match request.method.as_str() {
+                    "codex.models.list" => Ok(serde_json::to_value(serde_json::from_value::<
+                        farhelm_protocol::CodexModelList,
+                    >(value)?)?),
+                    "codex.session.native" => {
+                        Ok(serde_json::to_value(serde_json::from_value::<
+                            farhelm_protocol::CodexNativeIdentity,
+                        >(value)?)?)
+                    }
+                    "codex.native.read" => Ok(value),
+                    _ => Ok(serde_json::to_value(serde_json::from_value::<
+                        farhelm_protocol::CodexTranscriptPage,
+                    >(value)?)?),
+                })
+        }
     } else if request.method == "codex.session.archive_preview" {
         let id = request.params["session_id"]
             .as_str()

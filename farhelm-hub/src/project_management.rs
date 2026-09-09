@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 pub(crate) fn migrate(c: &Connection) -> Result<()> {
-    c.execute_batch("CREATE TABLE IF NOT EXISTS project_preferences(user TEXT NOT NULL,agent_id TEXT NOT NULL,project_id TEXT NOT NULL,display_name TEXT,hidden INTEGER NOT NULL,pinned INTEGER NOT NULL,PRIMARY KEY(user,agent_id,project_id));
+    c.execute_batch("CREATE TABLE IF NOT EXISTS project_preferences(user TEXT NOT NULL,agent_id TEXT NOT NULL,project_id TEXT NOT NULL,display_name TEXT,hidden INTEGER NOT NULL,pinned INTEGER NOT NULL,manual_order INTEGER,PRIMARY KEY(user,agent_id,project_id));
         CREATE TABLE IF NOT EXISTS project_preference_revisions(user TEXT PRIMARY KEY,revision INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS project_sync_status(agent_id TEXT NOT NULL,project_id TEXT NOT NULL,state TEXT NOT NULL,revision INTEGER NOT NULL,PRIMARY KEY(agent_id,project_id));")?;
     Ok(())
@@ -23,7 +23,7 @@ impl EventStore {
             .optional()?
             .unwrap_or(0)
             .try_into()?;
-        let mut stmt=c.prepare("SELECT agent_id,project_id,display_name,hidden,pinned FROM project_preferences WHERE user=?1 ORDER BY agent_id,project_id")?;
+        let mut stmt=c.prepare("SELECT agent_id,project_id,display_name,hidden,pinned,manual_order FROM project_preferences WHERE user=?1 ORDER BY agent_id,project_id")?;
         let projects = stmt
             .query_map([user], |r| {
                 Ok(ProjectPreference {
@@ -32,6 +32,17 @@ impl EventStore {
                     display_name: r.get(2)?,
                     hidden: r.get(3)?,
                     pinned: r.get(4)?,
+                    manual_order: r
+                        .get::<_, Option<i64>>(5)?
+                        .map(u32::try_from)
+                        .transpose()
+                        .map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                5,
+                                rusqlite::types::Type::Integer,
+                                Box::new(e),
+                            )
+                        })?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -87,10 +98,10 @@ impl EventStore {
             );
             let approved:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM project_candidates WHERE agent_id=?1 AND suggested_project_id=?2 AND state='approved')",params![p.agent_id,p.project_id],|r|r.get(0))?;
             ensure!(approved, "project_not_approved");
-            tx.execute("INSERT INTO project_preferences VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(user,agent_id,project_id) DO UPDATE SET display_name=excluded.display_name,hidden=excluded.hidden,pinned=excluded.pinned",params![user,p.agent_id,p.project_id,p.display_name,p.hidden,p.pinned])?;
+            tx.execute("INSERT INTO project_preferences(user,agent_id,project_id,display_name,hidden,pinned,manual_order) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(user,agent_id,project_id) DO UPDATE SET display_name=excluded.display_name,hidden=excluded.hidden,pinned=excluded.pinned,manual_order=excluded.manual_order",params![user,p.agent_id,p.project_id,p.display_name,p.hidden,p.pinned,p.manual_order])?;
         }
         tx.execute("INSERT INTO project_preference_revisions VALUES(?1,?2) ON CONFLICT(user) DO UPDATE SET revision=excluded.revision",params![user,i64::try_from(revision+1)?])?;
-        let mut stmt=tx.prepare("SELECT agent_id,project_id,display_name,hidden,pinned FROM project_preferences WHERE user=?1 ORDER BY agent_id,project_id")?;
+        let mut stmt=tx.prepare("SELECT agent_id,project_id,display_name,hidden,pinned,manual_order FROM project_preferences WHERE user=?1 ORDER BY agent_id,project_id")?;
         let projects = stmt
             .query_map([user], |r| {
                 Ok(ProjectPreference {
@@ -99,6 +110,17 @@ impl EventStore {
                     display_name: r.get(2)?,
                     hidden: r.get(3)?,
                     pinned: r.get(4)?,
+                    manual_order: r
+                        .get::<_, Option<i64>>(5)?
+                        .map(u32::try_from)
+                        .transpose()
+                        .map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                5,
+                                rusqlite::types::Type::Integer,
+                                Box::new(e),
+                            )
+                        })?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -309,6 +331,7 @@ pub(super) async fn add(
     if !valid_agent_id(request.agent_id())
         || !valid_directory_id(request.directory_id())
         || matches!(&request,AddProjectRequest::Create{name,..} if !valid_directory_name(name))
+        || matches!(&request,AddProjectRequest::AttachTo{project_id,..} if !valid_project_id(project_id))
     {
         return api_error(StatusCode::BAD_REQUEST, "invalid_project_request");
     }
@@ -375,6 +398,7 @@ mod tests {
             project_id: "p".into(),
             hidden,
             pinned: true,
+            manual_order: None,
             display_name: Some("Account name".into()),
         }
     }
@@ -550,7 +574,7 @@ mod tests {
         assert_eq!(
             c.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            8
+            9
         );
         let receipt: (i64, String, String) = c
             .query_row(
@@ -593,7 +617,7 @@ mod tests {
         }
         c.execute("INSERT INTO typed_commands(command_id,agent_id,action,payload_json,state,idempotency_key,created_at_unix,expires_at_unix,updated_at_unix) VALUES('new-command','a','project.add','{}','queued','new-operation',3,100,3)",[]).unwrap();
         assert!(c.last_insert_rowid() > 43);
-        c.pragma_update(None, "user_version", 9).unwrap();
+        c.pragma_update(None, "user_version", 10).unwrap();
         assert!(crate::migrations::apply(&c).is_err());
     }
 }

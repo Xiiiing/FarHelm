@@ -208,11 +208,20 @@ impl Codex {
         store: &ExperimentStore,
         id: &str,
     ) -> Result<ArchivePreview> {
+        self.archive_preview_for_operation(store, id, "").await
+    }
+
+    pub async fn archive_preview_for_operation(
+        &self,
+        store: &ExperimentStore,
+        id: &str,
+        command: &str,
+    ) -> Result<ArchivePreview> {
         let _activity = self.activity().await;
         let c = self.archive_connection().await?;
         let (targets, fingerprint) = tokio::time::timeout(
             Duration::from_secs(18),
-            self.archive_plan(store, &c, id, true, ""),
+            self.archive_plan(store, &c, id, true, command),
         )
         .await
         .context("codex_archive_unverified")??;

@@ -4,14 +4,21 @@
   <p><strong>面向个人科研与 GPU 训练环境的远程控制平面</strong></p>
   <p>从手机查看训练服务器状态，并在不开放训练机入站端口的前提下安全扩展远程控制能力。</p>
   <p>
-    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.11.0">V0.11.0</a> ·
+    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.12.0">V0.12.0</a> ·
     <a href="./deploy/README.md">部署文档</a> ·
     <a href="./README.en.md">English</a>
   </p>
 </div>
 
 > [!IMPORTANT]
-> `V0.11.0` 补齐项目与会话流程：导入已发现项目、接入已有目录、创建空项目、多项目展示、账号同步偏好，以及原生会话归档与恢复。已有安装先在 Hub 执行 `sudo farhelm-hub update`，再由原用户在各台 Agent 执行 `farhelm-agent update`，无需重新配对。本版迁移至 schema 8，旧版程序不能直接回退运行。
+> `V0.12.0` 把服务器端 Codex 的原生队列、审批与问答、计划／审查／目标、Skills、图片、分组、历史操作和临时任务接入现有远程工作区。已有安装先升级 Hub，再升级各 Agent；本版迁移至 schema 9，升级程序会阻止不兼容的自动回退。
+
+## 原生 Codex 远程控制（V0.12.0）
+
+- FarHelm 继续只负责远程输入、审批和展示；Codex、工具、文件与 Skills 均在所选 Agent 上运行。
+- 网页与原生客户端共享 Codex 队列和任务状态，并支持运行中审批、问答、目标、审查、设置与历史操作。
+- Skills 和服务器图片路径不会暴露给浏览器；图片使用受限分片上传，支持 PNG、JPEG、WebP，每次最多四张、每张最多 20 MiB。
+- schema 8 会原地迁移到 schema 9；数据库升级后，低于 V0.12.0 的二进制不会被自动恢复。
 
 ## 快速安装
 

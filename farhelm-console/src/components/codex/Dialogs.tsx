@@ -8,29 +8,32 @@ import { useAgents } from '../../hooks/useAgents'
 
 export function CreateDialog({ csrf, projects, initialProject, onClose, onCreated }: { csrf: string; projects: ProjectCandidate[]; initialProject?: ProjectCandidate; onClose: () => void; onCreated: (sessionId?: string) => void }) {
   const [error, setError] = useState<string>(); const [busy, setBusy] = useState(false)
-  const [form] = Form.useForm<{ project: string; isolated: boolean }>()
+  const [form] = Form.useForm<{ project: string; isolated: boolean; directory?: string }>()
   const selectedKey = Form.useWatch('project', form)
+  const selectedDirectory = Form.useWatch('directory', form)
   const projectKey = (project: ProjectCandidate) => JSON.stringify([project.agent_id, project.candidate_id])
   const project = projects.find((p) => projectKey(p) === selectedKey && p.state === 'approved')
   const { agents } = useAgents()
   const supportsNative = agents.state === 'ready' && agents.data.agents.find((a) => a.agent_id === project?.agent_id)?.capabilities?.includes('codex.session_context')
   const info = useQuery({ queryKey: ['project-info', project?.agent_id, project?.suggested_project_id], enabled: !!project, queryFn: ({ signal }) => fetchProjectInfo(project!.agent_id, project!.suggested_project_id, signal), staleTime: 0 })
+  const canCreateWorktree = selectedDirectory ? info.data?.directories?.find((item) => item.directory_id === selectedDirectory)?.can_create_worktree ?? false : info.data?.can_create_worktree ?? false
   const active = useRef(true)
   useEffect(() => { active.current = true; return () => { active.current = false } }, [])
   return <Modal title="创建 Codex 会话" open onCancel={onClose} footer={null}><Form className="create-session-form" form={form} layout="vertical" initialValues={{ isolated: false, project: initialProject ? projectKey(initialProject) : undefined }} onFinish={async (values) => {
     if (!project || busy || !supportsNative) return
     setBusy(true); setError(undefined)
     try {
-      const result = await waitForCommand(await createSession(csrf, project.agent_id, project.suggested_project_id, values.isolated && info.data?.can_create_worktree ? 'edit' : 'inspect', true))
+      const result = await waitForCommand(await createSession(csrf, project.agent_id, project.suggested_project_id, values.isolated && canCreateWorktree ? 'edit' : 'inspect', true, values.directory))
       if (active.current) { onCreated(result.data?.session_id ?? result.result?.session_id); onClose() }
     } catch (e) { if (active.current) setError(errorText(e)) } finally { if (active.current) setBusy(false) }
   }}>
     {error && <Alert type="error" showIcon title={error} />}
-    <Form.Item label="项目" name="project" rules={[{ required: true }]}><Select options={projects.filter((p) => p.state === 'approved').map((p) => ({ value: projectKey(p), label: `${p.display_name} · ${p.agent_id}` }))} /></Form.Item>
+    <Form.Item label="项目" name="project" rules={[{ required: true }]}><Select onChange={() => form.setFieldValue('directory', undefined)} options={projects.filter((p) => p.state === 'approved').map((p) => ({ value: projectKey(p), label: `${p.display_name} · ${p.agent_id}` }))} /></Form.Item>
+    {(info.data?.directories?.length ?? 0) > 1 && <Form.Item label="主工作目录" name="directory" rules={[{ required: true }]} initialValue={info.data?.directories?.find((item) => item.is_primary)?.directory_id}><Select options={info.data?.directories?.map((item) => ({ value: item.directory_id, label: `${item.name}${item.is_primary ? ' · 默认' : ''}` }))} /></Form.Item>}
     <p className="settings-detail-note">模型和权限跟随服务器上的 Codex 项目配置。</p>
-    <Form.Item name="isolated" valuePropName="checked" extra="单独的 Git 工作区，适合希望与当前项目修改分开的任务。"><Checkbox disabled={!info.data?.can_create_worktree}>使用隔离工作区</Checkbox></Form.Item>
+    <Form.Item name="isolated" valuePropName="checked" extra="单独的 Git 工作区，适合希望与当前项目修改分开的任务。"><Checkbox disabled={!canCreateWorktree}>使用隔离工作区</Checkbox></Form.Item>
     {info.error && <Alert type="warning" title="项目状态读取失败" description={errorText(info.error)} action={<Button onClick={() => void info.refetch()}>重试</Button>} />}
-    {project && !info.error && !info.isPending && !info.data?.can_create_worktree && <p className="settings-detail-note">当前项目没有可用的 Git 提交，隔离工作区不可用。</p>}
+    {project && !info.error && !info.isPending && !canCreateWorktree && <p className="settings-detail-note">所选目录没有可用的 Git 提交，隔离工作区不可用。</p>}
     {project && !supportsNative && <Alert showIcon type="warning" title="请升级此 Agent 后使用原生会话权限" />}
     <Button type="primary" htmlType="submit" loading={busy} disabled={!supportsNative} block>创建会话</Button>
   </Form></Modal>

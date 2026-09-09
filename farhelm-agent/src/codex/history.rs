@@ -239,6 +239,14 @@ pub fn normalise_turn(turn: &Value) -> Value {
                     .join("\n");
                 ("file_change_summary", summary(&text))
             }
+            Some("imageView") => {
+                metadata["native_image_path"] = item["path"].clone();
+                ("image", "Codex 图片".to_owned())
+            }
+            Some("imageGeneration") if item["savedPath"].is_string() => {
+                metadata["native_image_path"] = item["savedPath"].clone();
+                ("image", "Codex 生成的图片".to_owned())
+            }
             _ => continue,
         };
         if text.is_empty() {

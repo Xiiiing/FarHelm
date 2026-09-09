@@ -14,6 +14,7 @@ import { ModelPicker, PermissionDetails } from './SessionSettings'
 import { NativeSession, RenameSession } from './NativeSession'
 import { ArchiveDialog } from './ArchiveDialog'
 import { useProjects } from '../../hooks/useProjects'
+import { NativeControlDrawer, NativeInteractionCards } from './NativeControl'
 
 const ComposerInput = forwardRef<ComponentRef<typeof Input.TextArea>, ComponentProps<typeof Input.TextArea>>((props, ref) => <Input.TextArea {...props} variant="borderless" ref={ref} aria-label="给 Codex 发送指令" maxLength={32768} />)
 const senderComponents = { input: ComposerInput }
@@ -34,7 +35,7 @@ export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, sess
   const page = history.data; const turns = page?.turns ?? []
   const [readingMore, setReadingMore] = useState(false)
   const [modal, modalHolder] = Modal.useModal()
-  const [sessionDialog, setSessionDialog] = useState<'rename' | 'native' | 'archive'>()
+  const [sessionDialog, setSessionDialog] = useState<'rename' | 'native' | 'archive' | 'control'>()
   const [moreError, setMoreError] = useState<Error>()
   const [newMessages, setNewMessages] = useState(false)
   const [away, setAway] = useState(false)
@@ -133,8 +134,9 @@ export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, sess
   const continuation = page?.continuation
   const needsMessage = continuation?.kind === 'message' && !turns.some((t) => t.turn_id === continuation.turn_id && t.items.some((i) => i.item_id === continuation.item_id && i.text_complete))
   const nativeIdentity = !!session && !!agent?.capabilities?.includes('codex.native_identity')
-  const menu = { items: [{ key: 'archive', label: session?.state === 'archived' ? '恢复会话' : '归档会话', disabled: !session || !agent?.online || !agent.capabilities?.includes('codex.session_archive') }, { key: 'rename', label: '重命名会话', disabled: !nativeIdentity || session?.state === 'archived' }, { key: 'native', label: '在原生 Codex 中继续', disabled: !nativeIdentity || session?.state === 'archived' }, { key: 'schedules', icon: <CalendarOutlined />, label: '定时任务', disabled: !session || session.state === 'archived' }, { key: 'copy', icon: <CopyOutlined />, label: '复制会话 ID', disabled: !id }], onClick: ({ key }: { key: string }) => {
-    if (key === 'rename' || key === 'native' || key === 'archive') setSessionDialog(key)
+  const nativeControl = !!session && !!agent?.capabilities?.includes('codex.native_control')
+  const menu = { items: [{ key: 'control', label: '原生队列、目标与审查', disabled: !nativeControl || session?.state === 'archived' }, { key: 'archive', label: session?.state === 'archived' ? '恢复会话' : '归档会话', disabled: !session || !agent?.online || !agent.capabilities?.includes('codex.session_archive') }, { key: 'rename', label: '重命名会话', disabled: !nativeIdentity || session?.state === 'archived' }, { key: 'native', label: '在原生 Codex 中继续', disabled: !nativeIdentity || session?.state === 'archived' }, { key: 'schedules', icon: <CalendarOutlined />, label: '定时任务', disabled: !session || session.state === 'archived' }, { key: 'copy', icon: <CopyOutlined />, label: '复制会话 ID', disabled: !id }], onClick: ({ key }: { key: string }) => {
+    if (key === 'rename' || key === 'native' || key === 'archive' || key === 'control') setSessionDialog(key)
     if (key === 'schedules' && session) onSchedules(session)
     if (key === 'copy' && id) void navigator.clipboard.writeText(id).catch(() => onDraft((old) => ({ ...old, error: `复制失败，会话 ID：${id}` })))
   } }
@@ -154,6 +156,7 @@ export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, sess
     {session && sessionDialog === 'archive' && <ArchiveDialog session={session} csrf={csrf} onClose={() => setSessionDialog(undefined)} />}
     {session && sessionDialog === 'rename' && <RenameSession session={session} csrf={csrf} onClose={() => setSessionDialog(undefined)} />}
     {session && sessionDialog === 'native' && <NativeSession session={session} csrf={csrf} onClose={() => setSessionDialog(undefined)} onRename={() => setSessionDialog('rename')} />}
+    {session && <NativeControlDrawer csrf={csrf} session={session.session_id} turns={turns} activeTurn={session.active_turn_id} open={sessionDialog === 'control'} onClose={() => setSessionDialog(undefined)} />}
     <header className="conversation-head">
       <div className="conversation-identity">
         <Button className="mobile-only" type="text" icon={<MenuOutlined />} onClick={onRail} aria-label="打开会话列表" />
@@ -173,7 +176,8 @@ export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, sess
     }}>
       {!id ? <Welcome recent={recent} hasDraft={false} onNew={onNew} onBrowse={onBrowse} onSelect={onSelect} onPrompt={prompt} /> : loading && !page ? <div className="history-loading" role="status"><span>正在读取对话历史…</span><Skeleton active paragraph={{ rows: 5 }} /></div> : failure && !turns.length ? <Empty className="codex-empty" description={<><p>{unavailable}</p><p className="conversation-meta">{failure.message}</p></>}><Button onClick={() => void load()} icon={<ReloadOutlined />}>重试读取</Button></Empty> : page && !turns.length && session ? <Welcome session={session} recent={[]} hasDraft={!!draft.text.trim()} onNew={onNew} onBrowse={onBrowse} onSelect={onSelect} onPrompt={prompt} /> : null}
       {page?.next_cursor && !needsMessage && <Button loading={loading} className="load-earlier" onClick={() => void load(true)}>加载更早对话</Button>}
-      <Transcript turns={turns} scroll={scrollElement} position={position} continuation={needsMessage ? continuation : undefined} loading={loading} onContinue={continueHistory} onAnchor={anchorInteraction} />
+      <Transcript session={id ?? ''} turns={turns} scroll={scrollElement} position={position} continuation={needsMessage ? continuation : undefined} loading={loading} onContinue={continueHistory} onAnchor={anchorInteraction} />
+      {session && <NativeInteractionCards csrf={csrf} session={session.session_id} enabled={!!agent?.online && !!agent.capabilities?.includes('codex.interactions')} />}
       <div className="pending-messages">{pending.map((p) => <article key={p.id} className={`codex-message user pending-message ${p.state === 'submitting' ? 'is-submitting' : ''}`} data-message-key={`pending:${p.id}`}><div className="message-role">{p.state === 'submitting' ? <LoadingOutlined /> : ['failed', 'orphaned', 'unknown', 'rejected', 'expired', 'unconfirmed'].includes(p.state) ? <CloseCircleOutlined /> : p.command_id ? <CheckCircleOutlined /> : <ClockCircleOutlined />} 你 · {stateNames[p.state] ?? '处理中'}</div><div className="message-body user-text">{p.text}</div></article>)}</div>
       {visibleTurn && <div className="response-activity" role="status"><ActivityIndicator /><span>{turns.some((turn) => turn.items.some((item) => item.streaming)) ? 'Codex 正在回复' : 'Codex 正在处理'}<small>你可以继续编写下一条指令</small></span></div>}
     </div><Button className="jump-to-bottom" icon={<ArrowDownOutlined aria-hidden />} hidden={!away && !newMessages} onClick={() => { follow.current = true; anchor.current = undefined; restore(); setNewMessages(false); setAway(false) }}>{newMessages ? '有新消息 · 回到底部' : '回到底部'}</Button></div>

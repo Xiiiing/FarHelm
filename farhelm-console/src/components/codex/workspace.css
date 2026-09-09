@@ -318,3 +318,10 @@
 
 .project-management-drawer .ant-tabs-tab.ant-tabs-tab-active .ant-tabs-tab-btn { color: var(--farhelm-text); }
 .project-management-drawer .ant-tabs-tab { min-height: 44px; }
+.native-interactions { display: grid; gap: 12px; margin: 16px 0; }
+.native-request-card { padding: 16px; border: 1px solid var(--farhelm-border); border-radius: var(--radius-panel); background: var(--farhelm-surface); }
+.native-request-card h3 { margin: 0 0 8px; font-size: 16px; }
+.native-request-card pre { max-height: 240px; overflow: auto; padding: 12px; border-radius: var(--radius-control); background: var(--farhelm-raised); white-space: pre-wrap; overflow-wrap: anywhere; }
+.native-question { display: grid; gap: 8px; margin: 12px 0; }
+.native-control-stack { width: 100%; }
+.native-section-heading { min-height: 44px; width: 100%; text-align: left; color: var(--farhelm-text-secondary); }

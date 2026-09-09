@@ -321,6 +321,13 @@ pub(super) async fn display(
                     )
                 })
                 .unwrap_or(Value::Null);
+            for field in ["section_id", "section_name"] {
+                value[field] = row
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .map(|text| Value::String(text.chars().take(128).collect()))
+                    .unwrap_or(Value::Null);
+            }
             rows.push((
                 After {
                     updated_at_unix: updated,
