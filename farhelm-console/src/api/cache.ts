@@ -115,14 +115,14 @@ export function connectCodexCache() {
     while (reconciled.size > 512) reconciled.delete(reconciled.values().next().value!)
     if (!seen) refreshHistory(session)
   }
-  const off = subscribeEvents(['open', 'codex.stream.resync', 'agent.status', 'project.discovered', 'project.updated', 'project.sync.updated', 'project.preferences.updated', 'command.updated', 'codex.schedule.updated', 'experiment.updated', 'experiment.reported', 'codex.session.updated', 'codex.turn.started', 'codex.turn.completed', 'codex.turn.failed', 'codex.turn.orphaned', 'codex.message.delta'], (event) => {
+  const off = subscribeEvents(['open', 'codex.stream.resync', 'agent.status', 'project.discovered', 'project.updated', 'project.sync.updated', 'project.preferences.updated', 'command.updated', 'codex.schedule.updated', 'experiment.updated', 'experiment.reported', 'codex.session.updated', 'codex.turn.started', 'codex.turn.completed', 'codex.turn.failed', 'codex.turn.orphaned', 'codex.message.delta', 'codex.native.changed', 'codex.session.deleted'], (event) => {
     if (event.type === 'open' || event.type === 'codex.stream.resync') {
       if (opened || event.type === 'codex.stream.resync') {
         flush()
         reconcileLists()
         void queryClient.invalidateQueries({ queryKey: ['projects'] })
         void queryClient.invalidateQueries({ queryKey: ['project-preferences'] })
-        for (const query of queryClient.getQueryCache().findAll({ queryKey: ['codex'], type: 'active' })) if (['history', 'session', 'operation', 'schedules'].includes(String(query.queryKey[1]))) void queryClient.invalidateQueries({ queryKey: query.queryKey, exact: true })
+        for (const query of queryClient.getQueryCache().findAll({ queryKey: ['codex'], type: 'active' })) if (['history', 'session', 'operation', 'schedules', 'native'].includes(String(query.queryKey[1]))) void queryClient.invalidateQueries({ queryKey: query.queryKey, exact: true })
       }
       opened = true; return
     }
@@ -141,6 +141,18 @@ export function connectCodexCache() {
       } else if (event.type === 'codex.session.updated') {
         updateSession(payload)
         if (payload.session_id && queryClient.getQueryState(keys.history(payload.session_id))?.status === 'error') refreshHistory(payload.session_id)
+      }
+      else if (event.type === 'codex.session.deleted' && payload.session_id) {
+        queryClient.removeQueries({ queryKey: keys.history(payload.session_id), exact: true })
+        void queryClient.invalidateQueries({ queryKey: keys.session(payload.session_id), exact: true })
+        reconcileLists()
+      }
+      else if (event.type === 'codex.native.changed' && payload.session_id) {
+        flush()
+        refreshHistory(payload.session_id)
+        void queryClient.invalidateQueries({ queryKey: ['codex', 'native', payload.session_id] })
+        void queryClient.invalidateQueries({ queryKey: keys.session(payload.session_id) })
+        reconcileLists()
       }
       else if (payload.session_id) {
         const id = payload.session_id; const data = payload.data

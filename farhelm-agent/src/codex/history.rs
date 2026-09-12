@@ -209,7 +209,13 @@ pub fn normalise_turn(turn: &Value) -> Value {
                 if let Some(duration) = duration {
                     text.push_str(&format!(" · {duration} ms"));
                 }
-                ("command_summary", summary(&text))
+                if let Some(command) = item["command"].as_str() {
+                    text.push_str(&format!("\n$ {command}"));
+                }
+                if let Some(output) = item["aggregatedOutput"].as_str() {
+                    text.push_str(&format!("\n{output}"));
+                }
+                ("command_summary", text)
             }
             Some("fileChange") => {
                 if let Some(status) = item["status"]
@@ -233,12 +239,50 @@ pub fn normalise_turn(turn: &Value) -> Value {
                             .as_str()
                             .or_else(|| c["kind"]["type"].as_str())
                             .unwrap_or("update");
-                        format!("{kind}: {name}")
+                        format!("{kind}: {name}\n{}", c["diff"].as_str().unwrap_or_default())
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                ("file_change_summary", summary(&text))
+                ("file_change_summary", text)
             }
+            Some("plan") => (
+                "assistant_message",
+                format!("计划\n\n{}", item["text"].as_str().unwrap_or_default()),
+            ),
+            Some("enteredReviewMode") => (
+                "assistant_message",
+                format!(
+                    "开始审查\n\n{}",
+                    item["review"].as_str().unwrap_or_default()
+                ),
+            ),
+            Some("exitedReviewMode") => (
+                "assistant_message",
+                format!(
+                    "审查结果\n\n{}",
+                    item["review"].as_str().unwrap_or_default()
+                ),
+            ),
+            Some("contextCompaction") => ("assistant_message", "上下文已压缩".into()),
+            Some("mcpToolCall") => (
+                "command_summary",
+                format!(
+                    "MCP {} / {} · {}\n{}",
+                    item["server"].as_str().unwrap_or_default(),
+                    item["tool"].as_str().unwrap_or_default(),
+                    item["status"].as_str().unwrap_or_default(),
+                    item["result"].get("content").unwrap_or(&Value::Null)
+                ),
+            ),
+            Some("collabAgentToolCall") => (
+                "command_summary",
+                format!(
+                    "子任务 {} · {}\n{}",
+                    item["tool"].as_str().unwrap_or_default(),
+                    item["status"].as_str().unwrap_or_default(),
+                    item["agentsStates"]
+                ),
+            ),
             Some("imageView") => {
                 metadata["native_image_path"] = item["path"].clone();
                 ("image", "Codex 图片".to_owned())
@@ -255,6 +299,11 @@ pub fn normalise_turn(turn: &Value) -> Value {
         metadata["item_id"] = item["id"]
             .as_str()
             .map_or_else(|| json!(format!("item-{index}")), |s| json!(s));
+        if kind == "user_message"
+            && let Some(client_id) = item["clientId"].as_str()
+        {
+            metadata["client_id"] = json!(client_id);
+        }
         metadata["kind"] = json!(kind);
         metadata["text"] = json!(redact_paths(&text));
         items.push(metadata);

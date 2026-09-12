@@ -5,17 +5,17 @@ import { PROTOCOL_VERSION } from './health'
 export type ExperimentState = 'watching' | 'succeeded' | 'failed' | 'unknown' | 'cancelled'
 export type Experiment = { watch_id: string; agent_id: string; project_id: string; name: string; pid: number; state: ExperimentState; session_id?: string; detail?: string; updated_at_unix: number }
 export type SessionState = 'creating' | 'idle' | 'queued' | 'running' | 'interrupting' | 'failed' | 'orphaned' | 'archived'
-export type CodexSession = { session_id: string; agent_id: string; project_id: string; mode: 'inspect' | 'edit'; state: SessionState; title?: string; display_label?: string; section_id?: string; section_name?: string; active_turn_id?: string; updated_at_unix: number; revision?: number }
-export type TranscriptItem = { item_id: string; kind: 'user_message' | 'assistant_message' | 'command_summary' | 'file_change_summary' | 'image' | 'error'; text: string; text_offset?: number; text_complete?: boolean; status?: string; exit_code?: number; duration_ms?: number; image_resource_id?: string; mime_type?: string; streaming?: boolean }
+export type CodexSession = { session_id: string; agent_id: string; project_id: string; mode: 'inspect' | 'edit'; state: SessionState; title?: string; display_label?: string; is_pinned?: boolean; section_id?: string; section_name?: string; active_turn_id?: string; updated_at_unix: number; revision?: number }
+export type TranscriptItem = { client_id?: string; item_id: string; kind: 'user_message' | 'assistant_message' | 'command_summary' | 'file_change_summary' | 'image' | 'error'; text: string; text_offset?: number; text_complete?: boolean; status?: string; exit_code?: number; duration_ms?: number; image_resource_id?: string; mime_type?: string; streaming?: boolean }
 export type TranscriptTurn = { turn_id: string; status: string; started_at_unix?: number; completed_at_unix?: number; items: TranscriptItem[] }
-export type SessionContext = { model?: string; reasoning_effort?: string; sandbox?: string; approval_policy?: string; approvals_reviewer?: string }
+export type SessionContext = { ephemeral?: boolean; model?: string; reasoning_effort?: string; sandbox?: string; approval_policy?: string; approvals_reviewer?: string }
 export type ModelChoice = { model: string; reasoning_effort: string }
 export type ModelOption = { model: string; display_name: string; reasoning_efforts: string[]; default_reasoning_effort: string; is_default: boolean }
 export type NativeIdentity = { session_id: string; persisted: boolean; held_by_agent?: boolean; native_name?: string; source?: string; history_mode?: string }
 export function fetchModels(sessionId: string, signal?: AbortSignal) { return json<{ models: ModelOption[] }>(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/models`, signal) }
 export function fetchNativeIdentity(sessionId: string, signal?: AbortSignal) { return json<NativeIdentity>(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/native`, signal) }
 export function renameSession(csrf: string, sessionId: string, name: string) { return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/name`, csrf, { name }) }
-export type NativeReadKind = 'queue' | 'sections' | 'goal' | 'skills' | 'settings' | 'permissions' | 'delete_impact' | 'pending_interactions' | 'image_resource'
+export type NativeReadKind = 'activity' | 'queue' | 'sections' | 'goal' | 'skills' | 'settings' | 'permissions' | 'delete_impact' | 'pending_interactions' | 'image_resource'
 export type NativeRead<T = unknown> = { revision: string; data: T }
 export function fetchNativeControl<T = unknown>(sessionId: string, kind: NativeReadKind, signal?: AbortSignal, forceReload = false) {
   return json<NativeRead<T>>(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/native-control?${new URLSearchParams({ kind, ...(forceReload ? { force_reload: 'true' } : {}) })}`, signal)
@@ -33,6 +33,8 @@ export async function fetchNativeImage(sessionId: string, resourceId: string, si
 export type NativeOperation =
   | { operation: 'queue_add'; input: ({ type: 'text'; text: string } | { type: 'skill'; skill_id: string } | { type: 'image'; attachment_id: string })[]; client_message_id: string }
   | { operation: 'queue_update'; submission_id: string; input: ({ type: 'text'; text: string } | { type: 'skill'; skill_id: string } | { type: 'image'; attachment_id: string })[]; revision: string }
+  | { operation: 'temporary_start' | 'temporary_end' }
+  | { operation: 'pin'; pinned: boolean }
   | { operation: 'queue_delete'; submission_id: string; revision: string }
   | { operation: 'queue_reorder'; submission_ids: string[]; revision: string }
   | { operation: 'queue_start'; submission_id?: string; revision: string }
@@ -54,7 +56,7 @@ export type NativeOperation =
   | { operation: 'attachment_chunk'; attachment_id: string; offset: number; data_base64: string }
   | { operation: 'attachment_finish'; attachment_id: string }
 export function operateNative(csrf: string, sessionId: string, operation: NativeOperation) {
-  const key = crypto.randomUUID()
+  const key = operation.operation === 'queue_add' ? operation.client_message_id : crypto.randomUUID()
   return mutate(`/api/v1/codex/sessions/${encodeURIComponent(sessionId)}/native-control`, csrf, { idempotency_key: key, ...operation }, 'POST', key)
 }
 export type TranscriptPage = { older_loaded?: boolean; protocol?: string; session_id: string; turns: TranscriptTurn[]; context?: SessionContext; next_cursor?: string; continuation?: { kind: 'message' | 'history'; turn_id: string; item_id: string; text_offset: number } }
@@ -142,6 +144,17 @@ const codexErrors: Record<string, string> = {
   codex_handoff_busy: 'Agent 正在读取或执行对话，请结束活动任务后再交接',
   codex_handoff_unsaved: 'Agent 还有尚未落盘的空会话，请先发送消息并等待保存',
   codex_handoff_background: 'Codex 还有后台终端任务，请先在原客户端处理完再交接',
+  native_queue_legacy_pending: '旧版排队指令仍未排空，请等待完成或取消后再使用原生队列',
+  native_queue_pending_conflict: '此任务有提交正在对账；为避免重复执行，请先等待原操作核对结果',
+  codex_ephemeral_queue_unsupported: '当前 Codex 不支持临时任务使用原生队列，请使用普通文字轮次',
+  codex_server_request_scope_mismatch: '审批不属于当前任务，请刷新待处理请求',
+  codex_server_request_expired: '此请求已过期，未发送批准',
+  codex_server_request_resolved: '此请求已处理或撤销，请刷新',
+  codex_server_answer_unknown: '回答是否送达尚未确认，请核对原生状态；不会重复发送批准',
+  codex_pin_upgrade_required: '当前 Codex 未提供原生置顶状态，请升级服务器 Codex',
+  codex_pin_unverified: '尚未确认原生置顶状态，请刷新后核对',
+  temporary_session_capacity: '临时任务数量已达上限，请先结束不再使用的临时任务',
+  not_temporary_session: '此任务不是当前连接中的临时任务',
   codex_handoff_unverified: '暂时无法确认 Codex 已空闲，连接尚未释放，请稍后重试',
   codex_handoff_unconfirmed: '连接退出尚未确认，请重新核对原生会话状态',
 }

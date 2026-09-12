@@ -131,6 +131,10 @@ impl Codex {
         // Re-read runtime status: stored list rows are not evidence that a loaded child is idle.
         for row in &rows {
             let id = row["id"].as_str().context("codex_archive_unverified")?;
+            ensure!(
+                c.pending_server_requests(id).is_empty(),
+                "codex_archive_busy"
+            );
             let live = c
                 .request("thread/read", json!({"threadId":id,"includeTurns":false}))
                 .await
@@ -149,6 +153,8 @@ impl Codex {
             );
             ensure!(live["cwd"] == row["cwd"], "codex_archive_changed");
             if live["status"]["type"] == "idle" {
+                let goal = c.request("thread/goal/get", json!({"threadId":id})).await?;
+                ensure!(goal["goal"]["status"] != "active", "codex_archive_busy");
                 let terminals = c
                     .request(
                         "thread/backgroundTerminals/list",
@@ -308,6 +314,22 @@ impl Codex {
         let Ok(_lifecycle) = self.inner.lifecycle.try_lock() else {
             return Ok(());
         };
+        for (session, command) in store.pending_native_lifecycles()? {
+            let c = self.connection().await?;
+            let live = c
+                .request(
+                    "thread/read",
+                    json!({"threadId":session,"includeTurns":false}),
+                )
+                .await?;
+            if matches!(
+                live["thread"]["status"]["type"].as_str(),
+                Some("idle" | "notLoaded")
+            ) && c.pending_server_requests(&session).is_empty()
+            {
+                store.release_native_lifecycle(&session, &command)?;
+            }
+        }
         let pending = store.background(|s| s.pending_archives()).await?;
         if pending.is_empty() {
             return Ok(());

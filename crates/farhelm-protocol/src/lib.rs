@@ -67,6 +67,7 @@ impl AgentHeartbeat {
                 "codex.interactions".to_owned(),
                 "codex.skills".to_owned(),
                 "codex.images".to_owned(),
+                "codex.native_completion".to_owned(),
             ],
             protocol: FARHELM_PROTOCOL.to_owned(),
             agent_id: agent_id.into(),
@@ -348,6 +349,8 @@ pub enum CodexTranscriptItemKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodexTranscriptItem {
     pub item_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
     pub kind: CodexTranscriptItemKind,
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -394,6 +397,8 @@ pub struct CodexTranscriptPage {
 /// Ephemeral configuration only. Never persist a native configuration object or paths.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodexSessionContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -863,7 +868,7 @@ mod tests {
                 "agent_id": "gpu-a",
                 "hostname": "trainer-a",
                 "agent_version": "0.1.0",
-                "capabilities": ["codex.ephemeral_submit", "codex.session_display", "codex.item_offsets", "codex.native", "codex.session_context", "codex.model_choice", "codex.native_identity", "agent.live", "project.management", "codex.session_archive", "codex.native_control", "codex.interactions", "codex.skills", "codex.images"]
+                "capabilities": ["codex.ephemeral_submit", "codex.session_display", "codex.item_offsets", "codex.native", "codex.session_context", "codex.model_choice", "codex.native_identity", "agent.live", "project.management", "codex.session_archive", "codex.native_control", "codex.interactions", "codex.skills", "codex.images", "codex.native_completion"]
             })
         );
     }

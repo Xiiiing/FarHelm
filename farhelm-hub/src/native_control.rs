@@ -32,6 +32,13 @@ pub(super) async fn read(
     {
         return api_error(status, code);
     }
+    if matches!(query.kind, NativeReadKind::Activity)
+        && let Err((status, code)) =
+            project_management::capability(&state, &session.agent_id, "codex.native_completion")
+                .await
+    {
+        return api_error(status, code);
+    }
     let kind = match serde_json::to_value(query.kind) {
         Ok(Value::String(v)) => v,
         _ => return api_error(StatusCode::BAD_REQUEST, "invalid_native_read"),
@@ -73,6 +80,16 @@ pub(super) async fn operate(
     };
     if let Err((status, code)) =
         project_management::capability(&state, &session.agent_id, "codex.native_control").await
+    {
+        return api_error(status, code);
+    }
+    if matches!(
+        request.operation,
+        farhelm_protocol::native::NativeOperation::Pin { .. }
+            | farhelm_protocol::native::NativeOperation::TemporaryStart
+            | farhelm_protocol::native::NativeOperation::TemporaryEnd
+    ) && let Err((status, code)) =
+        project_management::capability(&state, &session.agent_id, "codex.native_completion").await
     {
         return api_error(status, code);
     }

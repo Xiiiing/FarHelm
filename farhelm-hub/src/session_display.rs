@@ -321,6 +321,10 @@ pub(super) async fn display(
                     )
                 })
                 .unwrap_or(Value::Null);
+            value["is_pinned"] = row["is_pinned"]
+                .as_bool()
+                .map(Value::Bool)
+                .unwrap_or(Value::Null);
             for field in ["section_id", "section_name"] {
                 value[field] = row
                     .get(field)

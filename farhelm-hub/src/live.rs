@@ -158,7 +158,7 @@ async fn channel(
                 ensure!(state.live.read().await.get(agent).is_some_and(|c|c.generation==generation),"replaced_connection");
                 last_seen=std::time::Instant::now();
                 if let AgentFrame::Delta {event}=frame {
-                    ensure!(initialized && event.agent_id==agent && event.protocol==FARHELM_PROTOCOL && event.event_type=="codex.message.delta","invalid_delta");
+                    ensure!(initialized && event.agent_id==agent && event.protocol==FARHELM_PROTOCOL && matches!(event.event_type.as_str(),"codex.message.delta"|"codex.native.changed"),"invalid_delta");
                     let mut payload=farhelm_protocol::public_event_payload(&event.event_type,&event.payload);
                     payload["agent_id"]=serde_json::json!(agent);
                     let _=state.event_bus.send(StoredEvent {sequence:0,event_id:event.event_id,event_type:event.event_type,payload});

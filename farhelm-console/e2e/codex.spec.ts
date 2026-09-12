@@ -531,3 +531,34 @@ test('separated terminal events and receipts reconcile each execution once in ei
     expect(model.historyReads).toBe(before + 1)
   }
 })
+
+test('native composer pastes an image and submits its opaque attachment with selected Skills', async ({ page }) => {
+  await setup(page)
+  const operations: Record<string, unknown>[] = []
+  await page.route('**/api/v1/agents', route => route.fulfill({ json: { protocol: 'farhelm/1', agents: [{ agent_id: 'gpu-a', hostname: 'Synthetic native Agent', agent_version: '0.12.0', online: true, last_seen_unix: 2000000000, capabilities: ['codex.session_context', 'codex.native_control', 'codex.interactions', 'codex.skills', 'codex.images'] }] } }))
+  await page.route('**/native-control**', route => {
+    if (route.request().method() === 'POST') { operations.push(route.request().postDataJSON()); return route.fulfill({ json: { command_id: `native-${operations.length}`, state: 'completed' } }) }
+    const kind = new URL(route.request().url()).searchParams.get('kind')
+    return route.fulfill({ json: { revision: 'a'.repeat(64), data: kind === 'skills' ? { data: [{ skills: [{ skillId: 'skill-fixture', name: 'Synthetic Skill' }] }] } : [] } })
+  })
+  await page.route('**/api/v1/commands/*', route => route.fulfill({ json: { command_id: route.request().url().split('/').at(-1), state: 'completed' } }))
+  await page.goto('/codex?session=ses-a')
+  await expect(page.getByRole('button', { name: '添加图片', exact: true })).toBeVisible()
+  await page.getByRole('combobox', { name: '本次指令 Skills' }).click()
+  await page.getByText('Synthetic Skill', { exact: true }).last().click()
+  const input = page.getByLabel('给 Codex 发送指令')
+  await input.fill('Synthetic image request')
+  await input.evaluate(element => {
+    const transfer = new DataTransfer()
+    transfer.items.add(new File([new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])], 'synthetic.png', { type: 'image/png' }))
+    element.dispatchEvent(new ClipboardEvent('paste', { clipboardData: transfer, bubbles: true, cancelable: true }))
+  })
+  await expect(page.getByText('已上传', { exact: true })).toBeVisible()
+  await composerFits(page)
+  await page.getByRole('button', { name: '发送指令' }).click()
+  await expect.poll(() => operations.some(operation => operation.operation === 'queue_add')).toBe(true)
+  const queued = operations.find(operation => operation.operation === 'queue_add')!
+  expect(queued.input).toEqual(expect.arrayContaining([{ type: 'skill', skill_id: 'skill-fixture' }, { type: 'text', text: 'Synthetic image request' }]))
+  expect(JSON.stringify(queued)).not.toContain('synthetic.png')
+  expect(queued.input).toEqual(expect.arrayContaining([expect.objectContaining({ type: 'image', attachment_id: expect.any(String) })]))
+})

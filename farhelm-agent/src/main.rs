@@ -461,6 +461,8 @@ async fn run(
     let (client, _, heartbeat) = heartbeat_client(&hub)?;
     let command_store = CommandStore::open(database)?;
     let experiment_store = ExperimentStore::open(database)?;
+    experiment_store.cleanup_stale_ephemeral_attachments()?;
+    experiment_store.cleanup_stale_temporary_sessions(unix_time())?;
     experiment_store.import_config_projects(projects, unix_time())?;
     // Explicitly configured approvals remain visible even before Codex is ready.
     for (id, project) in experiment_store.approved_projects()? {
@@ -481,6 +483,58 @@ async fn run(
         agent_id: hub.agent_id.clone(),
         wake: Arc::new(tokio::sync::Notify::new()),
     };
+    {
+        let mut display = worker_runtime.codex.subscribe_display();
+        let runtime = worker_runtime.clone();
+        let store = experiment_store.clone();
+        worker_runtime.tasks.spawn(async move {
+            loop {
+                let event = match display.recv().await {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        if let Ok(bindings) = store.display_bindings(None, None) && let Some(bindings) = bindings.as_object() {
+                            for session in bindings.keys() {
+                                runtime.link.delta(farhelm_protocol::AgentEvent { protocol: FARHELM_PROTOCOL.into(), sequence: 0, event_id: format!("resync:{:032x}", rand::random::<u128>()), agent_id: runtime.agent_id.clone(), event_type: "codex.native.changed".into(), payload: serde_json::json!({"session_id":session}), created_at_unix: unix_time() });
+                            }
+                        }
+                        continue;
+                    },
+                    Err(_) => break,
+                };
+                if event.kind == "codex.temporary.closed" {
+                    if store.session_binding(&event.session).ok().flatten().is_some() {
+                        let operation = format!("native-closed:{}", event.session);
+                        let _ = store.cleanup_ephemeral_attachments(&event.session);
+                        if store.tombstone_session(&event.session, &operation, unix_time()).is_ok() {
+                            let _ = store.enqueue_event(&operation, "codex.session.deleted", &serde_json::json!({"session_id":event.session,"operation_id":operation,"updated_at_unix":unix_time()}), unix_time());
+                            runtime.wake.notify_one();
+                        }
+                    }
+                    continue;
+                }
+                // A binding is the local authorization boundary. Tombstones remove it.
+                let Ok(Some(binding)) = store.session_binding(&event.session) else { continue };
+                if !store.project_contains_path(&binding.project_id, &binding.cwd).unwrap_or(false) { continue; }
+                if event.kind.starts_with("codex.turn.") {
+                    let key = format!("native:{}:{}:{}",event.session,event.data["turn_id"].as_str().unwrap_or_default(),event.kind);
+                    let payload = serde_json::json!({"session_id":event.session,"project_id":binding.project_id,"data":event.data});
+                    if store.enqueue_event(&key,event.kind,&payload,unix_time()).is_ok() {
+                        let running = event.kind == "codex.turn.started";
+                        let _ = store.enqueue_event(&format!("{key}:session"),"codex.session.updated", &serde_json::json!({"session_id":event.session,"project_id":binding.project_id,"mode":binding.mode,"state":if running {"running"} else {"idle"},"title":null,"active_turn_id":if running {event.data["turn_id"].clone()} else {serde_json::Value::Null},"updated_at_unix":unix_time()}),unix_time());
+                        runtime.wake.notify_one();
+                    }
+                    continue;
+                }
+                runtime.link.delta(farhelm_protocol::AgentEvent {
+                    protocol: FARHELM_PROTOCOL.into(), sequence: 0,
+                    event_id: format!("native:{:032x}", rand::random::<u128>()),
+                    agent_id: runtime.agent_id.clone(), event_type: event.kind.into(),
+                    payload: serde_json::json!({"session_id":event.session,"project_id":binding.project_id,"data":event.data}),
+                    created_at_unix: unix_time(),
+                });
+            }
+        });
+    }
     experiment_store.recover_recorded_turns(unix_time())?;
     let orphaned = experiment_store.orphan_running_prompts(unix_time())?;
     if orphaned > 0 {
@@ -1349,7 +1403,33 @@ async fn drain_remote_work(
     worker_runtime: &CodexRuntime,
     processed: &mut u64,
 ) -> Result<()> {
-    let _ = (projects, worker_runtime, processed);
+    let _ = (projects, processed);
+    for (command, session, message) in store.reconciling_native_queues()? {
+        let Some(binding) = store.session_binding(&session)? else {
+            continue;
+        };
+        if !store.project_contains_path(&binding.project_id, &binding.cwd)? {
+            continue;
+        }
+        if matches!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                worker_runtime
+                    .codex
+                    .reconcile_native_queue(&session, &message)
+            )
+            .await,
+            Ok(Ok(true))
+        ) {
+            store.finish_remote_command(
+                &command,
+                CommandState::Completed,
+                Some(&serde_json::json!({"status":"accepted","client_message_id":message})),
+                None,
+                unix_time(),
+            )?;
+        }
+    }
     for command in store.background(|s| s.pending_remote_commands()).await? {
         if unix_time() >= command.expires_at_unix {
             {
@@ -1504,6 +1584,7 @@ async fn execute_remote_command(
     let outcome = execute_remote_command_inner(&store, projects, worker_runtime, &command).await;
     let (state, data, detail) = match outcome {
         Ok(data) => (CommandState::Completed, Some(data), None),
+        Err(error) if error.to_string().contains("native_queue_reconciling") => return Ok(()),
         Err(error) => {
             warn!(command_id = %command.command_id, %error, "local Codex operation failed");
             let event_type = if error.downcast_ref::<CodexTurnOrphaned>().is_some() {
@@ -1512,6 +1593,17 @@ async fn execute_remote_command(
                 "codex.turn.failed"
             };
             let error_detail = [
+                "native_queue_pending_conflict",
+                "native_queue_legacy_pending",
+                "codex_ephemeral_queue_unsupported",
+                "codex_server_request_scope_mismatch",
+                "codex_server_request_expired",
+                "codex_server_request_resolved",
+                "codex_server_answer_unknown",
+                "codex_pin_upgrade_required",
+                "codex_pin_unverified",
+                "temporary_session_capacity",
+                "not_temporary_session",
                 "project_root_revoked",
                 "project_root_is_container",
                 "project_directory_expired",
@@ -1697,6 +1789,22 @@ async fn execute_remote_command_inner(
             ensure!(binding.project_id == project_id, "session_project_mismatch");
             let operation: farhelm_protocol::native::NativeOperation =
                 serde_json::from_value(command.payload["native_operation"].clone())?;
+            if matches!(
+                operation,
+                farhelm_protocol::native::NativeOperation::TemporaryStart
+            ) {
+                let value = worker_runtime
+                    .codex
+                    .start_temporary(&binding.cwd, &binding.mode)
+                    .await?;
+                let id = value["session_id"]
+                    .as_str()
+                    .context("temporary_session_missing")?;
+                store.bind_session(id, project_id, &binding.cwd, &binding.mode, unix_time())?;
+                store.mark_temporary_session(id, unix_time())?;
+                store.enqueue_event(&format!("{}:temporary",command.command_id),"codex.session.updated",&serde_json::json!({"session_id":id,"project_id":project_id,"mode":binding.mode,"state":"idle","title":"临时任务","active_turn_id":null,"updated_at_unix":unix_time()}),unix_time())?;
+                return Ok(serde_json::json!({"session_id":id,"ephemeral":true}));
+            }
             match &operation {
                 farhelm_protocol::native::NativeOperation::AttachmentBegin {
                     attachment_id,
@@ -1709,7 +1817,7 @@ async fn execute_remote_command_inner(
                         attachment_id,
                         mime_type,
                         *size_bytes,
-                        *ephemeral,
+                        *ephemeral || store.is_temporary_session(session_id)?,
                         unix_time(),
                     );
                 }
@@ -1725,6 +1833,20 @@ async fn execute_remote_command_inner(
                 }
                 _ => {}
             }
+            if matches!(
+                &operation,
+                farhelm_protocol::native::NativeOperation::Delete { .. }
+                    | farhelm_protocol::native::NativeOperation::Revert { .. }
+                    | farhelm_protocol::native::NativeOperation::Compact
+                    | farhelm_protocol::native::NativeOperation::TemporaryEnd
+                    | farhelm_protocol::native::NativeOperation::Review { .. }
+                    | farhelm_protocol::native::NativeOperation::GoalSet {
+                        status: None | Some(farhelm_protocol::native::GoalStatus::Active),
+                        ..
+                    }
+            ) {
+                store.begin_native_lifecycle(session_id, &command.command_id)?;
+            }
             let mut attachments = std::collections::HashMap::new();
             if let farhelm_protocol::native::NativeOperation::QueueAdd { input, .. }
             | farhelm_protocol::native::NativeOperation::QueueUpdate { input, .. } = &operation
@@ -1737,6 +1859,22 @@ async fn execute_remote_command_inner(
                         );
                     }
                 }
+            }
+            if matches!(
+                operation,
+                farhelm_protocol::native::NativeOperation::QueueAdd { .. }
+                    | farhelm_protocol::native::NativeOperation::QueueUpdate { .. }
+                    | farhelm_protocol::native::NativeOperation::QueueDelete { .. }
+                    | farhelm_protocol::native::NativeOperation::QueueReorder { .. }
+                    | farhelm_protocol::native::NativeOperation::QueueStart { .. }
+                    | farhelm_protocol::native::NativeOperation::Compact
+                    | farhelm_protocol::native::NativeOperation::Review { .. }
+                    | farhelm_protocol::native::NativeOperation::GoalSet { .. }
+                    | farhelm_protocol::native::NativeOperation::GoalClear
+                    | farhelm_protocol::native::NativeOperation::ThreadSettings { .. }
+                    | farhelm_protocol::native::NativeOperation::TurnSettings { .. }
+            ) {
+                worker_runtime.codex.call("codex.session.resume", serde_json::json!({"session_id":session_id,"cwd":binding.cwd,"mode":binding.mode})).await?;
             }
             let delete_targets =
                 if let farhelm_protocol::native::NativeOperation::Delete { impact_fingerprint } =
@@ -1754,11 +1892,17 @@ async fn execute_remote_command_inner(
                 } else {
                     Vec::new()
                 };
+            if matches!(
+                operation,
+                farhelm_protocol::native::NativeOperation::QueueAdd { .. }
+            ) {
+                store.begin_native_queue(&command.command_id)?;
+            }
             let value = worker_runtime
                 .codex
-                .native_operation(session_id, &operation, &attachments)
+                .native_operation(session_id, &operation, &attachments, &binding.mode)
                 .await?;
-            if let farhelm_protocol::native::NativeOperation::Fork { ephemeral, .. } = operation {
+            if let farhelm_protocol::native::NativeOperation::Fork { ephemeral, .. } = &operation {
                 let fork = value.get("thread").unwrap_or(&value);
                 let fork_id = fork["id"]
                     .as_str()
@@ -1768,10 +1912,18 @@ async fn execute_remote_command_inner(
                     .map(PathBuf::from)
                     .unwrap_or(binding.cwd.clone());
                 store.bind_session(fork_id, project_id, &cwd, &binding.mode, unix_time())?;
-                if ephemeral {
+                if *ephemeral {
                     store.mark_temporary_session(fork_id, unix_time())?;
                 }
                 store.enqueue_event(&format!("{}:fork",command.command_id),"codex.session.updated",&serde_json::json!({"session_id":fork_id,"project_id":project_id,"mode":binding.mode,"state":"idle","title":fork.get("name"),"active_turn_id":null,"updated_at_unix":unix_time()}),unix_time())?;
+            }
+            if matches!(
+                operation,
+                farhelm_protocol::native::NativeOperation::TemporaryEnd
+            ) {
+                store.cleanup_ephemeral_attachments(session_id)?;
+                store.tombstone_session(session_id, &command.command_id, unix_time())?;
+                store.enqueue_event(&format!("{}:temporary-ended",command.command_id),"codex.session.deleted",&serde_json::json!({"session_id":session_id,"operation_id":command.command_id,"updated_at_unix":unix_time()}),unix_time())?;
             }
             for target in delete_targets {
                 store.cleanup_ephemeral_attachments(&target)?;
@@ -2404,6 +2556,7 @@ async fn read_request(
                 )?);
             }
         }
+        let native_queue = request.method == "codex.native.read" && params["kind"] == "queue";
         if let Some(value) = native_result {
             Ok(value)
         } else {
@@ -2420,7 +2573,19 @@ async fn read_request(
                             farhelm_protocol::CodexNativeIdentity,
                         >(value)?)?)
                     }
-                    "codex.native.read" => Ok(value),
+                    "codex.native.read" => {
+                        let mut value = value;
+                        if native_queue {
+                            let pending: Vec<_> = store
+                                .reconciling_native_queues()?
+                                .into_iter()
+                                .filter(|(_, session, _)| session == &session_id)
+                                .map(|(command, _, _)| command)
+                                .collect();
+                            value["data"]["reconciling"] = serde_json::json!(pending);
+                        }
+                        Ok(value)
+                    }
                     _ => Ok(serde_json::to_value(serde_json::from_value::<
                         farhelm_protocol::CodexTranscriptPage,
                     >(value)?)?),

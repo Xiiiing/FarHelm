@@ -1,6 +1,9 @@
 //! Local Codex is the transcript/authentication authority. No vendor body is a Hub record.
 mod archive;
 mod context;
+mod events;
+mod temporary;
+pub use events::DisplayEvent;
 mod handoff;
 pub mod history;
 mod models;
@@ -45,6 +48,9 @@ struct Index {
     changed: HashMap<String, u64>,
 }
 struct Inner {
+    display: tokio::sync::broadcast::Sender<DisplayEvent>,
+    live_activity: RwLock<HashMap<String, Value>>,
+    event_generation: std::sync::atomic::AtomicU64,
     bin: Option<PathBuf>,
     connection: Mutex<Option<Arc<Connection>>>,
     index: RwLock<Index>,
@@ -86,6 +92,9 @@ impl Codex {
     pub fn new(bin: Option<PathBuf>) -> Self {
         Self {
             inner: Arc::new(Inner {
+                display: tokio::sync::broadcast::channel(4096).0,
+                live_activity: RwLock::new(HashMap::new()),
+                event_generation: std::sync::atomic::AtomicU64::new(0),
                 bin,
                 connection: Mutex::new(None),
                 index: RwLock::new(Index::default()),
@@ -106,6 +115,9 @@ impl Codex {
                 .0,
             }),
         }
+    }
+    pub fn subscribe_display(&self) -> tokio::sync::broadcast::Receiver<DisplayEvent> {
+        self.inner.display.subscribe()
     }
     pub fn status(&self) -> CodexStatus {
         self.inner.status.borrow().clone()
@@ -162,10 +174,24 @@ impl Codex {
         {
             return Ok(connection.clone());
         }
+        let generation = self.inner.event_generation.fetch_add(1, Ordering::AcqRel) + 1;
         if let Some(old) = current.take() {
             old.shutdown().await;
         }
-        self.inner.loaded.write().await.clear();
+        {
+            let mut loaded = self.inner.loaded.write().await;
+            for (session, thread) in loaded.iter() {
+                if thread.thread["ephemeral"] == true {
+                    let _ = self.inner.display.send(DisplayEvent {
+                        kind: "codex.temporary.closed",
+                        session: session.clone(),
+                        data: json!({}),
+                    });
+                }
+            }
+            loaded.clear();
+        }
+        self.inner.live_activity.write().await.clear();
         self.inner.skills.write().await.clear();
         self.inner.image_resources.write().await.clear();
         let result: Result<(Arc<Connection>, String)> = async {
@@ -188,26 +214,64 @@ impl Codex {
                 let weak = Arc::downgrade(&self.inner);
                 let mut events = connection.events.subscribe();
                 tokio::spawn(async move {
+                    let mut projector = events::Projector::default();
                     loop {
                         let event = match events.recv().await {
                             Ok(e) => e,
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                                 if let Some(inner) = weak.upgrade() {
-                                    inner.index.write().await.refreshed = None;
+                                    let mut index = inner.index.write().await;
+                                    index.refreshed = None;
+                                    for session in index.rows.keys() {
+                                        let _ = inner.display.send(DisplayEvent {
+                                            kind: "codex.native.changed",
+                                            session: session.clone(),
+                                            data: json!({}),
+                                        });
+                                    }
                                 }
                                 continue;
                             }
                             Err(_) => break,
                         };
                         let Some(inner) = weak.upgrade() else { break };
+                        if inner.event_generation.load(Ordering::Acquire) != generation {
+                            break;
+                        }
                         if event["method"] == "farhelm/disconnected" {
+                            for (session, loaded) in inner.loaded.read().await.iter() {
+                                if loaded.thread["ephemeral"] == true {
+                                    let _ = inner.display.send(DisplayEvent {
+                                        kind: "codex.temporary.closed",
+                                        session: session.clone(),
+                                        data: json!({}),
+                                    });
+                                }
+                            }
+                            inner.live_activity.write().await.clear();
                             let mut status = inner.status.borrow().clone();
                             status.state = "unavailable".into();
                             status.reason = Some("codex_connection_closed".into());
                             inner.status.send_replace(status);
                             break;
                         }
+                        events::observe_activity(&inner, &event).await;
+                        temporary::observe(&inner, &event).await;
+                        projector.accept(&event, &inner.display);
                         let params = &event["params"];
+                        if matches!(
+                            event["method"].as_str(),
+                            Some(
+                                "turn/started"
+                                    | "item/started"
+                                    | "item/agentMessage/delta"
+                                    | "turn/completed"
+                            )
+                        ) && let Some(id) = params["threadId"].as_str()
+                            && let Some(loaded) = inner.loaded.write().await.get_mut(id)
+                        {
+                            loaded.has_turns = true;
+                        }
                         if event["method"] == "thread/settings/updated"
                             && let Some(id) = params["threadId"].as_str()
                             && let Some(loaded) = inner.loaded.write().await.get_mut(id)
@@ -521,6 +585,9 @@ impl Codex {
                 let (upstream, resume) =
                     history::decode_cursor(&session, params["cursor"].as_str())?;
                 let connection = self.connection().await?;
+                if let Some(page) = self.temporary_history(&session, &resume).await? {
+                    return Ok(page);
+                }
                 if let Some(loaded) = self.inner.loaded.read().await.get(&session)
                     && !loaded.has_turns
                 {
@@ -657,7 +724,7 @@ impl Codex {
                 }
                 let mut request = json!({"cwd":params["cwd"]});
                 if method == "codex.session.start" {
-                    request["ephemeral"] = json!(false);
+                    request["ephemeral"] = json!(params["ephemeral"] == true);
                 }
                 // Resuming belongs to Codex: explicit overrides here would erase the user's
                 // persisted permission profile and approval policy. Legacy explicit creation
@@ -757,10 +824,75 @@ impl Codex {
         session: &str,
         operation: &farhelm_protocol::native::NativeOperation,
         attachments: &HashMap<String, PathBuf>,
+        mode: &str,
     ) -> Result<Value> {
         use farhelm_protocol::native::{GoalStatus, NativeOperation, ReviewTarget};
         ensure!(operation.is_valid(), "invalid_native_operation");
+        let _activity = self.activity().await;
+        let _lifecycle = self.inner.lifecycle.lock().await;
         let connection = self.connection().await?;
+        if matches!(
+            operation,
+            NativeOperation::Revert { .. }
+                | NativeOperation::Compact
+                | NativeOperation::Review { .. }
+                | NativeOperation::GoalSet {
+                    status: None | Some(GoalStatus::Active),
+                    ..
+                }
+        ) {
+            ensure!(
+                connection.pending_server_requests(session).is_empty(),
+                "codex_archive_busy"
+            );
+            let goal = connection
+                .request("thread/goal/get", json!({"threadId":session}))
+                .await?;
+            ensure!(goal["goal"]["status"] != "active", "codex_archive_busy");
+            let terminals = connection
+                .request(
+                    "thread/backgroundTerminals/list",
+                    json!({"threadId":session,"limit":1}),
+                )
+                .await?;
+            ensure!(
+                terminals["data"].as_array().is_some_and(Vec::is_empty)
+                    && terminals["nextCursor"].is_null(),
+                "codex_archive_busy"
+            );
+            let live = connection
+                .request(
+                    "thread/read",
+                    json!({"threadId":session,"includeTurns":false}),
+                )
+                .await?;
+            ensure!(
+                matches!(
+                    live["thread"]["status"]["type"].as_str(),
+                    Some("idle" | "notLoaded")
+                ),
+                "codex_archive_busy"
+            );
+            let queue = connection
+                .request("thread/queue/list", json!({"threadId":session}))
+                .await?;
+            ensure!(
+                queue["data"].as_array().is_some_and(Vec::is_empty),
+                "codex_archive_busy"
+            );
+            if matches!(
+                operation,
+                NativeOperation::Revert { .. } | NativeOperation::GoalSet { .. }
+            ) {
+                ensure!(
+                    live["thread"]["ephemeral"] == false
+                        && live["thread"]["path"]
+                            .as_str()
+                            .is_some_and(|p| std::path::Path::new(p).is_file()),
+                    "codex_archive_unsaved"
+                );
+            }
+        }
         let revision_check = |value: &Value, expected: &str| -> Result<()> {
             ensure!(
                 native_revision(value) == expected,
@@ -771,7 +903,11 @@ impl Codex {
         match operation {
             NativeOperation::QueueAdd { input, client_message_id } => {
                 let input = self.native_inputs(session, input, attachments).await?;
-                connection.request("thread/queue/add", json!({"threadId":session,"input":input,"clientUserMessageId":client_message_id})).await
+                match connection.request("thread/queue/add", json!({"threadId":session,"input":input,"clientUserMessageId":client_message_id})).await {
+                    Ok(_) => Ok(json!({"status":"accepted","client_message_id":client_message_id})),
+                    Err(error) if error.to_string().contains("codex_request_rejected") || error.to_string().contains("codex_ephemeral_queue_unsupported") => Err(error),
+                    Err(_) => bail!("native_queue_reconciling"),
+                }
             }
             NativeOperation::QueueUpdate { submission_id, input, revision } => {
                 let queue = connection.request("thread/queue/list", json!({"threadId":session})).await?;
@@ -797,9 +933,26 @@ impl Codex {
             NativeOperation::SectionRename { section_id, name } => connection.request("threadSection/update", json!({"sectionId":section_id,"name":name})).await,
             NativeOperation::SectionDelete { section_id } => connection.request("threadSection/delete", json!({"sectionId":section_id})).await,
             NativeOperation::SectionMove { section_id, before_thread_id } => connection.request("thread/section/move", json!({"threadId":session,"sectionId":section_id,"beforeThreadId":before_thread_id})).await,
-            NativeOperation::Fork { last_turn_id, ephemeral } => connection.request("thread/fork", json!({"threadId":session,"lastTurnId":last_turn_id,"ephemeral":ephemeral,"excludeTurns":true})).await,
+            NativeOperation::Fork { last_turn_id, ephemeral } => {
+                if *ephemeral { self.check_temporary_capacity().await?; }
+                let result = connection.request("thread/fork", json!({"threadId":session,"lastTurnId":last_turn_id,"ephemeral":ephemeral,"excludeTurns":true})).await?;
+                if *ephemeral { self.register_temporary(&result["thread"], mode).await?; }
+                Ok(result)
+            },
             NativeOperation::Revert { before_turn_id } => connection.request("thread/revert", json!({"threadId":session,"beforeTurnId":before_turn_id})).await,
             NativeOperation::Delete { .. } => connection.request("thread/delete", json!({"threadId":session})).await,
+            NativeOperation::TemporaryStart => bail!("temporary_start_misrouted"),
+            NativeOperation::TemporaryEnd => {
+                self.end_temporary(&connection, session).await
+            }
+            NativeOperation::Pin { pinned } => {
+                let current = connection.request("thread/read", json!({"threadId":session,"includeTurns":false})).await?;
+                ensure!(current["thread"]["isPinned"].is_boolean(), "codex_pin_upgrade_required");
+                let result = connection.request("thread/metadata/update", json!({"threadId":session,"isPinned":pinned})).await?;
+                ensure!(result["thread"]["isPinned"] == *pinned, "codex_pin_unverified");
+                self.inner.index.write().await.refreshed = None;
+                Ok(json!({"session_id":session,"is_pinned":pinned}))
+            }
             NativeOperation::Compact => connection.request("thread/compact/start", json!({"threadId":session})).await,
             NativeOperation::GoalSet { objective, status, token_budget } => {
                 let status = status.map(|s| match s { GoalStatus::Active=>"active",GoalStatus::Paused=>"paused",GoalStatus::Blocked=>"blocked",GoalStatus::UsageLimited=>"usageLimited",GoalStatus::BudgetLimited=>"budgetLimited",GoalStatus::Complete=>"complete" });
@@ -812,9 +965,50 @@ impl Codex {
                 let target = match target { ReviewTarget::UncommittedChanges=>json!({"type":"uncommittedChanges"}),ReviewTarget::BaseBranch{branch}=>json!({"type":"baseBranch","branch":branch}),ReviewTarget::Commit{sha}=>json!({"type":"commit","sha":sha}) };
                 connection.request("review/start", json!({"threadId":session,"target":target})).await
             }
-            NativeOperation::InteractionAnswer { request_token, answer } => connection.answer_server_request(request_token, answer.clone()).await,
+            NativeOperation::InteractionAnswer { request_token, answer } => connection.answer_server_request(session, request_token, answer.clone()).await,
             NativeOperation::AttachmentBegin { .. } | NativeOperation::AttachmentChunk { .. } | NativeOperation::AttachmentFinish { .. } => bail!("attachment_operation_misrouted"),
         }
+    }
+
+    pub async fn reconcile_native_queue(&self, session: &str, message: &str) -> Result<bool> {
+        let c = self.connection().await?;
+        let queue = c
+            .request("thread/queue/list", json!({"threadId":session}))
+            .await?;
+        let matches = queue["data"]
+            .as_array()
+            .context("native_queue_unverified")?
+            .iter()
+            .filter(|item| item["clientUserMessageId"] == message)
+            .count();
+        if matches > 0 {
+            return Ok(matches == 1);
+        }
+        let mut cursor = Value::Null;
+        for _ in 0..5 {
+            let page = c
+                .request(
+                    "thread/turns/list",
+                    json!({"threadId":session,"cursor":cursor,"limit":100,"itemsView":"full"}),
+                )
+                .await?;
+            let turns = page["data"]
+                .as_array()
+                .context("native_history_unverified")?;
+            if turns
+                .iter()
+                .filter_map(|turn| turn["items"].as_array())
+                .flatten()
+                .any(|item| item["type"] == "userMessage" && item["clientId"] == message)
+            {
+                return Ok(true);
+            }
+            cursor = page["nextCursor"].clone();
+            if cursor.is_null() {
+                break;
+            }
+        }
+        Ok(false)
     }
 
     async fn native_read(&self, params: &Value) -> Result<Value> {
@@ -826,6 +1020,11 @@ impl Codex {
             .as_str()
             .context("native_read_kind_missing")?
         {
+            "activity" => {
+                return Ok(
+                    json!({"data":self.inner.live_activity.read().await.get(session).cloned().unwrap_or_else(|| json!({}))}),
+                );
+            }
             "queue" => {
                 connection
                     .request("thread/queue/list", json!({"threadId":session}))
@@ -866,7 +1065,7 @@ impl Codex {
                     .await?
             }
             "pending_interactions" => {
-                return Ok(json!({"data":connection.pending_server_requests()}));
+                return Ok(json!({"data":connection.pending_server_requests(session)}));
             }
             "image_resource" => return self.native_image_resource(session, params).await,
             _ => bail!("invalid_native_read_kind"),
@@ -1116,7 +1315,6 @@ impl Codex {
             json!({"session_id":session,"turn_id":turn}),
         )
         .await?;
-        let mut buffers = HashMap::<String, history::StreamText>::new();
         loop {
             let event = events.recv().await.map_err(|_| {
                 anyhow::Error::new(crate::CodexTurnOrphaned("codex_event_stream_lost".into()))
@@ -1133,24 +1331,7 @@ impl Codex {
             {
                 continue;
             }
-            if event["method"] == "item/agentMessage/delta" {
-                if let (Some(item), Some(delta)) = (data["itemId"].as_str(), data["delta"].as_str())
-                {
-                    let (offset, text) = buffers
-                        .entry(item.to_owned())
-                        .or_default()
-                        .feed(delta, false);
-                    if !text.is_empty() {
-                        emit("codex.message.delta",json!({"session_id":session,"turn_id":turn,"item_id":item,"text_offset":offset,"delta":text})).await?;
-                    }
-                }
-            } else if event["method"] == "turn/completed" {
-                for (item, buffer) in &mut buffers {
-                    let (offset, text) = buffer.feed("", true);
-                    if !text.is_empty() {
-                        emit("codex.message.delta",json!({"session_id":session,"turn_id":turn,"item_id":item,"text_offset":offset,"delta":text})).await?;
-                    }
-                }
+            if event["method"] == "turn/completed" {
                 let status = data["turn"]["status"].as_str().unwrap_or("unknown");
                 emit(
                     if status == "completed" {
@@ -1231,7 +1412,7 @@ fn display_page(rows: &[Value], params: &Value) -> Value {
         let updated=row["updatedAt"].as_u64().unwrap_or(0);
         if let Some(at)=after["updated_at_unix"].as_u64() && (std::cmp::Reverse(updated),agent,id)<=(std::cmp::Reverse(at),after["agent_id"].as_str().unwrap_or_default(),after["session_id"].as_str().unwrap_or_default()) {return None;}
         let label=title.unwrap_or_else(||history::redact_paths(preview).split_whitespace().collect::<Vec<_>>().join(" ").chars().take(80).collect());
-        Some(json!({"session_id":id,"project_id":binding["project_id"],"display_label":if label.is_empty() {Value::Null} else {json!(label)},"section_id":row["section"]["id"],"section_name":row["section"]["name"],"updated_at_unix":updated}))
+        Some(json!({"session_id":id,"project_id":binding["project_id"],"display_label":if label.is_empty() {Value::Null} else {json!(label)},"is_pinned":row["isPinned"],"section_id":row["section"]["id"],"section_name":row["section"]["name"],"updated_at_unix":updated}))
     }).collect::<Vec<_>>();
     matches.sort_by(|a, b| {
         b["updated_at_unix"]

@@ -2,6 +2,14 @@
 use super::*;
 
 pub(super) fn writable(c: &Connection, session: &str) -> Result<()> {
+    ensure!(
+        !c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_tombstones WHERE session_id=?1)",
+            [session],
+            |r| r.get::<_, bool>(0)
+        )?,
+        "session_deleted"
+    );
     let state: Option<(bool, Option<String>)> = c
         .query_row(
             "SELECT archived,operation_id FROM session_lifecycle WHERE session_id=?1",
@@ -35,6 +43,14 @@ pub(crate) struct ArchiveTarget {
 }
 
 impl ExperimentStore {
+    pub fn is_temporary_session(&self, session: &str) -> Result<bool> {
+        Ok(self.lock()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM temporary_sessions WHERE session_id=?1)",
+            [session],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn mark_temporary_session(&self, session: &str, now: u64) -> Result<()> {
         self.lock()?.execute(
             "INSERT OR REPLACE INTO temporary_sessions VALUES(?1,?2)",
@@ -94,6 +110,28 @@ impl ExperimentStore {
             [session],
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    pub fn begin_native_lifecycle(&self, id: &str, command: &str) -> Result<()> {
+        let c = self.lock()?;
+        let tx = crate::migrations::write_transaction(&c)?;
+        writable(&tx, id)?;
+        idle(&tx, id, command)?;
+        tx.execute("INSERT INTO session_lifecycle(session_id,archived,operation_id) VALUES(?1,0,?2) ON CONFLICT(session_id) DO UPDATE SET operation_id=excluded.operation_id", params![id,command])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn pending_native_lifecycles(&self) -> Result<Vec<(String, String)>> {
+        let c = self.lock()?;
+        let mut s = c.prepare("SELECT l.session_id,l.operation_id FROM session_lifecycle l JOIN remote_codex_commands r ON r.command_id=l.operation_id WHERE r.action='codex.native.operation' AND r.state IN ('failed','completed') AND r.command_id NOT IN (SELECT command_id FROM archive_operations) LIMIT 64")?;
+        Ok(s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn release_native_lifecycle(&self, id: &str, command: &str) -> Result<()> {
+        self.lock()?.execute("UPDATE session_lifecycle SET operation_id=NULL WHERE session_id=?1 AND operation_id=?2", params![id,command])?;
         Ok(())
     }
 

@@ -172,8 +172,6 @@ impl ExperimentStore {
             connection: Arc::new(Mutex::new(connection)),
             path: path.to_owned(),
         };
-        store.cleanup_stale_ephemeral_attachments()?;
-        store.cleanup_stale_temporary_sessions(crate::unix_time())?;
         Ok(store)
     }
 
@@ -739,12 +737,23 @@ impl ExperimentStore {
             matches!(mode, "inspect" | "edit"),
             "session mode is invalid"
         );
-        self.lock()?.execute(
+        let c = self.lock()?;
+        let tx = crate::migrations::write_transaction(&c)?;
+        ensure!(
+            !tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_tombstones WHERE session_id=?1)",
+                [session_id],
+                |r| r.get::<_, bool>(0)
+            )?,
+            "session_deleted"
+        );
+        tx.execute(
             "INSERT INTO codex_session_bindings (session_id,project_id,cwd,mode,updated_at_unix)
              VALUES (?1,?2,?3,?4,?5)
              ON CONFLICT(session_id) DO UPDATE SET project_id=excluded.project_id,cwd=excluded.cwd,mode=excluded.mode,updated_at_unix=excluded.updated_at_unix",
             params![session_id,project_id,cwd.to_string_lossy(),mode,as_i64(now)?],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -759,6 +768,13 @@ impl ExperimentStore {
     ) -> Result<()> {
         let connection = self.lock()?;
         let transaction = crate::migrations::write_transaction(&connection)?;
+        if transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_tombstones WHERE session_id=?1)",
+            [session_id],
+            |r| r.get::<_, bool>(0),
+        )? {
+            return Ok(());
+        }
         if transaction.query_row("SELECT EXISTS(SELECT 1 FROM session_lifecycle WHERE session_id=?1 AND operation_id IS NOT NULL)",[session_id],|r|r.get::<_,bool>(0))? {return Ok(());}
         transaction.execute("INSERT INTO session_lifecycle(session_id,archived) VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET archived=excluded.archived",params![session_id,archived])?;
         transaction.execute(
@@ -931,6 +947,26 @@ impl ExperimentStore {
         Ok(())
     }
 
+    pub fn begin_native_queue(&self, command: &str) -> Result<()> {
+        let c = self.lock()?;
+        let tx = crate::migrations::write_transaction(&c)?;
+        let pending: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM remote_codex_commands other JOIN remote_codex_commands current ON current.command_id=?1 WHERE other.command_id!=?1 AND other.state='running' AND json_extract(other.data_json,'$.status')='reconciling' AND json_extract(other.payload_json,'$.session_id')=json_extract(current.payload_json,'$.session_id'))", [command], |r| r.get(0))?;
+        ensure!(!pending, "native_queue_pending_conflict");
+        let legacy: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM execution_queue q JOIN remote_codex_commands r ON r.command_id=?1 WHERE q.session_id=json_extract(r.payload_json,'$.session_id') AND q.state IN ('queued','running'))", [command], |r| r.get(0))?;
+        ensure!(!legacy, "native_queue_legacy_pending");
+        ensure!(tx.execute(r#"UPDATE remote_codex_commands SET data_json='{"status":"reconciling"}' WHERE command_id=?1 AND state='running'"#, [command])? == 1, "native_queue_not_running");
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn reconciling_native_queues(&self) -> Result<Vec<(String, String, String)>> {
+        let c = self.lock()?;
+        let mut statement = c.prepare("SELECT command_id,json_extract(payload_json,'$.session_id'),json_extract(payload_json,'$.native_operation.client_message_id') FROM remote_codex_commands WHERE state='running' AND json_extract(data_json,'$.status')='reconciling' LIMIT 8")?;
+        Ok(statement
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn pending_remote_commands(&self) -> Result<Vec<RemoteCommand>> {
         self.remote_candidates(false, 0)
     }
@@ -1070,6 +1106,10 @@ impl ExperimentStore {
                 now,
             )?;
         }
+        tx.execute(
+            "UPDATE session_lifecycle SET operation_id=NULL WHERE operation_id=?1",
+            [command_id],
+        )?;
         execution::finish(&tx, command_id)?;
         tx.commit()?;
         Ok(())
@@ -1145,7 +1185,7 @@ impl ExperimentStore {
         let connection = self.lock()?;
         let transaction = crate::migrations::write_transaction(&connection)?;
         let mut statement = transaction.prepare(
-            "SELECT command_id,payload_json,action FROM remote_codex_commands WHERE state='running' AND command_id NOT IN (SELECT command_id FROM archive_operations)",
+            "SELECT command_id,payload_json,action FROM remote_codex_commands WHERE state='running' AND COALESCE(json_extract(data_json,'$.status'),'')!='reconciling' AND command_id NOT IN (SELECT command_id FROM archive_operations)",
         )?;
         let rows = statement
             .query_map([], |row| {
@@ -1779,6 +1819,140 @@ mod tests {
         assert_eq!(receipt.state, farhelm_protocol::CommandState::Completed);
         assert_eq!(receipt.data.unwrap()["turn_id"], "t");
         assert!(!reopened.claim_remote_command("cmd_terminal", 200).unwrap());
+    }
+
+    #[test]
+    fn native_lifecycle_gate_blocks_new_input_until_receipt_commits() {
+        let store = ExperimentStore::open(Path::new(":memory:")).unwrap();
+        let lifecycle = AgentCommand {
+            protocol: FARHELM_PROTOCOL.into(),
+            command_id: "compact".into(),
+            agent_id: "a".into(),
+            action: CommandAction::CodexNativeOperation,
+            created_at_unix: 10,
+            expires_at_unix: 100,
+            payload: Some(
+                json!({"project_id":"p","session_id":"s","native_operation":{"operation":"compact"}}),
+            ),
+        };
+        store.receive_remote_command(&lifecycle, 10).unwrap();
+        store.mark_remote_accepted_reported("compact", 11).unwrap();
+        assert!(store.claim_remote_command("compact", 12).unwrap());
+        store.begin_native_lifecycle("s", "compact").unwrap();
+        let input = AgentCommand {
+            command_id: "input".into(),
+            action: CommandAction::CodexTurnStart,
+            payload: Some(json!({"project_id":"p","session_id":"s","prompt":"test"})),
+            ..lifecycle.clone()
+        };
+        store.receive_remote_command(&input, 13).unwrap();
+        assert_eq!(
+            store.remote_receipt("input").unwrap().state,
+            farhelm_protocol::CommandState::Failed
+        );
+        assert!(store.check_session_writable("s").is_err());
+        store
+            .finish_remote_command(
+                "compact",
+                farhelm_protocol::CommandState::Completed,
+                Some(&json!({})),
+                None,
+                14,
+            )
+            .unwrap();
+        store.check_session_writable("s").unwrap();
+    }
+
+    #[test]
+    fn reopening_database_does_not_end_live_temporary_tasks() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("temporary.db");
+        let store = ExperimentStore::open(&path).unwrap();
+        store
+            .bind_session("temporary", "p", directory.path(), "inspect", 10)
+            .unwrap();
+        store.mark_temporary_session("temporary", 10).unwrap();
+        drop(store);
+        let reopened = ExperimentStore::open(&path).unwrap();
+        assert!(reopened.session_binding("temporary").unwrap().is_some());
+        assert!(reopened.is_temporary_session("temporary").unwrap());
+        reopened.cleanup_stale_temporary_sessions(20).unwrap();
+        assert!(reopened.session_binding("temporary").unwrap().is_none());
+        assert!(
+            reopened
+                .bind_session("temporary", "p", directory.path(), "inspect", 21)
+                .is_err()
+        );
+        reopened
+            .discover_session("temporary", "p", directory.path(), &Value::Null, false, 22)
+            .unwrap();
+        assert!(reopened.session_binding("temporary").unwrap().is_none());
+    }
+
+    #[test]
+    fn uncertain_native_queue_survives_restart_without_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("queue.db");
+        let store = ExperimentStore::open(&path).unwrap();
+        let command = AgentCommand {
+            protocol: FARHELM_PROTOCOL.into(),
+            command_id: "queue-command".into(),
+            agent_id: "a".into(),
+            action: CommandAction::CodexNativeOperation,
+            created_at_unix: 10,
+            expires_at_unix: 100,
+            payload: Some(
+                json!({"session_id":"s","project_id":"p","native_operation":{"operation":"queue_add","client_message_id":"message","input":[{"type":"text","text":"test"}]}}),
+            ),
+        };
+        store.receive_remote_command(&command, 10).unwrap();
+        store
+            .mark_remote_accepted_reported("queue-command", 11)
+            .unwrap();
+        assert!(store.claim_remote_command("queue-command", 12).unwrap());
+        store.begin_native_queue("queue-command").unwrap();
+        let mut competing = command.clone();
+        competing.command_id = "competing-queue".into();
+        store.receive_remote_command(&competing, 12).unwrap();
+        store
+            .mark_remote_accepted_reported("competing-queue", 12)
+            .unwrap();
+        assert!(store.claim_remote_command("competing-queue", 12).unwrap());
+        assert!(
+            store
+                .begin_native_queue("competing-queue")
+                .unwrap_err()
+                .to_string()
+                .contains("native_queue_pending_conflict")
+        );
+        store
+            .finish_remote_command(
+                "competing-queue",
+                farhelm_protocol::CommandState::Failed,
+                None,
+                Some("native_queue_pending_conflict"),
+                12,
+            )
+            .unwrap();
+        drop(store);
+        let store = ExperimentStore::open(&path).unwrap();
+        assert_eq!(store.orphan_running_remote_commands(15).unwrap(), 0);
+        assert_eq!(
+            store.reconciling_native_queues().unwrap(),
+            vec![("queue-command".into(), "s".into(), "message".into())]
+        );
+        store.receive_remote_command(&command, 16).unwrap();
+        assert!(!store.claim_remote_command("queue-command", 17).unwrap());
+        store
+            .finish_remote_command(
+                "queue-command",
+                farhelm_protocol::CommandState::Completed,
+                Some(&json!({"status":"accepted","client_message_id":"message"})),
+                None,
+                18,
+            )
+            .unwrap();
+        assert!(store.reconciling_native_queues().unwrap().is_empty());
     }
 
     #[test]

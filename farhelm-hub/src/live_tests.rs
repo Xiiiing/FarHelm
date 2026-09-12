@@ -264,6 +264,29 @@ async fn live_commands_reads_receipts_replacement_and_transient_privacy() {
             .unwrap(),
         0
     );
+    send(&mut socket, AgentFrame::Delta { event: AgentEvent { protocol: FARHELM_PROTOCOL.into(), event_id: "native-change".into(), agent_id: "gpu-a".into(), sequence: 0, event_type: "codex.native.changed".into(), created_at_unix: unix_time(), payload: json!({"session_id":"ses-live","data":{"command":"PRIVATE_NATIVE_COMMAND"}}) } }).await;
+    let changed = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(changed.event_type, "codex.native.changed");
+    assert_eq!(changed.payload["session_id"], "ses-live");
+    assert!(
+        !changed
+            .payload
+            .to_string()
+            .contains("PRIVATE_NATIVE_COMMAND")
+    );
+    assert_eq!(
+        inspect
+            .query_row(
+                "SELECT count(*) FROM agent_events WHERE event_id='native-change'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
     let generation = state
         .live
         .read()

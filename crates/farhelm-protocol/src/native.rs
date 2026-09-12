@@ -51,6 +51,11 @@ pub enum NativeOperation {
         impact_fingerprint: String,
     },
     Compact,
+    TemporaryStart,
+    TemporaryEnd,
+    Pin {
+        pinned: bool,
+    },
     GoalSet {
         objective: Option<String>,
         status: Option<GoalStatus>,
@@ -143,7 +148,11 @@ impl NativeOperation {
                 before_turn_id: last_turn_id,
             } => valid_id(last_turn_id),
             Self::Delete { impact_fingerprint } => valid_revision(impact_fingerprint),
-            Self::Compact | Self::GoalClear => true,
+            Self::Compact
+            | Self::GoalClear
+            | Self::Pin { .. }
+            | Self::TemporaryStart
+            | Self::TemporaryEnd => true,
             Self::GoalSet {
                 objective,
                 token_budget,
@@ -310,6 +319,7 @@ pub struct NativeOperationRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NativeReadKind {
+    Activity,
     Queue,
     Sections,
     Goal,

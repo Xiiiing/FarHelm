@@ -9,7 +9,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -24,6 +24,13 @@ type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Reply>>>>;
 struct PendingServerRequest {
     wire_id: Value,
     request: Value,
+    generation: String,
+    thread_id: String,
+    turn_id: String,
+    item_id: String,
+    approval_id: Value,
+    expires: Instant,
+    expires_at_unix: u64,
 }
 type ServerRequests = Arc<Mutex<HashMap<String, PendingServerRequest>>>;
 
@@ -34,6 +41,7 @@ pub struct Connection {
     pub alive: Arc<AtomicBool>,
     pub events: broadcast::Sender<Value>,
     server_requests: ServerRequests,
+    generation: String,
     child: AsyncMutex<Child>,
     reader: tokio::task::AbortHandle,
 }
@@ -57,6 +65,8 @@ impl Connection {
         let alive = Arc::new(AtomicBool::new(true));
         let (events, _) = broadcast::channel(4096);
         let server_requests: ServerRequests = Arc::default();
+        let generation = format!("{:032x}", rand::random::<u128>());
+        let reader_generation = generation.clone();
         let (input, replies, healthy, notices, requests) = (
             stdin.clone(),
             pending.clone(),
@@ -89,9 +99,20 @@ impl Connection {
                                 | "item/permissions/requestApproval"
                                 | "item/tool/requestUserInput"
                         ) {
+                            if requests.lock().is_ok_and(|pending| {
+                                pending
+                                    .values()
+                                    .any(|request| request.wire_id == value["id"])
+                            }) {
+                                continue;
+                            }
                             let token = format!("req_{:032x}", rand::random::<u128>());
                             let inserted = requests.lock().ok().is_some_and(|mut pending| {
-                                if pending.len() >= 64 {
+                                if pending.len() >= 64
+                                    || ["threadId", "turnId", "itemId"].iter().any(|key| {
+                                        value["params"][key].as_str().is_none_or(str::is_empty)
+                                    })
+                                {
                                     return false;
                                 }
                                 pending.insert(
@@ -99,11 +120,47 @@ impl Connection {
                                     PendingServerRequest {
                                         wire_id: value["id"].clone(),
                                         request: value.clone(),
+                                        generation: reader_generation.clone(),
+                                        thread_id: value["params"]["threadId"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .into(),
+                                        turn_id: value["params"]["turnId"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .into(),
+                                        item_id: value["params"]["itemId"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .into(),
+                                        approval_id: value["params"]["approvalId"].clone(),
+                                        expires: Instant::now() + Duration::from_secs(900),
+                                        expires_at_unix: crate::unix_time() + 900,
                                     },
                                 );
                                 true
                             });
                             if inserted {
+                                let expiry_requests = Arc::downgrade(&requests);
+                                let expiry_input = Arc::downgrade(&input);
+                                let expiry_notices = notices.clone();
+                                let expiry_token = token.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(Duration::from_secs(900)).await;
+                                    let Some(requests) = expiry_requests.upgrade() else {
+                                        return;
+                                    };
+                                    let expired = requests
+                                        .lock()
+                                        .ok()
+                                        .and_then(|mut p| p.remove(&expiry_token));
+                                    if let Some(item) = expired {
+                                        let _ = expiry_notices.send(json!({"method":"farhelm/serverRequestResolved","params":{"threadId":item.thread_id,"requestToken":expiry_token,"state":"expired"}}));
+                                        if let Some(input) = expiry_input.upgrade() {
+                                            let _ = tokio::time::timeout(Duration::from_secs(5), write_json(&input, &json!({"id":item.wire_id,"error":{"code":-32000,"message":"FarHelm interaction expired"}}))).await;
+                                        }
+                                    }
+                                });
                                 let _ = notices.send(json!({"method":"farhelm/serverRequest","params":{"requestToken":token,"threadId":value["params"]["threadId"],"turnId":value["params"]["turnId"],"requestMethod":method}}));
                                 continue;
                             }
@@ -126,6 +183,14 @@ impl Connection {
                                 pending.retain(|_, item| &item.wire_id != request_id);
                             }
                         }
+                        if method == "turn/completed"
+                            && let Ok(mut pending) = requests.lock()
+                        {
+                            pending.retain(|_, item| {
+                                !(value["params"]["threadId"] == item.thread_id
+                                    && value["params"]["turn"]["id"] == item.turn_id)
+                            });
+                        }
                         let _ = notices.send(value);
                     }
                 } else if let Some(id) = value["id"].as_u64() {
@@ -141,6 +206,10 @@ impl Connection {
                                 .is_some_and(|s| s.contains("already has an active writer"))
                             {
                                 Err("codex_session_in_use".into())
+                            } else if value["error"]["message"].as_str().is_some_and(|s| {
+                                s.contains("ephemeral thread does not support queued submissions")
+                            }) {
+                                Err("codex_ephemeral_queue_unsupported".into())
                             } else {
                                 Err(format!("codex_request_rejected:{}", value["error"]["code"]))
                             }
@@ -171,6 +240,7 @@ impl Connection {
             alive,
             events,
             server_requests,
+            generation,
             child: AsyncMutex::new(child),
             reader: reader.abort_handle(),
         });
@@ -231,58 +301,95 @@ impl Connection {
 
     pub async fn shutdown(&self) {
         self.alive.store(false, Ordering::Release);
+        self.server_requests
+            .lock()
+            .expect("Codex request map poisoned")
+            .clear();
+        let _ = self.events.send(json!({"method":"farhelm/disconnected"}));
         let mut child = self.child.lock().await;
         let _ = child.start_kill();
         let _ = child.wait().await;
         self.reader.abort();
     }
 
-    pub fn pending_server_requests(&self) -> Vec<Value> {
+    pub fn pending_server_requests(&self, session: &str) -> Vec<Value> {
         let Ok(pending) = self.server_requests.lock() else {
             return Vec::new();
         };
         pending
             .iter()
+            .filter(|(_, item)| {
+                item.thread_id == session
+                    && item.expires > Instant::now()
+                    && item.generation == self.generation
+                    && self.alive.load(Ordering::Acquire)
+            })
             .map(|(token, item)| {
                 let mut value = item.request.clone();
                 if let Some(map) = value.as_object_mut() {
                     map.remove("id");
                     map.insert("requestToken".into(), json!(token));
+                    map.insert("generation".into(), json!(item.generation));
+                    map.insert("expiresAtUnix".into(), json!(item.expires_at_unix));
+                    map.insert("itemId".into(), json!(item.item_id));
+                    map.insert("approvalId".into(), item.approval_id.clone());
                 }
                 value
             })
             .collect()
     }
 
-    pub async fn answer_server_request(&self, token: &str, answer: Value) -> Result<Value> {
-        let pending = self
-            .server_requests
-            .lock()
-            .map_err(|_| anyhow::anyhow!("codex_server_request_poisoned"))?
-            .remove(token)
-            .context("codex_server_request_resolved")?;
-        if let Err(error) = validate_server_answer(&pending.request, &answer) {
-            self.server_requests
+    pub async fn answer_server_request(
+        &self,
+        session: &str,
+        token: &str,
+        answer: Value,
+    ) -> Result<Value> {
+        ensure!(
+            self.alive.load(Ordering::Acquire),
+            "codex_connection_closed"
+        );
+        let pending = {
+            let mut requests = self
+                .server_requests
                 .lock()
-                .map_err(|_| anyhow::anyhow!("codex_server_request_poisoned"))?
-                .insert(token.to_owned(), pending);
-            return Err(error);
-        }
-        if let Err(error) =
-            write_json(&self.stdin, &json!({"id":pending.wire_id,"result":answer})).await
-        {
-            self.server_requests
-                .lock()
-                .map_err(|_| anyhow::anyhow!("codex_server_request_poisoned"))?
-                .insert(token.to_owned(), pending);
-            return Err(error);
-        }
+                .map_err(|_| anyhow::anyhow!("codex_server_request_poisoned"))?;
+            let pending = requests
+                .get(token)
+                .context("codex_server_request_resolved")?;
+            ensure!(
+                pending.thread_id == session && pending.generation == self.generation,
+                "codex_server_request_scope_mismatch"
+            );
+            ensure!(
+                pending.expires > Instant::now(),
+                "codex_server_request_expired"
+            );
+            validate_server_answer(&pending.request, &answer)?;
+            requests.remove(token).expect("validated request exists")
+        };
+        // A partial write is ambiguous. Never reinsert a consumed approval token.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            write_json(&self.stdin, &json!({"id":pending.wire_id,"result":answer})),
+        )
+        .await;
+        let answered = matches!(result, Ok(Ok(())));
+        let _ = self.events.send(json!({"method":"farhelm/serverRequestResolved","params":{"threadId":session,"turnId":pending.turn_id,"requestToken":token,"state":if answered {"answered"} else {"unknown"}}}));
+        ensure!(answered, "codex_server_answer_unknown");
         Ok(json!({"request_token":token,"state":"answered"}))
     }
 
     /// Only called after the owner verifies that every loaded thread is idle.
     /// Closing stdin lets Codex flush and release its writers without a forced kill.
     pub async fn close_idle(&self) -> Result<()> {
+        ensure!(
+            self.server_requests
+                .lock()
+                .expect("Codex request map poisoned")
+                .is_empty(),
+            "codex_handoff_pending_interaction"
+        );
         self.stdin.lock().await.take();
         tokio::time::timeout(Duration::from_secs(5), self.child.lock().await.wait())
             .await
@@ -337,7 +444,24 @@ fn validate_server_answer(request: &Value, answer: &Value) -> Result<()> {
             }
         }
         "item/tool/requestUserInput" => {
-            ensure!(answer["answers"].is_object(), "invalid_user_input_answer")
+            let answers = answer["answers"]
+                .as_object()
+                .context("invalid_user_input_answer")?;
+            let questions = request["params"]["questions"]
+                .as_array()
+                .context("invalid_user_input_request")?;
+            ensure!(
+                answers
+                    .keys()
+                    .all(|id| questions.iter().any(|q| q["id"] == *id)),
+                "unknown_user_input_question"
+            );
+            ensure!(
+                answers.values().all(|value| value["answers"]
+                    .as_array()
+                    .is_some_and(|values| values.iter().all(Value::is_string))),
+                "invalid_user_input_answer"
+            );
         }
         _ => bail!("unsupported_server_request"),
     }
@@ -536,7 +660,7 @@ while IFS= read -r line; do
    printf '{"id":%s,"result":{"side":"left"}}\n' "$left" ;;
   *'"method":"cancel"'*) ;;
   *'"method":"approval"'*)
-   printf '%s\n' '{"id":900,"method":"item/commandExecution/requestApproval","params":{"command":"untrusted"}}'
+   printf '%s\n' '{"id":900,"method":"item/commandExecution/requestApproval","params":{"threadId":"fixture","turnId":"t1","itemId":"i1","command":"untrusted"}}'
    IFS= read -r reply
    case "$reply" in *'"decision":"decline"'*) printf '{"id":%s,"result":{"declined":true}}\n' "$id" ;; *) exit 1 ;; esac ;;
   *) printf '{"id":%s,"result":{}}\n' "$id" ;;
@@ -571,12 +695,66 @@ done
         let request_event = events.recv().await.unwrap();
         assert_eq!(request_event["method"], "farhelm/serverRequest");
         let token = request_event["params"]["requestToken"].as_str().unwrap();
-        assert_eq!(connection.pending_server_requests().len(), 1);
+        assert_eq!(connection.pending_server_requests("fixture").len(), 1);
+        {
+            let mut pending = connection.server_requests.lock().unwrap();
+            pending.get_mut(token).unwrap().expires = Instant::now() - Duration::from_secs(1);
+        }
+        assert!(connection.pending_server_requests("fixture").is_empty());
+        assert!(
+            connection
+                .answer_server_request("fixture", token, json!({"decision":"accept"}))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("expired")
+        );
+        {
+            let mut pending = connection.server_requests.lock().unwrap();
+            let request = pending.get_mut(token).unwrap();
+            request.expires = Instant::now() + Duration::from_secs(900);
+            request.generation = "previous-connection".into();
+        }
+        assert!(
+            connection
+                .answer_server_request("fixture", token, json!({"decision":"accept"}))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("scope_mismatch")
+        );
         connection
-            .answer_server_request(token, json!({"decision":"decline"}))
+            .server_requests
+            .lock()
+            .unwrap()
+            .get_mut(token)
+            .unwrap()
+            .generation = connection.generation.clone();
+        assert!(connection.pending_server_requests("other").is_empty());
+        assert!(
+            connection
+                .answer_server_request("other", token, json!({"decision":"accept"}))
+                .await
+                .is_err()
+        );
+        assert!(
+            connection
+                .answer_server_request("fixture", token, json!({"decision":"invalid"}))
+                .await
+                .is_err()
+        );
+        assert_eq!(connection.pending_server_requests("fixture").len(), 1);
+        connection
+            .answer_server_request("fixture", token, json!({"decision":"decline"}))
             .await
             .unwrap();
         assert_eq!(approval.await.unwrap().unwrap()["declined"], true);
+        assert!(
+            connection
+                .answer_server_request("fixture", token, json!({"decision":"accept"}))
+                .await
+                .is_err()
+        );
         connection.shutdown().await;
         assert!(!connection.alive.load(Ordering::Acquire));
     }

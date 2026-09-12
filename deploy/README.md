@@ -1,4 +1,4 @@
-# FarHelm V0.12.0 部署与生命周期
+# FarHelm V0.12.1 部署与生命周期
 
 [简体中文](README.md) · [English](README.en.md)
 
@@ -200,17 +200,17 @@ V0.7 的页面通知通过现有 SSE 和持久通知中心工作，无需 VAPID 
 
 若 FarHelm 仍占用原生写入连接，先在该弹窗点击“释放连接后继续”。存在活动任务、后台终端或未保存会话时会拒绝交接，处理完后可重试；不会终止它们。原生客户端用完后关闭会话连接，再回到网页发送。已有定时任务仍按计划执行，不会因交接自动暂停。
 
-## V0.12.0 升级
+## V0.12.1 升级
 
 先升级 Hub，再以原用户升级各台 Agent；升级前结束正在执行的会话并备份配置和数据库。各角色唯一迁移入口将 schema 8 升级为 9，保留项目、会话、授权、收据和执行身份，无需重新配对：
 
 ```bash
 # Hub
-sudo farhelm-hub update --version V0.12.0
+sudo farhelm-hub update --version V0.12.1
 sudo farhelm-hub status
 
 # 各台 Agent，不使用 sudo
-farhelm-agent update --version V0.12.0
+farhelm-agent update --version V0.12.1
 farhelm-agent status
 ```
 

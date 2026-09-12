@@ -4,6 +4,12 @@ use serde_json::Value;
 
 pub fn project(value: &Value, previous: Option<&CodexSessionContext>) -> CodexSessionContext {
     let mut context = previous.cloned().unwrap_or_default();
+    if let Some(ephemeral) = value["thread"]["ephemeral"]
+        .as_bool()
+        .or_else(|| value["ephemeral"].as_bool())
+    {
+        context.ephemeral = Some(ephemeral);
+    }
     if let Some(model) = value.get("model") {
         context.model = model
             .as_str()

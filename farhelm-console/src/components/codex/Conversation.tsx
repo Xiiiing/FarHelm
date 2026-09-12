@@ -14,11 +14,13 @@ import { ModelPicker, PermissionDetails } from './SessionSettings'
 import { NativeSession, RenameSession } from './NativeSession'
 import { ArchiveDialog } from './ArchiveDialog'
 import { useProjects } from '../../hooks/useProjects'
+import { NativeActivity } from './NativeActivity'
+import { NativeComposer } from './NativeComposer'
 import { NativeControlDrawer, NativeInteractionCards } from './NativeControl'
 
 const ComposerInput = forwardRef<ComponentRef<typeof Input.TextArea>, ComponentProps<typeof Input.TextArea>>((props, ref) => <Input.TextArea {...props} variant="borderless" ref={ref} aria-label="给 Codex 发送指令" maxLength={32768} />)
 const senderComponents = { input: ComposerInput }
-type Props = { recent: CodexSession[]; onSelect: (id: string) => void; onNew: () => void; onBrowse: () => void; csrf: string; id?: string; session?: CodexSession; draft: SessionDraft; onDraft: (change: (old: SessionDraft) => SessionDraft) => void; onSend: (turn?: string) => void; onRail: () => void; onCollapse: () => void; collapsed: boolean; onSchedule: (session: CodexSession) => void; onSchedules: (session: CodexSession) => void }
+type Props = { recent: CodexSession[]; onSelect: (id: string) => void; onNew: () => void; onBrowse: () => void; csrf: string; id?: string; session?: CodexSession; draft: SessionDraft; onDraft: (change: (old: SessionDraft) => SessionDraft) => void; onSend: (turn?: string, nativeQueue?: boolean) => void; onRail: () => void; onCollapse: () => void; collapsed: boolean; onSchedule: (session: CodexSession) => void; onSchedules: (session: CodexSession) => void }
 
 export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, session: listed, draft, onDraft, onSend, onRail, onCollapse, collapsed, onSchedule, onSchedules }: Props) {
   const metadata = useQuery({ queryKey: keys.session(id ?? ''), enabled: !!id, queryFn: async ({ signal }) => mergeSession(await json<CodexSession>(`/api/v1/codex/sessions/${encodeURIComponent(id!)}`, signal)) })
@@ -130,7 +132,7 @@ export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, sess
   const unavailable = failureCode === 'agent_offline' ? 'Agent 离线，暂时无法读取历史' : failureCode === 'session_not_found' ? '会话不存在或尚未导入' : '对话暂时无法读取'
   const loading = history.isFetching || readingMore
   const visibleTurn = session?.active_turn_id
-  const pending = draft.pending.filter((p) => p.delivery === 'steer' ? !p.command_id : !p.turn_id || !turns.some((t) => t.turn_id === p.turn_id && t.items.some((i) => i.kind === 'user_message')))
+  const pending = draft.pending.filter((p) => !turns.some(turn => turn.items.some(item => item.kind === 'user_message' && item.client_id === p.id))).filter((p) => p.delivery === 'steer' ? !p.command_id : !p.turn_id || !turns.some((t) => t.turn_id === p.turn_id && t.items.some((i) => i.kind === 'user_message')))
   const continuation = page?.continuation
   const needsMessage = continuation?.kind === 'message' && !turns.some((t) => t.turn_id === continuation.turn_id && t.items.some((i) => i.item_id === continuation.item_id && i.text_complete))
   const nativeIdentity = !!session && !!agent?.capabilities?.includes('codex.native_identity')
@@ -149,14 +151,14 @@ export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, sess
     // An explicit send returns to the latest turn; background deltas keep the reading anchor.
     follow.current = true; anchor.current = undefined; anchorLocked.current = false
     setAway(false); setNewMessages(false)
-    onSend(visibleTurn); sender.current?.focus({ preventScroll: true })
+    onSend(visibleTurn, !!agent?.capabilities?.includes('codex.native_completion') && page?.context?.ephemeral === false); sender.current?.focus({ preventScroll: true })
   }
   return <section className={`codex-conversation ${!id ? 'conversation-unselected' : ''}`}>
     {modalHolder}
     {session && sessionDialog === 'archive' && <ArchiveDialog session={session} csrf={csrf} onClose={() => setSessionDialog(undefined)} />}
     {session && sessionDialog === 'rename' && <RenameSession session={session} csrf={csrf} onClose={() => setSessionDialog(undefined)} />}
     {session && sessionDialog === 'native' && <NativeSession session={session} csrf={csrf} onClose={() => setSessionDialog(undefined)} onRename={() => setSessionDialog('rename')} />}
-    {session && <NativeControlDrawer csrf={csrf} session={session.session_id} turns={turns} activeTurn={session.active_turn_id} open={sessionDialog === 'control'} onClose={() => setSessionDialog(undefined)} />}
+    {session && <NativeControlDrawer supportsCompletion={!!agent?.capabilities?.includes('codex.native_completion')} csrf={csrf} session={session.session_id} turns={turns} activeTurn={session.active_turn_id} open={sessionDialog === 'control'} onClose={() => setSessionDialog(undefined)} />}
     <header className="conversation-head">
       <div className="conversation-identity">
         <Button className="mobile-only" type="text" icon={<MenuOutlined />} onClick={onRail} aria-label="打开会话列表" />
@@ -177,20 +179,23 @@ export function Conversation({ recent, onSelect, onNew, onBrowse, csrf, id, sess
       {!id ? <Welcome recent={recent} hasDraft={false} onNew={onNew} onBrowse={onBrowse} onSelect={onSelect} onPrompt={prompt} /> : loading && !page ? <div className="history-loading" role="status"><span>正在读取对话历史…</span><Skeleton active paragraph={{ rows: 5 }} /></div> : failure && !turns.length ? <Empty className="codex-empty" description={<><p>{unavailable}</p><p className="conversation-meta">{failure.message}</p></>}><Button onClick={() => void load()} icon={<ReloadOutlined />}>重试读取</Button></Empty> : page && !turns.length && session ? <Welcome session={session} recent={[]} hasDraft={!!draft.text.trim()} onNew={onNew} onBrowse={onBrowse} onSelect={onSelect} onPrompt={prompt} /> : null}
       {page?.next_cursor && !needsMessage && <Button loading={loading} className="load-earlier" onClick={() => void load(true)}>加载更早对话</Button>}
       <Transcript session={id ?? ''} turns={turns} scroll={scrollElement} position={position} continuation={needsMessage ? continuation : undefined} loading={loading} onContinue={continueHistory} onAnchor={anchorInteraction} />
+      {session && <NativeActivity session={session.session_id} enabled={!!agent?.online && !!agent.capabilities?.includes('codex.native_completion')} />}
       {session && <NativeInteractionCards csrf={csrf} session={session.session_id} enabled={!!agent?.online && !!agent.capabilities?.includes('codex.interactions')} />}
       <div className="pending-messages">{pending.map((p) => <article key={p.id} className={`codex-message user pending-message ${p.state === 'submitting' ? 'is-submitting' : ''}`} data-message-key={`pending:${p.id}`}><div className="message-role">{p.state === 'submitting' ? <LoadingOutlined /> : ['failed', 'orphaned', 'unknown', 'rejected', 'expired', 'unconfirmed'].includes(p.state) ? <CloseCircleOutlined /> : p.command_id ? <CheckCircleOutlined /> : <ClockCircleOutlined />} 你 · {stateNames[p.state] ?? '处理中'}</div><div className="message-body user-text">{p.text}</div></article>)}</div>
       {visibleTurn && <div className="response-activity" role="status"><ActivityIndicator /><span>{turns.some((turn) => turn.items.some((item) => item.streaming)) ? 'Codex 正在回复' : 'Codex 正在处理'}<small>你可以继续编写下一条指令</small></span></div>}
     </div><Button className="jump-to-bottom" icon={<ArrowDownOutlined aria-hidden />} hidden={!away && !newMessages} onClick={() => { follow.current = true; anchor.current = undefined; restore(); setNewMessages(false); setAway(false) }}>{newMessages ? '有新消息 · 回到底部' : '回到底部'}</Button></div>
     {id && <footer className="composer-wrap">
+      <NativeComposer csrf={csrf} session={id} draft={draft} onDraft={onDraft} enabled={!!agent?.capabilities?.includes('codex.interactions')} disabled={draft.sending || !session || session.state === 'archived' || !agent?.online}>
       <Sender ref={sender} className={`composer ${draft.text.trim() ? 'has-draft' : ''} ${draft.sending ? 'is-submitting' : ''}`} components={senderComponents} value={draft.text} onChange={(value) => onDraft((old) => ({ ...old, text: value }))} autoSize={{ minRows: 1, maxRows: 5 }} placeholder={session ? '描述下一步，或提出问题…' : '正在读取会话…'} disabled={!session || session.state === 'archived' || failureCode === 'session_not_found'} onSubmit={submit} onKeyDown={(event) => { if (event.nativeEvent.isComposing || event.keyCode === 229) return false }} suffix={false} footer={(_, { components: { SendButton } }) => <>
         {visibleTurn && <div className="active-turn-controls"><Radio.Group className="delivery-options" aria-label="活动会话发送方式" value={draft.delivery} onChange={(event) => onDraft((old) => ({ ...old, delivery: event.target.value as 'queue' | 'steer' }))}><Radio value="queue">排队下一轮</Radio><Radio value="steer">补充当前对话</Radio></Radio.Group><Tooltip title="中断当前对话"><Button danger type="text" icon={<StopOutlined />} onClick={interrupt} aria-label="中断" /></Tooltip></div>}
         <div className="composer-actions">
           <div className="composer-tools"><PermissionDetails context={page?.context} session={session} supported={agent ? agent.capabilities?.includes('codex.session_context') ?? false : undefined} /><Tooltip title="定时发送"><Button type="text" className="composer-control schedule-action" icon={<ClockCircleOutlined />} disabled={!session || session.state === 'archived'} onClick={() => session && onSchedule(session)} aria-label="定时发送" /></Tooltip></div>
           <div className="composer-submit"><ModelPicker context={page?.context} session={session} choice={draft.model_choice} sending={draft.sending} steer={!!visibleTurn && draft.delivery === 'steer'} supported={!!agent?.capabilities?.includes('codex.model_choice')} onChange={choice => onDraft(old => ({ ...old, model_choice: choice }))} />
-          <SendButton className="send-action" shape="default" type="primary" icon={<ArrowUpOutlined />} loading={draft.sending} disabled={!session || session.state === 'archived' || !draft.text.trim() || draft.sending} aria-label="发送指令"><span className="sr-only">发送</span></SendButton>
+          <SendButton className="send-action" shape="default" type="primary" icon={<ArrowUpOutlined />} loading={draft.sending} disabled={!session || session.state === 'archived' || !draft.text.trim() || draft.sending || draft.images?.some(image => image.state !== 'ready')} aria-label="发送指令"><span className="sr-only">发送</span></SendButton>
           </div>
         </div>
       </>} />
+      </NativeComposer>
       <div className="composer-hint"><span className={`submission-status ${receiptFailed ? 'status-error' : ''}`} role="status">{draft.sending ? <><LoadingOutlined /> 等待 Agent 保存确认…</> : lastReceipt?.command_id ? <>{receiptFailed ? <CloseCircleOutlined /> : ['accepted', 'completed'].includes(lastReceipt.state) ? <CheckCircleOutlined /> : <ClockCircleOutlined />} {stateNames[lastReceipt.state] ?? '处理中'}<span className="receipt-id"> · {lastReceipt.command_id.slice(-8)}</span></> : session ? <><FolderOpenOutlined /> {session.project_id}</> : '正在读取会话'}</span><span className="keyboard-hint"><kbd>Enter</kbd> 发送 <span>·</span> <kbd>Shift + Enter</kbd> 换行</span></div>
     </footer>}
 

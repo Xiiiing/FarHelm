@@ -4,16 +4,18 @@
   <p><strong>A remote control plane for personal research and GPU training environments</strong></p>
   <p>See training-host status from your phone and safely extend remote control without exposing inbound ports on training machines.</p>
   <p>
-    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.12.0">V0.12.0</a> ·
+    <a href="https://github.com/Xiiiing/FarHelm/releases/tag/V0.12.1">V0.12.1</a> ·
     <a href="./deploy/README.en.md">Deployment guide</a> ·
     <a href="./README.md">简体中文</a>
   </p>
 </div>
 
 > [!IMPORTANT]
-> `V0.12.0` brings the server-side Codex native queue, approvals and questions, plan/review/goal controls, Skills, images, sections, history operations, and temporary tasks into the existing remote workspace. Upgrade Hub first and then every Agent. This version migrates to schema 9 and prevents an incompatible automatic rollback.
+> `V0.12.1` brings the server-side Codex native queue, approvals and questions, plan/review/goal controls, Skills, images, sections, history operations, and temporary tasks into the existing remote workspace. Upgrade Hub first and then every Agent. This version migrates to schema 9 and prevents an incompatible automatic rollback.
 
-## Native Codex remote control (V0.12.0)
+## Native Codex remote control (V0.12.1)
+
+The main composer supports Skills, image uploads, and pasted images. Conversations display command output, file diffs, and review results. Uncertain native queue submissions remain under reconciliation and are never automatically resubmitted. Temporary history has a memory limit and cannot be recovered after ending the task; native unloading follows Codex's unsubscribe grace period. Codex 0.153.4 does not support native queues for temporary tasks; ordinary text turns remain available. Native pinning requires a server that returns `isPinned` (not provided by 0.153.4); section names no longer simulate pins.
 
 - FarHelm remains the remote input, approval, and presentation layer; Codex, tools, files, and Skills continue to run on the selected Agent.
 - The web UI and native clients share Codex queue and task state, including live approvals, questions, goals, reviews, settings, and history operations.
@@ -161,7 +163,7 @@ flowchart LR
 
 FarHelm is one monorepo, but Hub and Agent are compiled separately and retain distinct privileges and attack surfaces. Codex communicates only over local stdio. Authentication remains local; Hub relays bodies only in bounded memory for at most 20 seconds.
 
-The Codex composer displays the session model, reasoning effort, and permission details returned by the server. Click the model to choose from the local Codex catalog, including supported reasoning efforts, for the next queued instruction and subsequent turns. Steering an active turn retains its running model. If persistence is unconfirmed, retries keep the original instruction and model to prevent duplicate execution or silently changing the request. Without a selection, native session settings are inherited; schedules inherit the session model when they execute. The browser never changes global model or permission settings. Resuming inherits native Codex settings; new browser sessions use project configuration, with an optional isolated Git worktree. Unconfirmed settings are marked unknown rather than inferred from legacy session modes. Browser approval prompts are not supported yet, so operations requiring user approval are declined. Upgrade Hub before Agent: model selection and native identity checks require `codex.model_choice` and `codex.native_identity`, respectively; permission display continues to use `codex.session_context`. Explicit inspect/edit creation through older APIs and the CLI remains compatible.
+The Codex composer displays the session model, reasoning effort, and permission details returned by the server. Click the model to choose from the local Codex catalog, including supported reasoning efforts, for the next queued instruction and subsequent turns. Steering an active turn retains its running model. If persistence is unconfirmed, retries keep the original instruction and model to prevent duplicate execution or silently changing the request. Without a selection, native session settings are inherited; schedules inherit the session model when they execute. The browser never changes global model or permission settings. Resuming inherits native Codex settings; new browser sessions use project configuration, with an optional isolated Git worktree. Unconfirmed settings are marked unknown rather than inferred from legacy session modes. Supported native approval prompts and questions appear in the conversation; disconnects, expiry, and duplicate answers are never treated as approval. Upgrade Hub before Agent: model selection and native identity checks require `codex.model_choice` and `codex.native_identity`, respectively; permission display continues to use `codex.session_context`. Explicit inspect/edit creation through older APIs and the CLI remains compatible.
 
 The browser and server Codex use the same native session ID, without assigning a generic name to new sessions. The session menu supports renaming and “Continue in native Codex,” which checks local persistence and the native name and copies `codex resume <session ID>`. An empty session might not be stored yet; send a message before checking. Other clients must use the same server, user, and Codex data directory. Existing desktop lists may need a refresh or reopening the project. Older sessions still named `Codex session` can be renamed for matching labels; temporary message summaries are never automatically saved as formal names.
 

@@ -804,6 +804,7 @@ async fn loaded_empty_thread_can_send_and_interleaved_items_keep_offsets_before_
         .await
         .unwrap();
     assert_eq!(empty["turns"], json!([]));
+    let mut display = native.subscribe_display();
     let events = Arc::new(std::sync::Mutex::new(Vec::new()));
     native
         .turn("new", "hello", "op", |kind, data| {
@@ -815,7 +816,11 @@ async fn loaded_empty_thread_can_send_and_interleaved_items_keep_offsets_before_
     let events = events.lock().unwrap().clone();
     assert_eq!(events.first().unwrap().0, "codex.turn.started");
     assert_eq!(events.last().unwrap().0, "codex.turn.completed");
-    let item: Vec<_> = events
+    let mut projected = Vec::new();
+    while let Ok(event) = display.try_recv() {
+        projected.push((event.kind, event.data));
+    }
+    let item: Vec<_> = projected
         .iter()
         .filter(|(kind, data)| *kind == "codex.message.delta" && data["item_id"] == "i1")
         .map(|(_, data)| {
@@ -948,4 +953,36 @@ printf 'closed\n' >> 'CLOSED'
         json!({"session_id":"s"})
     );
     assert!(native.inner.connection.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn pin_requires_an_advertised_native_boolean_instead_of_section_names() {
+    let directory = tempfile::tempdir().unwrap();
+    let native = Codex::new(Some(fixture(directory.path(), "0.153.4")));
+    let error = native
+        .native_operation(
+            "new",
+            &farhelm_protocol::native::NativeOperation::Pin { pinned: true },
+            &HashMap::new(),
+            "inspect",
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("codex_pin_upgrade_required"));
+    native.shutdown().await;
+}
+
+#[test]
+fn native_client_identity_is_distinct_from_item_identity() {
+    let turn = super::history::normalise_turn(
+        &json!({"id":"turn", "items":[{"type":"userMessage", "id":"native-item", "clientId":"submission", "content":[{"type":"text","text":"hello"}]}]}),
+    );
+    assert_eq!(turn["items"][0]["item_id"], "native-item");
+    assert_eq!(turn["items"][0]["client_id"], "submission");
+    let relayed: farhelm_protocol::CodexTranscriptItem =
+        serde_json::from_value(turn["items"][0].clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(relayed).unwrap()["client_id"],
+        "submission"
+    );
 }

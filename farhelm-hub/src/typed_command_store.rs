@@ -477,6 +477,17 @@ fn public_detail(detail: &str) -> &'static str {
         "codex_handoff_background",
         "codex_handoff_unconfirmed",
         "codex_handoff_unverified",
+        "native_queue_pending_conflict",
+        "native_queue_legacy_pending",
+        "codex_ephemeral_queue_unsupported",
+        "codex_server_request_scope_mismatch",
+        "codex_server_request_expired",
+        "codex_server_request_resolved",
+        "codex_server_answer_unknown",
+        "codex_pin_upgrade_required",
+        "codex_pin_unverified",
+        "temporary_session_capacity",
+        "not_temporary_session",
     ]
     .into_iter()
     .find(|code| *code == detail)
